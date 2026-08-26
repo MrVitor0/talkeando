@@ -1,0 +1,818 @@
+use std::{collections::HashSet, time::Duration};
+
+use axum::{
+    extract::{
+        ws::{Message, WebSocket, WebSocketUpgrade},
+        State,
+    },
+    response::IntoResponse,
+};
+use futures::{SinkExt, StreamExt};
+use tokio::sync::mpsc;
+use uuid::Uuid;
+
+use crate::{
+    auth::authenticate_token,
+    db,
+    state::AppState,
+    ws::{
+        call_registry::CallOpError,
+        protocol::*,
+    },
+};
+
+pub async fn ws_upgrade(ws: WebSocketUpgrade, State(state): State<AppState>) -> impl IntoResponse {
+    ws.on_upgrade(move |socket| handle_socket(socket, state))
+}
+
+async fn handle_socket(socket: WebSocket, state: AppState) {
+    let (mut sender, mut receiver) = socket.split();
+    let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+
+    // Forward outbound queue -> actual socket sink. Keeps the socket write
+    // half owned by exactly one task, avoiding interleaved writes.
+    let forward_task = tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            if sender.send(msg).await.is_err() {
+                break;
+            }
+        }
+    });
+
+    // WS-FR-001: client must send auth.hello within 10s of connecting.
+    let hello = tokio::time::timeout(Duration::from_secs(10), receiver.next()).await;
+    let user = match hello {
+        Ok(Some(Ok(Message::Text(text)))) => match serde_json::from_str::<InboundEnvelope>(&text) {
+            Ok(env) if env.op == "auth.hello" => {
+                match serde_json::from_value::<AuthHello>(env.data) {
+                    Ok(AuthHello { token }) => authenticate_token(&state.pool, &token).await.ok(),
+                    Err(_) => None,
+                }
+            }
+            _ => None,
+        },
+        _ => None,
+    };
+
+    let Some((user, _session_id)) = user else {
+        let _ = tx.send(Message::Text(
+            serde_json::to_string(&OutboundEnvelope::new(
+                "auth.rejected",
+                serde_json::json!({ "reason": "invalid_or_missing_token" }),
+            ))
+            .unwrap(),
+        ));
+        let _ = tx.send(Message::Close(None));
+        drop(tx);
+        let _ = forward_task.await;
+        return;
+    };
+
+    let user_id = user.id;
+    tracing::info!(%user_id, "ws connected");
+
+    let was_online = state.hub.is_online(user_id).await;
+    let connection_id = state.hub.register(user_id, tx.clone()).await;
+    state.advance_presence_epoch(user_id).await;
+    let cancelled_offline_grace = state.cancel_offline_grace(user_id).await;
+
+    state
+        .hub
+        .send_to_connection(
+            user_id,
+            connection_id,
+            OutboundEnvelope::new(
+                "auth.ok",
+                AuthOk {
+                    user_id,
+                    username: user.username.clone(),
+                    display_name: user.display_name.clone(),
+                },
+            ),
+        )
+        .await;
+
+    let members = match db::related_member_ids(&state.pool, user_id).await {
+        Ok(members) => members,
+        Err(error) => {
+            tracing::error!(%user_id, %error, "failed to resolve presence snapshot members");
+            vec![user_id]
+        }
+    };
+    let mut entries = Vec::with_capacity(members.len());
+    for member_id in members {
+        entries.push(PresenceEntry {
+            user_id: member_id,
+            status: if state.hub.is_online(member_id).await { "online" } else { "offline" }.to_string(),
+        });
+    }
+    let snapshot = PresenceSnapshot { users: entries };
+    state
+        .hub
+        .send_to_connection(user_id, connection_id, OutboundEnvelope::new("presence.snapshot", snapshot))
+        .await;
+    if !was_online && !cancelled_offline_grace {
+        broadcast_presence_update(&state, user_id, "online").await;
+    }
+
+    let mut joined_calls: HashSet<Uuid> = HashSet::new();
+
+    while let Some(msg) = receiver.next().await {
+        let msg = match msg {
+            Ok(m) => m,
+            Err(_) => break,
+        };
+        match msg {
+            Message::Text(text) => {
+                dispatch(&state, user_id, &text, &mut joined_calls).await;
+            }
+            Message::Ping(payload) => {
+                let _ = state
+                    .hub
+                    .send_to_raw(user_id, Message::Pong(payload))
+                    .await;
+            }
+            Message::Close(_) => break,
+            _ => {}
+        }
+    }
+
+    // Connection ended: unwind presence + any calls this user was in.
+    let was_last_connection = state.hub.unregister(user_id, connection_id).await;
+    if !was_last_connection {
+        tracing::info!(%user_id, "ws disconnected; another connection remains active");
+        let _ = forward_task.await;
+        return;
+    }
+    let channels: Vec<Uuid> = joined_calls.into_iter().collect();
+    let disconnect_epoch = state.advance_presence_epoch(user_id).await;
+    state.begin_offline_grace(user_id).await;
+    let delayed_state = state.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(8)).await;
+        if delayed_state.hub.is_online(user_id).await
+            || !delayed_state.presence_epoch_is_current(user_id, disconnect_epoch).await
+        {
+            return;
+        }
+        if !delayed_state.finish_offline_grace(user_id).await {
+            return;
+        }
+        for channel_id in channels {
+            teardown_call_membership(&delayed_state, channel_id, user_id, "disconnected").await;
+        }
+        broadcast_presence_update(&delayed_state, user_id, "offline").await;
+        tracing::info!(%user_id, "ws disconnect grace period elapsed");
+    });
+    tracing::info!(%user_id, "ws disconnected; grace period started");
+    let _ = forward_task.await;
+}
+
+async fn broadcast_presence_update(state: &AppState, user_id: Uuid, status: &str) {
+    match db::related_member_ids(&state.pool, user_id).await {
+        Ok(user_ids) => state.hub.broadcast_to(
+            &user_ids,
+            OutboundEnvelope::new(
+                "presence.update",
+                PresenceUpdate { user_id, status: status.to_string() },
+            ),
+        ).await,
+        Err(error) => tracing::error!(%user_id, %error, "failed to resolve presence recipients"),
+    }
+}
+
+async fn teardown_call_membership(
+    state: &AppState,
+    channel_id: Uuid,
+    user_id: Uuid,
+    reason: &str,
+) {
+    let removed_streams = {
+        let mut calls = state.hub.calls.write().await;
+        if !calls.is_participant(channel_id, user_id) {
+            return;
+        }
+        calls.leave(channel_id, user_id)
+    };
+    let remaining = state.hub.calls.read().await.participant_ids(channel_id);
+    state
+        .hub
+        .broadcast_to(
+            &remaining,
+            OutboundEnvelope::new(
+                "call.peer_left",
+                CallPeerLeft {
+                    channel_id,
+                    user_id,
+                    reason: reason.to_string(),
+                },
+            ),
+        )
+        .await;
+    for stream_id in removed_streams {
+        state
+            .hub
+            .broadcast_to(
+                &remaining,
+                OutboundEnvelope::new(
+                    "stream.unpublished",
+                    StreamUnpublished { channel_id, stream_id },
+                ),
+            )
+            .await;
+    }
+}
+
+async fn dispatch(state: &AppState, user_id: Uuid, text: &str, joined_calls: &mut HashSet<Uuid>) {
+    let env = match serde_json::from_str::<InboundEnvelope>(text) {
+        Ok(e) => e,
+        Err(e) => {
+            state
+                .hub
+                .send_to(
+                    user_id,
+                    OutboundEnvelope::error("bad_request", format!("malformed envelope: {e}"), None),
+                )
+                .await;
+            return;
+        }
+    };
+
+    macro_rules! parse_or_reject {
+        ($ty:ty) => {
+            match serde_json::from_value::<$ty>(env.data.clone()) {
+                Ok(v) => v,
+                Err(e) => {
+                    state
+                        .hub
+                        .send_to(
+                            user_id,
+                            OutboundEnvelope::error(
+                                "bad_request",
+                                format!("invalid payload for {}: {e}", env.op),
+                                None,
+                            ),
+                        )
+                        .await;
+                    return;
+                }
+            }
+        };
+    }
+
+    match env.op.as_str() {
+        "chat.message.create" => {
+            let data: ChatMessageCreate = parse_or_reject!(ChatMessageCreate);
+            handle_chat_create(state, user_id, data).await;
+        }
+        "chat.message.edit" => {
+            let data: ChatMessageEdit = parse_or_reject!(ChatMessageEdit);
+            handle_chat_edit(state, user_id, data).await;
+        }
+        "chat.message.delete" => {
+            let data: ChatMessageDelete = parse_or_reject!(ChatMessageDelete);
+            handle_chat_delete(state, user_id, data).await;
+        }
+        "chat.typing" => {
+            let data: ChatTyping = parse_or_reject!(ChatTyping);
+            if let Ok(Some(channel)) = db::channel_if_member(&state.pool, data.channel_id, user_id).await {
+                if channel.kind == "text" {
+                    broadcast_to_community(state, channel.community_id, OutboundEnvelope::new(
+                        "chat.typing",
+                        serde_json::json!({ "channel_id": data.channel_id, "user_id": user_id }),
+                    )).await;
+                }
+            }
+        }
+        "call.join" => {
+            let data: CallJoin = parse_or_reject!(CallJoin);
+            handle_call_join(state, user_id, data, joined_calls).await;
+        }
+        "call.leave" => {
+            let data: CallLeave = parse_or_reject!(CallLeave);
+            joined_calls.remove(&data.channel_id);
+            teardown_call_membership(state, data.channel_id, user_id, "left").await;
+        }
+        "call.state.update" => {
+            let data: CallStateUpdate = parse_or_reject!(CallStateUpdate);
+            handle_call_state_update(state, user_id, data).await;
+        }
+        "rtc.offer" => {
+            let data: RtcOffer = parse_or_reject!(RtcOffer);
+            relay_rtc(state, user_id, data.channel_id, data.to, "rtc.offer", data).await;
+        }
+        "rtc.answer" => {
+            let data: RtcAnswer = parse_or_reject!(RtcAnswer);
+            relay_rtc(state, user_id, data.channel_id, data.to, "rtc.answer", data).await;
+        }
+        "rtc.ice" => {
+            let data: RtcIce = parse_or_reject!(RtcIce);
+            relay_rtc(state, user_id, data.channel_id, data.to, "rtc.ice", data).await;
+        }
+        "rtc.connection_state" => {
+            let data: RtcConnectionState = parse_or_reject!(RtcConnectionState);
+            tracing::info!(%user_id, to = %data.to, channel_id = %data.channel_id, state = %data.state, "rtc connection state");
+        }
+        "stream.publish" => {
+            let data: StreamPublish = parse_or_reject!(StreamPublish);
+            handle_stream_publish(state, user_id, data).await;
+        }
+        "stream.unpublish" => {
+            let data: StreamUnpublish = parse_or_reject!(StreamUnpublish);
+            handle_stream_unpublish(state, user_id, data).await;
+        }
+        "stream.subscribe" => {
+            let data: StreamSubscribe = parse_or_reject!(StreamSubscribe);
+            handle_stream_subscribe(state, user_id, data).await;
+        }
+        "stream.unsubscribe" => {
+            let data: StreamUnsubscribe = parse_or_reject!(StreamUnsubscribe);
+            handle_stream_unsubscribe(state, user_id, data).await;
+        }
+        "device.list_changed" => {
+            let data: DeviceListChanged = parse_or_reject!(DeviceListChanged);
+            tracing::debug!(%user_id, summary = ?data.summary, "device list changed");
+        }
+        other => {
+            state
+                .hub
+                .send_to(
+                    user_id,
+                    OutboundEnvelope::error("unknown_op", format!("unknown op: {other}"), None),
+                )
+                .await;
+        }
+    }
+}
+
+async fn handle_chat_create(state: &AppState, user_id: Uuid, data: ChatMessageCreate) {
+    let Ok(Some(channel)) = db::channel_if_member(&state.pool, data.channel_id, user_id).await else {
+        state
+            .hub
+            .send_to(
+                user_id,
+                OutboundEnvelope::error("forbidden", "not a member of this channel's community", data.req_id.as_deref()),
+            )
+            .await;
+        return;
+    };
+    if channel.kind != "text" {
+        state.hub.send_to(user_id, OutboundEnvelope::error("validation_error", "messages can only be sent to text channels", data.req_id.as_deref())).await;
+        return;
+    }
+    if data.content.trim().is_empty() || data.content.len() > 4000 {
+        state
+            .hub
+            .send_to(
+                user_id,
+                OutboundEnvelope::error("validation_error", "message must be 1..=4000 chars", data.req_id.as_deref()),
+            )
+            .await;
+        return;
+    }
+    let row = sqlx::query_as::<_, db::Message>(
+        "INSERT INTO messages (channel_id, author_id, content) VALUES ($1, $2, $3) RETURNING *",
+    )
+    .bind(data.channel_id)
+    .bind(user_id)
+    .bind(&data.content)
+    .fetch_one(&state.pool)
+    .await;
+
+    match row {
+        Ok(m) => {
+            broadcast_to_community(state, channel.community_id, OutboundEnvelope::new(
+                    "chat.message.created",
+                    MessageDto {
+                        id: m.id,
+                        channel_id: m.channel_id,
+                        author_id: m.author_id,
+                        content: m.content,
+                        created_at: m.created_at,
+                        edited_at: m.edited_at,
+                    },
+                )).await;
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "failed to persist chat message");
+            state
+                .hub
+                .send_to(
+                    user_id,
+                    OutboundEnvelope::error("internal_error", "failed to send message", data.req_id.as_deref()),
+                )
+                .await;
+        }
+    }
+}
+
+async fn handle_chat_edit(state: &AppState, user_id: Uuid, data: ChatMessageEdit) {
+    if data.content.trim().is_empty() || data.content.len() > 4000 {
+        state
+            .hub
+            .send_to(
+                user_id,
+                OutboundEnvelope::error("validation_error", "message must be 1..=4000 chars", data.req_id.as_deref()),
+            )
+            .await;
+        return;
+    }
+    let updated = sqlx::query_as::<_, db::Message>(
+        "UPDATE messages SET content = $1, edited_at = now() \
+         WHERE id = $2 AND author_id = $3 AND deleted_at IS NULL RETURNING *",
+    )
+    .bind(&data.content)
+    .bind(data.message_id)
+    .bind(user_id)
+    .fetch_optional(&state.pool)
+    .await;
+
+    match updated {
+        Ok(Some(m)) => {
+            if let Ok(Some(channel)) = db::channel_if_member(&state.pool, m.channel_id, user_id).await {
+                broadcast_to_community(state, channel.community_id, OutboundEnvelope::new(
+                    "chat.message.edited",
+                    MessageDto {
+                        id: m.id,
+                        channel_id: m.channel_id,
+                        author_id: m.author_id,
+                        content: m.content,
+                        created_at: m.created_at,
+                        edited_at: m.edited_at,
+                    },
+                )).await;
+            }
+        }
+        Ok(None) => {
+            state
+                .hub
+                .send_to(
+                    user_id,
+                    OutboundEnvelope::error("forbidden", "message not found or not yours", data.req_id.as_deref()),
+                )
+                .await;
+        }
+        Err(e) => tracing::error!(error = %e, "failed to edit message"),
+    }
+}
+
+async fn handle_chat_delete(state: &AppState, user_id: Uuid, data: ChatMessageDelete) {
+    let updated = sqlx::query_as::<_, (Uuid, Uuid)>(
+        "UPDATE messages SET deleted_at = now() \
+         WHERE id = $1 AND author_id = $2 AND deleted_at IS NULL RETURNING id, channel_id",
+    )
+    .bind(data.message_id)
+    .bind(user_id)
+    .fetch_optional(&state.pool)
+    .await;
+
+    match updated {
+        Ok(Some((message_id, channel_id))) => {
+            if let Ok(Some(channel)) = db::channel_if_member(&state.pool, channel_id, user_id).await {
+                broadcast_to_community(state, channel.community_id, OutboundEnvelope::new(
+                    "chat.message.deleted",
+                    ChatMessageDeleted { message_id, channel_id },
+                )).await;
+            }
+        }
+        Ok(None) => {
+            state
+                .hub
+                .send_to(
+                    user_id,
+                    OutboundEnvelope::error("forbidden", "message not found or not yours", data.req_id.as_deref()),
+                )
+                .await;
+        }
+        Err(e) => tracing::error!(error = %e, "failed to delete message"),
+    };
+}
+
+async fn handle_call_join(
+    state: &AppState,
+    user_id: Uuid,
+    data: CallJoin,
+    joined_calls: &mut HashSet<Uuid>,
+) {
+    let channel = match db::channel_if_member(&state.pool, data.channel_id, user_id).await {
+        Ok(Some(channel)) if channel.kind == "voice" => channel,
+        Ok(Some(_)) => {
+            state.hub.send_to(user_id, OutboundEnvelope::error("validation_error", "calls can only be joined in voice channels", None)).await;
+            return;
+        }
+        _ => {
+        state
+            .hub
+            .send_to(
+                user_id,
+                OutboundEnvelope::error("forbidden", "not a member of this channel's community", None),
+            )
+            .await;
+        return;
+        }
+    };
+
+    let call_is_full = {
+        let calls = state.hub.calls.read().await;
+        !calls.is_participant(data.channel_id, user_id) && calls.is_full(data.channel_id)
+    };
+    if call_is_full {
+        state.hub.send_to(user_id, OutboundEnvelope::error("call_full", "this voice channel already has 10 participants", None)).await;
+        return;
+    }
+
+    // A connection can belong to exactly one voice call. Move semantics are
+    // intentional: the old roster sees a leave before the new one sees join.
+    for previous_channel_id in joined_calls.clone() {
+        if previous_channel_id != channel.id {
+            joined_calls.remove(&previous_channel_id);
+            teardown_call_membership(state, previous_channel_id, user_id, "left").await;
+        }
+    };
+
+    let snapshot = {
+        let mut calls = state.hub.calls.write().await;
+        calls.join(data.channel_id, user_id, data.muted, data.deafened)
+    };
+    let snapshot = match snapshot {
+        Ok(snapshot) => snapshot,
+        Err(CallOpError::CallFull) => {
+            state.hub.send_to(user_id, OutboundEnvelope::error("call_full", "this voice channel already has 10 participants", None)).await;
+            return;
+        }
+        Err(_) => {
+            state.hub.send_to(user_id, OutboundEnvelope::error("internal_error", "failed to join call", None)).await;
+            return;
+        }
+    };
+    state
+        .hub
+        .send_to(
+            user_id,
+            OutboundEnvelope::new(
+                "call.snapshot",
+                CallSnapshot {
+                    channel_id: data.channel_id,
+                    participants: snapshot.participants,
+                    streams: snapshot.streams,
+                },
+            ),
+        )
+        .await;
+
+    joined_calls.insert(data.channel_id);
+
+    let others: Vec<Uuid> = state
+        .hub
+        .calls
+        .read()
+        .await
+        .participant_ids(data.channel_id)
+        .into_iter()
+        .filter(|id| *id != user_id)
+        .collect();
+    state
+        .hub
+        .broadcast_to(
+            &others,
+            OutboundEnvelope::new(
+                "call.peer_joined",
+                CallPeerJoined {
+                    channel_id: data.channel_id,
+                    participant: ParticipantDto {
+                        user_id,
+                        muted: data.muted,
+                        deafened: data.deafened,
+                    },
+                },
+            ),
+        )
+        .await;
+}
+
+async fn broadcast_to_community(state: &AppState, community_id: Uuid, event: OutboundEnvelope) {
+    match db::community_member_ids(&state.pool, community_id).await {
+        Ok(user_ids) => state.hub.broadcast_to(&user_ids, event).await,
+        Err(error) => tracing::error!(%community_id, %error, "failed to resolve community realtime recipients"),
+    };
+}
+
+async fn handle_call_state_update(
+    state: &AppState,
+    user_id: Uuid,
+    data: CallStateUpdate,
+) {
+    let participant = {
+        let mut calls = state.hub.calls.write().await;
+        calls
+            .update_participant_state(data.channel_id, user_id, data.muted, data.deafened)
+    };
+    let participant = match participant {
+        Ok(participant) => participant,
+        Err(_) => {
+            state.hub.send_to(user_id, OutboundEnvelope::error("forbidden", "join the call before changing participant state", None)).await;
+            return;
+        }
+    };
+    let recipients = state.hub.calls.read().await.participant_ids(data.channel_id);
+    state.hub.broadcast_to(
+        &recipients,
+        OutboundEnvelope::new(
+            "call.state.update",
+            CallStateUpdateEvent {
+                channel_id: data.channel_id,
+                user_id,
+                muted: participant.muted,
+                deafened: participant.deafened,
+            },
+        ),
+    ).await;
+}
+
+async fn relay_rtc(
+    state: &AppState,
+    from: Uuid,
+    channel_id: Uuid,
+    to: Uuid,
+    op: &str,
+    payload: impl serde::Serialize,
+) {
+    let ok = {
+        let calls = state.hub.calls.read().await;
+        calls.is_participant(channel_id, from) && calls.is_participant(channel_id, to)
+    };
+    if !ok {
+        state
+            .hub
+            .send_to(
+                from,
+                OutboundEnvelope::error(
+                    "forbidden",
+                    "target is not a participant of this call",
+                    None,
+                ),
+            )
+            .await;
+        return;
+    }
+    if !state.hub.is_online(to).await {
+        state
+            .hub
+            .send_to(from, OutboundEnvelope::error("peer_offline", "target is not connected", None))
+            .await;
+        return;
+    }
+    let mut payload = match serde_json::to_value(payload) {
+        Ok(serde_json::Value::Object(payload)) => payload,
+        Ok(_) | Err(_) => {
+            tracing::error!(%from, %to, %channel_id, "rtc relay payload was not an object");
+            state.hub.send_to(from, OutboundEnvelope::error("internal_error", "failed to relay RTC signal", None)).await;
+            return;
+        }
+    };
+    // Inbound RTC messages name only their target. The recipient needs an
+    // authenticated sender identity to route the signal to its PeerController;
+    // it is injected server-side rather than trusted from the client payload.
+    payload.insert("from".to_string(), serde_json::json!(from));
+    state
+        .hub
+        .send_to(to, OutboundEnvelope::new(op, serde_json::Value::Object(payload)))
+        .await;
+}
+
+async fn handle_stream_publish(state: &AppState, user_id: Uuid, data: StreamPublish) {
+    if data.kind != "screen" && data.kind != "camera" {
+        state
+            .hub
+            .send_to(user_id, OutboundEnvelope::error("validation_error", "kind must be screen|camera", None))
+            .await;
+        return;
+    }
+    let result = {
+        let mut calls = state.hub.calls.write().await;
+        calls.publish(
+            data.channel_id,
+            user_id,
+            data.stream_id,
+            data.kind.clone(),
+            data.label.clone(),
+            data.has_audio,
+        )
+    };
+    if let Err(_e @ CallOpError::NotInCall) = result {
+        state
+            .hub
+            .send_to(user_id, OutboundEnvelope::error("forbidden", "join the call before publishing", None))
+            .await;
+        return;
+    }
+    let participants = state.hub.calls.read().await.participant_ids(data.channel_id);
+    state
+        .hub
+        .broadcast_to(
+            &participants,
+            OutboundEnvelope::new(
+                "stream.published",
+                StreamPublished {
+                    channel_id: data.channel_id,
+                    stream_id: data.stream_id,
+                    owner: user_id,
+                    kind: data.kind,
+                    label: data.label,
+                    has_audio: data.has_audio,
+                },
+            ),
+        )
+        .await;
+}
+
+async fn handle_stream_unpublish(state: &AppState, user_id: Uuid, data: StreamUnpublish) {
+    let result = {
+        let mut calls = state.hub.calls.write().await;
+        calls.unpublish(data.channel_id, user_id, data.stream_id)
+    };
+    match result {
+        Ok(_viewers) => {
+            let participants = state.hub.calls.read().await.participant_ids(data.channel_id);
+            state
+                .hub
+                .broadcast_to(
+                    &participants,
+                    OutboundEnvelope::new(
+                        "stream.unpublished",
+                        StreamUnpublished {
+                            channel_id: data.channel_id,
+                            stream_id: data.stream_id,
+                        },
+                    ),
+                )
+                .await;
+        }
+        Err(CallOpError::NotStreamOwner) => {
+            state
+                .hub
+                .send_to(user_id, OutboundEnvelope::error("forbidden", "you do not own this stream", None))
+                .await;
+        }
+        Err(_) => {
+            state
+                .hub
+                .send_to(user_id, OutboundEnvelope::error("not_found", "stream not found", None))
+                .await;
+        }
+    }
+}
+
+async fn handle_stream_subscribe(state: &AppState, user_id: Uuid, data: StreamSubscribe) {
+    let result = {
+        let mut calls = state.hub.calls.write().await;
+        calls.subscribe(data.channel_id, user_id, data.stream_id)
+    };
+    match result {
+        Ok(owner) => {
+            state
+                .hub
+                .send_to(
+                    owner,
+                    OutboundEnvelope::new(
+                        "stream.subscription_requested",
+                        StreamSubscriptionRequested {
+                            channel_id: data.channel_id,
+                            stream_id: data.stream_id,
+                            subscriber: user_id,
+                        },
+                    ),
+                )
+                .await;
+        }
+        Err(_) => {
+            state
+                .hub
+                .send_to(user_id, OutboundEnvelope::error("not_found", "stream not found or you're not in this call", None))
+                .await;
+        }
+    }
+}
+
+async fn handle_stream_unsubscribe(state: &AppState, user_id: Uuid, data: StreamUnsubscribe) {
+    let result = {
+        let mut calls = state.hub.calls.write().await;
+        calls.unsubscribe(data.channel_id, user_id, data.stream_id)
+    };
+    if let Ok(owner) = result {
+        state
+            .hub
+            .send_to(
+                owner,
+                OutboundEnvelope::new(
+                    "stream.unsubscribed",
+                    StreamUnsubscribed {
+                        channel_id: data.channel_id,
+                        stream_id: data.stream_id,
+                        subscriber: user_id,
+                    },
+                ),
+            )
+            .await;
+    }
+}

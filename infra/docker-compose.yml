@@ -1,0 +1,30 @@
+name: talkeando
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: talkeando
+      POSTGRES_PASSWORD: talkeando
+      POSTGRES_DB: talkeando
+    ports:
+      - "5432:5432"
+    volumes:
+      - talkeando_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U talkeando"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  coturn:
+    image: coturn/coturn:latest
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./coturn/turnserver.conf:/etc/coturn/turnserver.conf:ro
+    command: ["-c", "/etc/coturn/turnserver.conf"]
+
+volumes:
+  talkeando_pg_data:

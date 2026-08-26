@@ -1,0 +1,39 @@
+[package]
+name = "talkeando-server"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "talkeando-server"
+path = "src/main.rs"
+
+[dependencies]
+axum = { version = "0.7", features = ["ws", "macros"] }
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "macros", "migrate"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+argon2 = "0.5"
+password-hash = "0.5"
+rand = "0.8"
+base64 = "0.22"
+sha2 = "0.10"
+hmac = "0.12"
+sha1 = "0.10"
+hex = "0.4"
+chrono = { version = "0.4", features = ["serde"] }
+thiserror = "1"
+anyhow = "1"
+tower = "0.4"
+tower-http = { version = "0.5", features = ["cors", "trace"] }
+dotenvy = "0.15"
+clap = { version = "4", features = ["derive"] }
+futures = "0.3"
+
+[dev-dependencies]
+tokio-tungstenite = "0.23"
+reqwest = { version = "0.12", features = ["json"] }
+serial_test = "3"

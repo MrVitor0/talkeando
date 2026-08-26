@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://talkeando.local/protocol/ipc-envelope-v1.schema.json",
+  "title": "Talkeando native/UI IPC envelope v1",
+  "type": "object",
+  "required": ["v", "op", "data"],
+  "properties": {
+    "v": { "const": 1 },
+    "op": { "type": "string", "pattern": "^[a-z]+(\\.[a-z_]+)+$" },
+    "data": { "type": "object" }
+  },
+  "additionalProperties": false
+}

@@ -1,0 +1,12 @@
+# Copy to turnserver.conf and inject TURN_SHARED_SECRET via deployment tooling.
+listening-port=3478
+fingerprint
+use-auth-secret
+static-auth-secret=replace-with-TURN_SHARED_SECRET
+realm=talkeando.example.com
+lt-cred-mech
+no-multicast-peers
+no-cli
+min-port=49160
+max-port=49200
+# Production: configure cert/pkey and expose UDP/TCP 3478 plus relay range.
