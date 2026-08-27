@@ -29,12 +29,12 @@ jobs:
       - name: Configure restricted SSH access
         env:
           DEPLOY_HOST: ${{ secrets.LIGHTSAIL_HOST }}
-          DEPLOY_KEY: ${{ secrets.LIGHTSAIL_SSH_KEY }}
+          DEPLOY_KEY_B64: ${{ secrets.LIGHTSAIL_SSH_KEY_B64 }}
         run: |
           test -n "$DEPLOY_HOST"
-          test -n "$DEPLOY_KEY"
+          test -n "$DEPLOY_KEY_B64"
           install -d -m 700 ~/.ssh
-          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/talkeando-production
+          printf '%s' "$DEPLOY_KEY_B64" | base64 --decode > ~/.ssh/talkeando-production
           chmod 600 ~/.ssh/talkeando-production
           ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
 
@@ -55,4 +55,3 @@ jobs:
               docker compose -f docker-compose.production.yml up -d --build --remove-orphans
               docker compose -f docker-compose.production.yml ps
             '
-
