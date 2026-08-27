@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 
 use uuid::Uuid;
 
-use super::protocol::{ParticipantDto, StreamDto};
+use super::protocol::{ParticipantDto, StreamDto, VoiceRosterEntry};
 
 pub type ChannelId = Uuid;
 pub type UserId = Uuid;
@@ -140,6 +140,67 @@ impl CallRegistry {
             .unwrap_or_default()
     }
 
+    /// Community-visible view of a voice channel: every occupant plus their
+    /// mute/deafen state and whether they currently have a live stream. Empty
+    /// when the channel has no active call (used to clear a stale sidebar row).
+    pub fn roster(&self, channel_id: ChannelId) -> Vec<VoiceRosterEntry> {
+        let Some(call) = self.calls.get(&channel_id) else {
+            return vec![];
+        };
+        call.participants
+            .values()
+            .map(|p| VoiceRosterEntry {
+                user_id: p.user_id,
+                muted: p.muted,
+                deafened: p.deafened,
+                sharing: call.streams.values().any(|s| s.owner == p.user_id),
+            })
+            .collect()
+    }
+
+    /// The live streams in a channel — pairs with `roster` for the community
+    /// broadcast so non-participants can request a hover preview.
+    pub fn roster_streams(&self, channel_id: ChannelId) -> Vec<StreamDto> {
+        self.calls
+            .get(&channel_id)
+            .map(|c| c.streams.values().map(Into::into).collect())
+            .unwrap_or_default()
+    }
+
+    /// True if `user_id` is subscribed to any stream in this channel (they may
+    /// be a spectator, not a call participant) — used to authorise RTC relay
+    /// between a stream owner and an outside viewer.
+    pub fn is_stream_viewer(&self, channel_id: ChannelId, user_id: UserId) -> bool {
+        self.calls
+            .get(&channel_id)
+            .map(|c| c.streams.values().any(|s| s.viewers.contains(&user_id)))
+            .unwrap_or(false)
+    }
+
+    /// Drops `user_id` from every stream's viewer set across all calls (a
+    /// disconnecting spectator). Returns `(channel, stream, owner)` for each
+    /// stream affected so the caller can tell owners to stop sending.
+    pub fn remove_viewer_globally(
+        &mut self,
+        user_id: UserId,
+    ) -> Vec<(ChannelId, StreamId, UserId)> {
+        let mut affected = Vec::new();
+        for (channel_id, call) in self.calls.iter_mut() {
+            for (stream_id, stream) in call.streams.iter_mut() {
+                if stream.viewers.remove(&user_id) {
+                    affected.push((*channel_id, *stream_id, stream.owner));
+                }
+            }
+        }
+        affected
+    }
+
+    /// Channel ids with an active call right now — for the per-connection
+    /// voice.rooms snapshot.
+    pub fn active_channel_ids(&self) -> Vec<ChannelId> {
+        self.calls.keys().copied().collect()
+    }
+
     /// Force-ends a call when its voice channel is deleted. The caller owns
     /// notifying the returned participants; no ephemeral state survives the
     /// channel deletion.
@@ -224,6 +285,10 @@ impl CallRegistry {
     /// can route `stream.subscription_requested` to them. Media only starts
     /// flowing once the owner's client reacts to that message — the
     /// registry itself never moves bytes (SUB-FR-001).
+    ///
+    /// The subscriber need NOT be a call participant: a community member can
+    /// spectate a stream for a hover preview without joining voice. The
+    /// handler is responsible for the community-membership check.
     pub fn subscribe(
         &mut self,
         channel_id: ChannelId,
@@ -231,9 +296,6 @@ impl CallRegistry {
         stream_id: StreamId,
     ) -> Result<UserId, CallOpError> {
         let call = self.calls.get_mut(&channel_id).ok_or(CallOpError::NotInCall)?;
-        if !call.participants.contains_key(&subscriber) {
-            return Err(CallOpError::NotInCall);
-        }
         let stream = call
             .streams
             .get_mut(&stream_id)

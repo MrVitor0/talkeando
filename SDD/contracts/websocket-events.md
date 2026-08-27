@@ -16,9 +16,33 @@ informa `from_user` como dado confiável.
 | `auth.rejected` | S→C + close | `{ code, in_reply_to? }` |
 | `presence.snapshot` | S→C | `{ users: [{ user_id, status }] }` |
 | `presence.update` | S→C | `{ user_id, status }` |
+| `presence.set` | C→S | `{ status: "online" \| "busy" }` — override manual do próprio status |
 
-`status` é `online|offline` na v1. Snapshot inclui todos os membros da
-comunidade, não apenas sockets online.
+`status` é `online|busy|offline`. `busy` (Não Perturbe) é um override em
+memória por usuário no `Hub`, definido por `presence.set` e limpo quando o
+último socket do usuário cai. Enquanto `busy`, o cliente silencia o som de
+notificação de novas mensagens (efeito client-side). Snapshot inclui todos os
+membros da comunidade, não apenas sockets online.
+
+## Atividade (rich presence)
+
+| Op | Direção | Data |
+|---|---|---|
+| `activity.report` | C→S | `{ activities: [Activity], req_id? }` — fire-and-forget, sem ack; substitui a lista inteira do usuário |
+| `activity.snapshot` | S→C | `{ users: [{ user_id, activities: [Activity] }] }` — uma vez, após `presence.snapshot`; só membros com atividade não-vazia |
+| `activity.update` | S→C | `{ user_id, activities: [Activity] }` — broadcast em mudança; `[]` = limpou |
+
+`Activity = { kind: "playing"|"listening"|"watching"|"browsing", name,
+details?, state?, started_at?, asset_image?, asset_text? }`. Detecção é no
+cliente nativo: SMTC (mídia) + Steam/lista curada (jogos). `asset_image` é um
+ref opaco resolvido pela UI: `"steam:<appid>"`, `"att:<sha256>"`
+(`GET /api/activity-assets/:id`, sem auth) ou URL absoluta. Efêmero, nunca
+persistido. Servidor sanea (≤4 itens, clamp de strings) e faz dedupe.
+
+Só **S→C** e só para `kind: "playing"`, o servidor acrescenta campos
+derivados do ledger `game_sessions`: `total_seconds` (int), `last_played_at`
+(RFC3339), `is_new` (bool — 1ª sessão < 24h). O cliente nunca envia esses
+campos (são zerados na entrada). Ver `specs/activity.md`.
 
 ## Chat
 
@@ -31,6 +55,17 @@ comunidade, não apenas sockets online.
 | `chat.message.delete` | C→S | `{ req_id, message_id }` |
 | `chat.message.deleted` | S→C | `{ message_id, channel_id, in_reply_to? }` |
 | `chat.typing` | bidi | C→S `{ channel_id }`; S→C adiciona `user_id` |
+
+## Perfil e canais (edições "botão direito")
+
+Sem op de entrada — as mutações entram por REST (`PATCH /api/me`,
+`POST /api/me/avatar`, `PATCH /api/users/:id`, `PATCH /api/channels/:id/name`)
+e o servidor faz o fan-out abaixo para a comunidade.
+
+| Op | Direção | Data |
+|---|---|---|
+| `member.updated` | S→C | `{ user_id, display_name, avatar_url?, avatar_color?, profile_tag? }` — renome ou troca de avatar; broadcast para quem compartilha comunidade. O host converte `avatar_url` para `data:` URI. |
+| `channel.updated` | S→C | `{ id, name, kind, category_id? }` — canal renomeado (só nome). |
 
 ## Call e RTC
 

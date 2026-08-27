@@ -241,9 +241,18 @@ UI, no read receipts in v1 (explicit scope cuts).
 
 ## UI states
 
-- `MessageList`: loading (initial history fetch), loaded, loading-more
-  (scrolled to top, fetching older page), empty, error (history fetch
-  failed — shows retry button, distinct from the "empty" state).
+- `MessageList`: loading (initial history fetch — rendered as a
+  bottom-anchored **skeleton** sized to the channel's last-known message
+  count, persisted per channel in `localStorage` as `tk.msgCount.<id>`, not
+  a spinner/flash), loaded, loading-more (scrolled to top, fetching older
+  page), empty, error (history fetch failed — shows retry button, distinct
+  from the "empty" state). The skeleton shows only on the **first** visit to
+  a channel per session: re-entering a channel already hydrated restores its
+  message list from the in-session per-channel cache (CHAT-NFR-005)
+  instantly and re-fetches silently in the background, so channel-switching
+  never flashes a loading state. The `chat.history` IPC payload carries
+  `channel_id` so a slow reply for a channel the user already left updates
+  only that channel's cache, never the visible list.
 - Individual message: normal, pending, failed, editing, delete-confirming,
   edited (badge), deleted (never rendered — removed from list).
 - Composer: idle, disabled (channel not yet loaded / not connected —

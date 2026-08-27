@@ -1,0 +1,5 @@
+{$API_DOMAIN} {
+    encode zstd gzip
+
+    reverse_proxy talkeando-server:8080
+}

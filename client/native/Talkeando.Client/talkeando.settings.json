@@ -1,0 +1,4 @@
+{
+  "apiBaseUrl": "https://api.journeycalendar.site/api",
+  "webSocketUrl": "wss://api.journeycalendar.site/ws"
+}

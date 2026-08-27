@@ -83,6 +83,98 @@ pub struct PresenceUpdate {
     pub status: String,
 }
 
+/// Inbound `presence.set` — a member toggling their own status. v1 accepts
+/// `"online"` and `"busy"` (DND); `"busy"` also silences their own
+/// new-message notifications, which is a client-side effect.
+#[derive(Debug, Deserialize)]
+pub struct PresenceSet {
+    pub status: String,
+}
+
+// ---- activity.* ----
+// Ephemeral "rich presence": what a member is playing/listening to outside
+// Talkeando. Client-detected (native SMTC / process scan), never persisted.
+// Catalog: SDD/specs/activity.md.
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+pub struct Activity {
+    pub kind: String, // "playing" | "listening" | "watching" | "browsing"
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub details: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<String>, // RFC3339, opaque to the server
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asset_image: Option<String>, // opaque ref resolved by the UI ("steam:<appid>", "att:<hash>", URL)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub asset_text: Option<String>,
+
+    // ---- server-derived, outbound only (ACT-FR-032). Clients never set
+    // these; `sanitize` forces them to None on the way in, and the aggregate
+    // step fills them for `kind == "playing"` on the way out. ----
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_seconds: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_played_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_new: Option<bool>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ActivityReport {
+    #[serde(default)]
+    pub activities: Vec<Activity>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub req_id: Option<String>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct ActivityEntry {
+    pub user_id: Uuid,
+    pub activities: Vec<Activity>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ActivitySnapshot {
+    pub users: Vec<ActivityEntry>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct ActivityUpdate {
+    pub user_id: Uuid,
+    pub activities: Vec<Activity>,
+}
+
+// ---- member.updated / channel.updated ----
+// Outbound-only community broadcasts for the lightweight "right-click to
+// rename" edits (display name, avatar, channel name). No inbound op — the
+// mutations land over REST (routes/profile.rs, routes/channels.rs) and the
+// resulting row is fanned out here so every client's sidebar/roster stays
+// live without a refetch.
+
+#[derive(Debug, Serialize)]
+pub struct MemberUpdated {
+    pub user_id: Uuid,
+    pub display_name: String,
+    /// `/api/users/<id>/avatar` when the member has one, else `None`. The
+    /// native host inlines this to a `data:` URI before it reaches the UI
+    /// (IpcBridge.HandleNetworkEvent), same as it does for bootstrap avatars.
+    pub avatar_url: Option<String>,
+    pub avatar_color: Option<String>,
+    pub profile_tag: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ChannelUpdated {
+    pub id: Uuid,
+    pub name: String,
+    pub kind: String,
+    pub category_id: Option<Uuid>,
+}
+
 // ---- chat.* ----
 
 #[derive(Debug, Deserialize)]
@@ -212,6 +304,33 @@ pub struct CallStateUpdateEvent {
     pub user_id: Uuid,
     pub muted: bool,
     pub deafened: bool,
+}
+
+// ---- voice.roster / voice.rooms ----
+// Community-wide, low-frequency projection of who is in each voice channel so
+// the sidebar can render occupants live even for channels the viewer has not
+// joined. Distinct from call.* (which is scoped to a call's own participants).
+
+#[derive(Debug, Serialize, Clone)]
+pub struct VoiceRosterEntry {
+    pub user_id: Uuid,
+    pub muted: bool,
+    pub deafened: bool,
+    pub sharing: bool,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct VoiceRoster {
+    pub channel_id: Uuid,
+    pub participants: Vec<VoiceRosterEntry>,
+    /// Live streams in this channel, so a member who has *not* joined can still
+    /// request a hover preview (spectator subscribe — see handler.rs).
+    pub streams: Vec<StreamDto>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct VoiceRoomsSnapshot {
+    pub rooms: Vec<VoiceRoster>,
 }
 
 // ---- rtc.* ---- (relayed verbatim between two participants of the same call)

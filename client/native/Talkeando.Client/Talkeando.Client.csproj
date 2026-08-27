@@ -3,6 +3,11 @@
     <OutputType>WinExe</OutputType>
     <TargetFramework>net6.0-windows10.0.19041.0</TargetFramework>
     <UseWPF>true</UseWPF>
+    <!-- WinForms is referenced only for System.Windows.Forms.Screen /
+         SystemInformation (monitor geometry) and the System.Drawing GDI
+         capture path in ScreenCapture.cs — no WinForms UI is shown. -->
+    <UseWindowsForms>true</UseWindowsForms>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
   </PropertyGroup>
@@ -16,5 +21,6 @@
   </ItemGroup>
   <ItemGroup>
     <Content Include="..\..\ui\dist\**\*" Link="ui\%(RecursiveDir)%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
+    <Content Include="talkeando.settings.json" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>

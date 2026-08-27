@@ -100,10 +100,10 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         }
     };
     let mut entries = Vec::with_capacity(members.len());
-    for member_id in members {
+    for member_id in &members {
         entries.push(PresenceEntry {
-            user_id: member_id,
-            status: if state.hub.is_online(member_id).await { "online" } else { "offline" }.to_string(),
+            user_id: *member_id,
+            status: state.hub.status_for(*member_id).await,
         });
     }
     let snapshot = PresenceSnapshot { users: entries };
@@ -111,6 +111,22 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         .hub
         .send_to_connection(user_id, connection_id, OutboundEnvelope::new("presence.snapshot", snapshot))
         .await;
+    // ACT-FR-005: right after presence.snapshot, hand this connection the
+    // current activity of every member who has any (absent = empty list),
+    // each game enriched with its lifetime playtime (ACT-FR-032).
+    let mut activity_users = state.hub.activities.read().await.snapshot_for(&members);
+    for entry in activity_users.iter_mut() {
+        enrich_playtime(&state, entry.user_id, &mut entry.activities).await;
+    }
+    state
+        .hub
+        .send_to_connection(
+            user_id,
+            connection_id,
+            OutboundEnvelope::new("activity.snapshot", ActivitySnapshot { users: activity_users }),
+        )
+        .await;
+    send_voice_rooms_snapshot(&state, user_id, connection_id).await;
     if !was_online && !cancelled_offline_grace {
         broadcast_presence_update(&state, user_id, "online").await;
     }
@@ -161,6 +177,18 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         for channel_id in channels {
             teardown_call_membership(&delayed_state, channel_id, user_id, "disconnected").await;
         }
+        teardown_spectator_subscriptions(&delayed_state, user_id).await;
+        // ACT-FR-006: clear this user's activity in the same grace window,
+        // and close any playtime rows left open (ACT-FR-031).
+        if delayed_state.hub.activities.write().await.clear(user_id) {
+            broadcast_activity_update(&delayed_state, user_id, Vec::new()).await;
+        }
+        // Drop any "busy" override so a later reconnect comes back as plain
+        // online; the "offline" broadcast below already covers the visible state.
+        delayed_state.hub.clear_status(user_id).await;
+        if let Err(error) = db::close_all_game_sessions(&delayed_state.pool, user_id).await {
+            tracing::warn!(%user_id, %error, "failed to close game sessions on disconnect");
+        }
         broadcast_presence_update(&delayed_state, user_id, "offline").await;
         tracing::info!(%user_id, "ws disconnect grace period elapsed");
     });
@@ -178,6 +206,91 @@ async fn broadcast_presence_update(state: &AppState, user_id: Uuid, status: &str
             ),
         ).await,
         Err(error) => tracing::error!(%user_id, %error, "failed to resolve presence recipients"),
+    }
+}
+
+async fn broadcast_activity_update(state: &AppState, user_id: Uuid, activities: Vec<Activity>) {
+    match db::related_member_ids(&state.pool, user_id).await {
+        Ok(user_ids) => {
+            state
+                .hub
+                .broadcast_to(
+                    &user_ids,
+                    OutboundEnvelope::new("activity.update", ActivityUpdate { user_id, activities }),
+                )
+                .await
+        }
+        Err(error) => tracing::error!(%user_id, %error, "failed to resolve activity recipients"),
+    }
+}
+
+/// ACT-FR-001/003/004: fire-and-forget rich-presence report. Sanitize the
+/// client's list, replace what we hold for this user, and broadcast to the
+/// community (including the sender, so multi-device clients converge) only
+/// when the sanitized state actually changed. On a change we also reconcile
+/// the persistent playtime ledger (ACT-FR-031) and enrich each game with its
+/// lifetime aggregates before broadcasting (ACT-FR-032).
+async fn handle_activity_report(state: &AppState, user_id: Uuid, data: ActivityReport) {
+    let (mut activities, dropped) = crate::ws::activity::ActivityRegistry::sanitize(data.activities);
+    if dropped > 0 {
+        tracing::warn!(%user_id, dropped, "activity.report had items dropped by validation");
+    }
+    let previous = state.hub.activities.read().await.get(user_id);
+    let changed = state.hub.activities.write().await.set(user_id, activities.clone());
+    if !changed {
+        return;
+    }
+    reconcile_game_sessions(state, user_id, &previous, &activities).await;
+    enrich_playtime(state, user_id, &mut activities).await;
+    tracing::debug!(%user_id, count = activities.len(), "activity.update");
+    broadcast_activity_update(state, user_id, activities).await;
+}
+
+/// Open a playtime row for each game that just appeared in the user's report
+/// and close the row for each one that just disappeared (ACT-FR-031).
+async fn reconcile_game_sessions(
+    state: &AppState,
+    user_id: Uuid,
+    previous: &[Activity],
+    current: &[Activity],
+) {
+    use crate::ws::activity::game_key;
+    use std::collections::HashMap;
+    let prev: HashMap<String, ()> =
+        previous.iter().filter_map(|a| game_key(a).map(|k| (k, ()))).collect();
+    let curr: HashMap<String, String> =
+        current.iter().filter_map(|a| game_key(a).map(|k| (k, a.name.clone()))).collect();
+    for (key, name) in &curr {
+        if !prev.contains_key(key) {
+            if let Err(error) = db::open_game_session(&state.pool, user_id, key, name).await {
+                tracing::warn!(%user_id, key, %error, "failed to open game session");
+            }
+        }
+    }
+    for key in prev.keys() {
+        if !curr.contains_key(key) {
+            if let Err(error) = db::close_game_session(&state.pool, user_id, key).await {
+                tracing::warn!(%user_id, key, %error, "failed to close game session");
+            }
+        }
+    }
+}
+
+/// Fill `total_seconds` / `last_played_at` / `is_new` on every `kind ==
+/// "playing"` activity from the playtime ledger (ACT-FR-032). `user_id` is
+/// the member the activities belong to, not necessarily the viewer.
+async fn enrich_playtime(state: &AppState, user_id: Uuid, activities: &mut [Activity]) {
+    use crate::ws::activity::game_key;
+    for activity in activities.iter_mut() {
+        let Some(key) = game_key(activity) else { continue };
+        match db::game_stats(&state.pool, user_id, &key).await {
+            Ok(stats) => {
+                activity.total_seconds = Some(stats.total_seconds);
+                activity.last_played_at = stats.last_played_at.map(|time| time.to_rfc3339());
+                activity.is_new = Some(stats.is_new);
+            }
+            Err(error) => tracing::warn!(%user_id, key, %error, "failed to load game stats"),
+        }
     }
 }
 
@@ -217,6 +330,30 @@ async fn teardown_call_membership(
                 OutboundEnvelope::new(
                     "stream.unpublished",
                     StreamUnpublished { channel_id, stream_id },
+                ),
+            )
+            .await;
+    }
+
+    broadcast_voice_roster(state, channel_id).await;
+}
+
+/// A disconnecting client may have been spectating streams in channels it
+/// never joined (hover previews). Drop it from every stream's viewer set and
+/// tell the affected owners so they stop sending.
+async fn teardown_spectator_subscriptions(state: &AppState, user_id: Uuid) {
+    let affected = {
+        let mut calls = state.hub.calls.write().await;
+        calls.remove_viewer_globally(user_id)
+    };
+    for (channel_id, stream_id, owner) in affected {
+        state
+            .hub
+            .send_to(
+                owner,
+                OutboundEnvelope::new(
+                    "stream.unsubscribed",
+                    StreamUnsubscribed { channel_id, stream_id, subscriber: user_id },
                 ),
             )
             .await;
@@ -272,6 +409,16 @@ async fn dispatch(state: &AppState, user_id: Uuid, text: &str, joined_calls: &mu
         "chat.message.delete" => {
             let data: ChatMessageDelete = parse_or_reject!(ChatMessageDelete);
             handle_chat_delete(state, user_id, data).await;
+        }
+        "activity.report" => {
+            let data: ActivityReport = parse_or_reject!(ActivityReport);
+            handle_activity_report(state, user_id, data).await;
+        }
+        "presence.set" => {
+            let data: PresenceSet = parse_or_reject!(PresenceSet);
+            let status = if data.status == "busy" { "busy" } else { "online" };
+            state.hub.set_status(user_id, status).await;
+            broadcast_presence_update(state, user_id, status).await;
         }
         "chat.typing" => {
             let data: ChatTyping = parse_or_reject!(ChatTyping);
@@ -672,6 +819,8 @@ async fn handle_call_join(
             ),
         )
         .await;
+
+    broadcast_voice_roster(state, data.channel_id).await;
 }
 
 async fn broadcast_to_community(state: &AppState, community_id: Uuid, event: OutboundEnvelope) {
@@ -679,6 +828,70 @@ async fn broadcast_to_community(state: &AppState, community_id: Uuid, event: Out
         Ok(user_ids) => state.hub.broadcast_to(&user_ids, event).await,
         Err(error) => tracing::error!(%community_id, %error, "failed to resolve community realtime recipients"),
     };
+}
+
+/// Push the current occupants of one voice channel to the whole community so
+/// every member's sidebar stays live — even members who have not joined that
+/// call. Call after any change to a call's membership, mute/deafen state, or
+/// stream set. Sends an empty roster when the call has ended so stale rows clear.
+async fn broadcast_voice_roster(state: &AppState, channel_id: Uuid) {
+    let community_id = match db::channel_community(&state.pool, channel_id).await {
+        Ok(Some(community_id)) => community_id,
+        Ok(None) => return,
+        Err(error) => {
+            tracing::error!(%channel_id, %error, "failed to resolve voice roster community");
+            return;
+        }
+    };
+    let (participants, streams) = {
+        let calls = state.hub.calls.read().await;
+        (calls.roster(channel_id), calls.roster_streams(channel_id))
+    };
+    broadcast_to_community(
+        state,
+        community_id,
+        OutboundEnvelope::new(
+            "voice.roster",
+            VoiceRoster { channel_id, participants, streams },
+        ),
+    )
+    .await;
+}
+
+/// One-shot roster snapshot for a freshly connected client: every voice
+/// channel with an active call that lives in a community the user belongs to.
+async fn send_voice_rooms_snapshot(state: &AppState, user_id: Uuid, connection_id: Uuid) {
+    let active = state.hub.calls.read().await.active_channel_ids();
+    let rooms = if active.is_empty() {
+        vec![]
+    } else {
+        match db::visible_channel_ids(&state.pool, user_id, &active).await {
+            Ok(visible) => {
+                let calls = state.hub.calls.read().await;
+                visible
+                    .into_iter()
+                    .map(|channel_id| VoiceRoster {
+                        channel_id,
+                        participants: calls.roster(channel_id),
+                        streams: calls.roster_streams(channel_id),
+                    })
+                    .filter(|roster| !roster.participants.is_empty())
+                    .collect()
+            }
+            Err(error) => {
+                tracing::error!(%user_id, %error, "failed to build voice rooms snapshot");
+                vec![]
+            }
+        }
+    };
+    state
+        .hub
+        .send_to_connection(
+            user_id,
+            connection_id,
+            OutboundEnvelope::new("voice.rooms", VoiceRoomsSnapshot { rooms }),
+        )
+        .await;
 }
 
 async fn handle_call_state_update(
@@ -711,6 +924,8 @@ async fn handle_call_state_update(
             },
         ),
     ).await;
+
+    broadcast_voice_roster(state, data.channel_id).await;
 }
 
 async fn relay_rtc(
@@ -723,7 +938,13 @@ async fn relay_rtc(
 ) {
     let ok = {
         let calls = state.hub.calls.read().await;
-        calls.is_participant(channel_id, from) && calls.is_participant(channel_id, to)
+        // Either end may be a spectator (subscribed to a stream in this
+        // channel) rather than a full call participant — that pairing carries
+        // the owner→viewer screen-share offer/answer/ice.
+        let endpoint_allowed = |uid| {
+            calls.is_participant(channel_id, uid) || calls.is_stream_viewer(channel_id, uid)
+        };
+        endpoint_allowed(from) && endpoint_allowed(to)
     };
     if !ok {
         state
@@ -814,6 +1035,8 @@ async fn handle_stream_publish(state: &AppState, user_id: Uuid, data: StreamPubl
             ),
         )
         .await;
+
+    broadcast_voice_roster(state, data.channel_id).await;
 }
 
 async fn handle_stream_unpublish(state: &AppState, user_id: Uuid, data: StreamUnpublish) {
@@ -837,6 +1060,7 @@ async fn handle_stream_unpublish(state: &AppState, user_id: Uuid, data: StreamUn
                     ),
                 )
                 .await;
+            broadcast_voice_roster(state, data.channel_id).await;
         }
         Err(CallOpError::NotStreamOwner) => {
             state
@@ -854,6 +1078,27 @@ async fn handle_stream_unpublish(state: &AppState, user_id: Uuid, data: StreamUn
 }
 
 async fn handle_stream_subscribe(state: &AppState, user_id: Uuid, data: StreamSubscribe) {
+    // A subscriber who is not already in the call may still spectate a stream
+    // (hover preview from the sidebar) as long as they belong to the channel's
+    // community. Participants are trivially members, so one check covers both.
+    let is_participant = state
+        .hub
+        .calls
+        .read()
+        .await
+        .is_participant(data.channel_id, user_id);
+    if !is_participant {
+        match db::channel_if_member(&state.pool, data.channel_id, user_id).await {
+            Ok(Some(_)) => {}
+            _ => {
+                state
+                    .hub
+                    .send_to(user_id, OutboundEnvelope::error("forbidden", "not a member of this channel's community", None))
+                    .await;
+                return;
+            }
+        }
+    }
     let result = {
         let mut calls = state.hub.calls.write().await;
         calls.subscribe(data.channel_id, user_id, data.stream_id)

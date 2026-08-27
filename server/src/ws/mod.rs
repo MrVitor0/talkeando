@@ -1,3 +1,4 @@
+pub mod activity;
 pub mod call_registry;
 pub mod handler;
 pub mod hub;

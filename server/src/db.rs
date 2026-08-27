@@ -11,6 +11,11 @@ pub struct User {
     #[serde(skip_serializing)]
     pub password_hash: String,
     pub avatar_color: Option<String>,
+    pub avatar_storage_path: Option<String>,
+    pub avatar_content_type: Option<String>,
+    pub profile_tag: Option<String>,
+    pub profile_badge_storage_path: Option<String>,
+    pub profile_badge_content_type: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -20,6 +25,9 @@ pub struct PublicUser {
     pub username: String,
     pub display_name: String,
     pub avatar_color: Option<String>,
+    pub avatar_url: Option<String>,
+    pub profile_tag: Option<String>,
+    pub profile_badge_url: Option<String>,
 }
 
 impl From<User> for PublicUser {
@@ -29,6 +37,9 @@ impl From<User> for PublicUser {
             username: u.username,
             display_name: u.display_name,
             avatar_color: u.avatar_color,
+            avatar_url: u.avatar_storage_path.map(|_| format!("/api/users/{}/avatar", u.id)),
+            profile_tag: u.profile_tag,
+            profile_badge_url: u.profile_badge_storage_path.map(|_| format!("/api/users/{}/profile-badge", u.id)),
         }
     }
 }
@@ -116,6 +127,40 @@ pub async fn channel_if_member(
     .await
 }
 
+/// The community that owns a channel, if it exists. Used to fan a voice-roster
+/// update out to the right community without loading the whole `Channel` row.
+pub async fn channel_community(
+    pool: &PgPool,
+    channel_id: Uuid,
+) -> Result<Option<Uuid>, sqlx::Error> {
+    let row: Option<(Uuid,)> =
+        sqlx::query_as("SELECT community_id FROM channels WHERE id = $1")
+            .bind(channel_id)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.map(|(id,)| id))
+}
+
+/// Of the given channel ids, the subset that live in a community `user_id`
+/// belongs to — so the voice.rooms snapshot never leaks rooms across
+/// communities.
+pub async fn visible_channel_ids(
+    pool: &PgPool,
+    user_id: Uuid,
+    channel_ids: &[Uuid],
+) -> Result<Vec<Uuid>, sqlx::Error> {
+    let rows: Vec<(Uuid,)> = sqlx::query_as(
+        "SELECT c.id FROM channels c \
+         JOIN community_members cm ON cm.community_id = c.community_id \
+         WHERE cm.user_id = $1 AND c.id = ANY($2)",
+    )
+    .bind(user_id)
+    .bind(channel_ids)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|(id,)| id).collect())
+}
+
 /// All users who may receive community-scoped realtime events. Keeping this
 /// lookup next to the membership guard makes it hard for a new WS event to
 /// accidentally fan out across communities.
@@ -130,6 +175,83 @@ pub async fn community_member_ids(
     .fetch_all(pool)
     .await?;
     Ok(rows.into_iter().map(|(user_id,)| user_id).collect())
+}
+
+// ---- game_sessions (SDD/specs/activity.md, ACT-FR-030..032) ----
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct GameStats {
+    pub total_seconds: i64,
+    pub last_played_at: Option<DateTime<Utc>>,
+    pub is_new: bool,
+}
+
+/// Open a playtime row for a game the user just started, unless one is
+/// already open (partial unique index on `(user_id, game_key) WHERE ended_at
+/// IS NULL` makes this a no-op on conflict).
+pub async fn open_game_session(
+    pool: &PgPool,
+    user_id: Uuid,
+    game_key: &str,
+    game_name: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "INSERT INTO game_sessions (user_id, game_key, game_name) VALUES ($1, $2, $3) \
+         ON CONFLICT (user_id, game_key) WHERE ended_at IS NULL DO NOTHING",
+    )
+    .bind(user_id)
+    .bind(game_key)
+    .bind(game_name)
+    .execute(pool)
+    .await
+    .map(|_| ())
+}
+
+/// Close the open playtime row for one game (the user stopped playing it).
+pub async fn close_game_session(pool: &PgPool, user_id: Uuid, game_key: &str) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE game_sessions SET ended_at = now() WHERE user_id = $1 AND game_key = $2 AND ended_at IS NULL",
+    )
+    .bind(user_id)
+    .bind(game_key)
+    .execute(pool)
+    .await
+    .map(|_| ())
+}
+
+/// Close every open playtime row for a user (disconnect).
+pub async fn close_all_game_sessions(pool: &PgPool, user_id: Uuid) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE game_sessions SET ended_at = now() WHERE user_id = $1 AND ended_at IS NULL")
+        .bind(user_id)
+        .execute(pool)
+        .await
+        .map(|_| ())
+}
+
+/// Close rows left open by a crash — their real duration is unknown, so the
+/// session is worth zero seconds (ended_at = started_at). Run at startup.
+pub async fn close_dangling_game_sessions(pool: &PgPool) -> Result<u64, sqlx::Error> {
+    let result =
+        sqlx::query("UPDATE game_sessions SET ended_at = started_at WHERE ended_at IS NULL")
+            .execute(pool)
+            .await?;
+    Ok(result.rows_affected())
+}
+
+/// Lifetime aggregates for one (user, game): total seconds played, when it
+/// was last played, and whether the very first session began under 24h ago.
+pub async fn game_stats(pool: &PgPool, user_id: Uuid, game_key: &str) -> Result<GameStats, sqlx::Error> {
+    sqlx::query_as::<_, GameStats>(
+        "SELECT \
+           COALESCE(SUM(EXTRACT(EPOCH FROM (COALESCE(ended_at, now()) - started_at)))::bigint, 0) AS total_seconds, \
+           MAX(COALESCE(ended_at, now())) AS last_played_at, \
+           COALESCE(MIN(started_at) > now() - INTERVAL '24 hours', true) AS is_new \
+         FROM game_sessions WHERE user_id = $1 AND game_key = $2",
+    )
+    .bind(user_id)
+    .bind(game_key)
+    .fetch_one(pool)
+    .await
 }
 
 /// All members sharing at least one community with `user_id`. v1 has a

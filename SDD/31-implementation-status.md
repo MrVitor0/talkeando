@@ -217,6 +217,114 @@ que descrevia, incorretamente, reenvio com `req_id` novo).
   padrão do Inno Setup, mas fica registrada como não-verificada por
   compilação real.
 
+### Atividade / rich presence (nova feature — `specs/activity.md`)
+
+- **Fase 1 (SMTC / "Ouvindo") implementada de ponta a ponta**, ainda não
+  validada em runtime real:
+  - **Servidor**: `ws/protocol.rs` (structs `Activity`/`ActivityReport`/
+    `ActivitySnapshot`/`ActivityUpdate`), `ws/activity.rs` (`ActivityRegistry`
+    em memória no `Hub` — sanea ≤4 itens + clamp de strings, dedupe por
+    igualdade estrutural), `ws/handler.rs` (`handle_activity_report`,
+    `activity.snapshot` logo após `presence.snapshot`, limpeza no mesmo
+    grace task de 8s do disconnect). `cargo check` limpo; 4 testes unit de
+    `ws::activity` passando (`cargo test --lib activity`).
+  - **Cliente nativo**: `ActivityMonitor.cs` — observa
+    `GlobalSystemMediaTransportControlsSessionManager` (WinRT, TFM já é
+    `net6.0-windows10.0.19041.0`, sem pacote novo) + poll de 10s, mapeia
+    para `Activity` (só quando `PlaybackStatus == Playing`), debounce de 4s,
+    `SetEnabled` para o opt-out. `IpcBridge` ganhou o op IPC `activity.config`
+    e injeta o report direto no WebSocket. `dotnet build` limpo (0/0).
+  - **UI**: `ActivityPanel` no topo do `<aside className="members">`
+    (cabeçalho "Atividade — N", cronômetro ao vivo por atividade), handlers
+    `activity.snapshot`/`activity.update`, toggle "Compartilhar atividade"
+    (localStorage `tk.shareActivity`, envia `activity.config`). `tsc -b &&
+    vite build` limpo.
+  - **Contratos**: `contracts/websocket-events.md` e
+    `contracts/ipc-native-ui.md` atualizados.
+  - **Pendente da Fase 1**: `server/tests/activity_test.rs` está escrito e
+    compila, mas não foi executado nesta sessão (o `.exe` do servidor
+    estava em uso e falta Postgres local no ambiente do agente); teste
+    manual com dois clientes reais (Spotify tocando → linha aparece no
+    outro com o tempo correndo; pause → some; toggle off → some); teste
+    unit do mapeamento SMTC no cliente C#.
+  - **Correção colateral**: `server/Cargo.toml` — `reqwest` estava sem as
+    features `json`/`multipart` no working tree (movido de dev-dependency
+    para dependency numa mudança anterior não commitada), o que quebrava a
+    compilação de **todo** o `server/tests/`. Features re-adicionadas.
+- **Fase 2 (detecção de jogo) implementada**, sem teste em runtime:
+  - **Cliente**: `ActivityMonitor` agora também detecta jogo — Steam
+    (`RunningAppID` do registry + parse de `libraryfolders.vdf` /
+    `appmanifest_<appid>.acf` para o nome, `asset_image="steam:<appid>"`) e
+    uma lista curada de ~35 títulos não-Steam por nome de `.exe`, com o
+    ícone do executável extraído (`Icon.ExtractAssociatedIcon`) e enviado a
+    `POST /api/activity-assets` → `asset_image="att:<sha256>"` (cacheado por
+    jogo). Heurística de fullscreen para jogos desconhecidos **não** foi
+    feita (risco de falso-positivo).
+  - **Servidor**: `routes/activity_assets.rs` — store endereçado por hash
+    de conteúdo em `{ATTACHMENT_STORAGE_PATH}/_activity_assets/`, `POST`
+    autenticado (png/jpeg ≤512 KiB), `GET` **sem auth** (hash não-adivinhável,
+    é só um ícone, e a UI do WebView não tem token). Sem tabela — o
+    filesystem é o store, dedupe = arquivo já existe.
+  - **UI**: `resolveActivityArt` resolve `steam:` (→ `header.jpg` do CDN
+    Steam), `att:` (→ `{apiBaseUrl}/activity-assets/<hash>`, com `apiBaseUrl`
+    novo no `app.bootstrap`) e URL absoluta; `<img class="activity__art">`
+    na linha, com `onError` que esconde. Não há CSP no app, então nada a
+    liberar.
+- **Fase 3 (tempo de jogo) implementada**, sem teste em runtime:
+  - **Migration** `0005_game_sessions.sql` (spec dizia 0004; já ocupada) —
+    índice único parcial garante ≤1 sessão aberta por (usuário, jogo).
+  - **Servidor**: `db.rs` ganhou `open/close/close_all/close_dangling_game_sessions`
+    e `game_stats` (total_seconds / last_played_at / is_new numa query).
+    `handle_activity_report` faz o diff de `game_key` (`steam:<appid>` ou
+    `name:<lower>`) entre o report anterior e o novo, abrindo/fechando
+    linhas; a grace task de disconnect fecha as abertas; `main::serve`
+    fecha as penduradas de um crash no startup (`ended_at = started_at`).
+    `activity.update` e o `activity.snapshot` de conexão nova enriquecem
+    cada `Activity` de jogo com os agregados; `sanitize` zera esses campos
+    na entrada.
+  - **UI**: "Xh jogadas" / "Xmin jogadas" a partir de `total_seconds`;
+    badge "Novo jogador" quando `is_new`. `last_played_at` não é exibido
+    (o jogo está ativo agora; campo reservado p/ um futuro "jogados
+    recentemente").
+  - Builds: `cargo check` limpo (patchei também `routes/messages.rs`, que
+    estava quebrado no working tree — faltava `profile_badge_url` no
+    `PublicUser` de `HistoryMessage`, mudança de outra pessoa; pus `None`);
+    5 testes unit de `ws::activity` passando; `npm run build` limpo;
+    `dotnet build` compila (cópia do `.exe` falha só porque o app está
+    aberto).
+- **Pendente das Fases 2–3**: `server/tests/activity_test.rs` (soma de
+  duração, fechamento no disconnect, `is_new`) — não escrito ainda, e a
+  harness de integração do server precisa de Postgres local; teste manual
+  com um jogo Steam e um não-Steam reais; teste unit do `ActivityMonitor`
+  no C#.
+- **Fase 4 (Discord RPC pipe) implementada**, sem teste em runtime:
+  - `DiscordRpcListener.cs` — `NamedPipeServerStream("discord-ipc-0")` (4
+    instâncias), framing binário do IPC do Discord, handshake → `READY`,
+    ping→pong, `SET_ACTIVITY` → `RpcActivity`. Só cria o pipe se nenhum
+    `Discord*.exe` roda; um timer de 15s libera o pipe se o Discord
+    aparecer. Nome do jogo resolvido via
+    `GET discord.com/api/v10/applications/<id>/rpc` (cache, fallback "Jogo").
+  - `ActivityMonitor.BuildAsync` dá prioridade à RPC sobre Steam/lista
+    curada para o slot "playing"; o listener é ligado/desligado junto com o
+    toggle de privacidade.
+- **Fase 5 (refinos) implementada**, sem teste em runtime:
+  - **Arte de álbum**: `ActivityMonitor.ReadThumbnailAsync` lê o thumbnail
+    do SMTC → sobe uma vez por faixa → `asset_image="att:<hash>"`
+    (`UploadActivityAssetAsync` agora aceita `contentType`, png ou jpeg).
+  - **Retry de upload**: `AssetRefAsync` com cooldown crescente (30s ×
+    tentativa) até 4 tentativas, depois desiste pela sessão — não mais a
+    sentinela permanente.
+  - **Mixed content eliminado**: `IpcBridge.HandleNetworkEvent` intercepta
+    `activity.snapshot`/`activity.update` e troca `att:<hash>` por um `data:`
+    URI (`NetworkClient.GetActivityAssetDataUriAsync`, com token). O WebView
+    nunca mais toca a origem da API para arte de atividade; `steam:`/`https:`/
+    `data:` passam direto (UI ganhou o branch `data:`).
+  - Builds: `cargo check` limpo, `npm run build` limpo, `dotnet build`
+    compila 0 erros CS (cópia do `.exe` falha só porque o app está aberto).
+- **Pendente das Fases 4–5**: teste manual (capa do Spotify aparece; jogo
+  via RPC com details/state; nome do jogo RPC resolve; pipe some quando abre
+  o Discord); nenhum teste automatizado do `DiscordRpcListener`.
+
 ## Ainda pendente
 
 ### Bloqueadores de V1

@@ -1,7 +1,10 @@
-use clap::{Parser, Subcommand};
-use sqlx::postgres::PgPoolOptions;
+use std::{path::PathBuf, str::FromStr};
 
-use talkeando_server::{auth, build_app, config::Config, run_migrations, state::AppState, telemetry};
+use clap::{Parser, Subcommand};
+use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
+use sqlx::Executor;
+
+use talkeando_server::{auth, build_app, config::Config, discord_import, run_migrations, state::AppState, telemetry};
 
 #[derive(Parser)]
 struct Cli {
@@ -22,8 +25,14 @@ enum Command {
         password: String,
         #[arg(long)]
         display_name: String,
-        #[arg(long, default_value = "Talkeando")]
+        #[arg(long, default_value = "Estação Finita")]
         community_name: String,
+    },
+    /// Imports the Discord message responses captured in a HAR archive.
+    ImportDiscordHar {
+        /// HAR file copied from the machine that captured the Discord history.
+        #[arg(long)]
+        har_path: PathBuf,
     },
 }
 
@@ -34,9 +43,26 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     let config = Config::from_env();
+
+    // Neon's PgBouncer pooler endpoint (`ep-xxx-pooler.<region>...`) runs in
+    // transaction mode: it hands out sessions with an empty `search_path`
+    // (so unqualified `CREATE TABLE` in the migrations fails with "no schema
+    // has been selected to create in") and rejects the `options=search_path`
+    // startup parameter outright. Talk to the direct endpoint instead — this
+    // is a ~10-person deployment, the pooler buys us nothing.
+    let database_url = config.database_url.replace("-pooler.", ".");
+    let connect_options = PgConnectOptions::from_str(&database_url)?;
     let pool = PgPoolOptions::new()
         .max_connections(10)
-        .connect(&config.database_url)
+        .after_connect(|conn, _meta| {
+            Box::pin(async move {
+                // Harmless on a direct connection; a safety net if the URL
+                // ever points back at a session-mode pooler.
+                conn.execute("SET search_path TO public").await.ok();
+                Ok(())
+            })
+        })
+        .connect_with(connect_options)
         .await?;
     run_migrations(&pool).await?;
 
@@ -48,12 +74,26 @@ async fn main() -> anyhow::Result<()> {
             display_name,
             community_name,
         } => bootstrap_owner(pool, username, password, display_name, community_name).await,
+        Command::ImportDiscordHar { har_path } => {
+            discord_import::import_har(&pool, &config, &har_path).await
+        }
     }
 }
 
 async fn serve(pool: sqlx::PgPool, config: Config) -> anyhow::Result<()> {
     let bind_addr = config.bind_addr.clone();
     tokio::fs::create_dir_all(&config.attachment_storage_path).await?;
+    tokio::fs::create_dir_all(
+        std::path::Path::new(&config.attachment_storage_path).join("_activity_assets"),
+    )
+    .await?;
+    // ACT-FR-031: a previous run may have crashed with playtime rows still
+    // open; close them (worth zero seconds — real duration is unknown).
+    match talkeando_server::db::close_dangling_game_sessions(&pool).await {
+        Ok(closed) if closed > 0 => tracing::info!(closed, "closed dangling game sessions from a prior run"),
+        Ok(_) => {}
+        Err(error) => tracing::warn!(%error, "failed to close dangling game sessions"),
+    }
     let state = AppState::new(pool, config);
     spawn_attachment_cleanup(state.clone());
 
@@ -148,21 +188,53 @@ async fn bootstrap_owner(
         .execute(&mut *tx)
         .await?;
 
-    let category: (uuid::Uuid,) = sqlx::query_as(
-        "INSERT INTO channel_categories (community_id, name, position) VALUES ($1, 'General', 0) RETURNING id",
-    )
-    .bind(community.0)
-    .fetch_one(&mut *tx)
-    .await?;
+    // The initial community mirrors the channel structure used by the
+    // product UI, including separate text and voice groups.
+    let categories = [
+        "Central de Felipes#",
+        "hub central#",
+        "hub-larp",
+        "Central de Comunicação",
+        "Redes Privadas",
+        "*Redes Desconhecidas*",
+    ];
+    let mut category_ids = Vec::with_capacity(categories.len());
+    for (position, name) in categories.iter().enumerate() {
+        let category: (uuid::Uuid,) = sqlx::query_as(
+            "INSERT INTO channel_categories (community_id, name, position) VALUES ($1, $2, $3) RETURNING id",
+        )
+        .bind(community.0)
+        .bind(name)
+        .bind(position as i32)
+        .fetch_one(&mut *tx)
+        .await?;
+        category_ids.push(category.0);
+    }
 
-    sqlx::query(
-        "INSERT INTO channels (community_id, category_id, name, kind, position) VALUES \
-         ($1, $2, 'general', 'text', 0), ($1, $2, 'voice-general', 'voice', 1)",
-    )
-    .bind(community.0)
-    .bind(category.0)
-    .execute(&mut *tx)
-    .await?;
+    let channels = [
+        (0, "hangar", "text"), (0, "monitor-de-noticias", "text"),
+        (1, "átrio-principal", "text"), (1, "setor-habitacional", "text"),
+        (1, "central-de-docs", "text"), (1, "mercado-negro", "text"),
+        (1, "black-baratheon", "text"), (1, "comandos-de-console", "text"),
+        (2, "atrio-principlarper", "text"), (2, "cobblemon-masters-news", "text"),
+        (2, "comandos-de-larp", "text"),
+        (3, "*Canal Primário*", "voice"), (3, "*Canal Of.1*", "voice"),
+        (3, "*Canal Of.2*", "voice"), (4, "*Canal Alpha*", "voice"),
+        (4, "*Canal Beta*", "voice"), (4, "*Canal Gamma*", "voice"),
+        (4, "segredinho", "voice"), (5, "*&@Z#&+(O:*", "voice"),
+    ];
+    for (position, (category_index, name, kind)) in channels.iter().enumerate() {
+        sqlx::query(
+            "INSERT INTO channels (community_id, category_id, name, kind, position) VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind(community.0)
+        .bind(category_ids[*category_index])
+        .bind(name)
+        .bind(kind)
+        .bind(position as i32)
+        .execute(&mut *tx)
+        .await?;
+    }
 
     tx.commit().await?;
 

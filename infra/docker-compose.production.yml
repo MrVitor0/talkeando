@@ -1,35 +1,18 @@
 name: talkeando
 
 services:
-  postgres:
-    image: postgres:16-alpine
-    restart: unless-stopped
-    environment:
-      POSTGRES_USER: ${POSTGRES_USER:?set in production env}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in production env}
-      POSTGRES_DB: ${POSTGRES_DB:-talkeando}
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
-      interval: 5s
-      timeout: 3s
-      retries: 12
-
   talkeando-server:
     build:
       context: ../server
     restart: unless-stopped
-    depends_on:
-      postgres:
-        condition: service_healthy
     environment:
-      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-talkeando}
+      DATABASE_URL: ${DATABASE_URL:?set the Neon production connection string}
       BIND_ADDR: 0.0.0.0:8080
       TURN_SHARED_SECRET: ${TURN_SHARED_SECRET:?set in production env}
       TURN_REALM: ${TURN_REALM:?set in production env}
       TURN_URIS: ${TURN_URIS:?set in production env}
-      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-https://${TALKEANDO_DOMAIN}}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:?set in production env}
+      ATTACHMENT_STORAGE_PATH: /var/lib/talkeando/attachments
     volumes:
       - attachments_data:/var/lib/talkeando/attachments
 
@@ -39,7 +22,7 @@ services:
     depends_on:
       - talkeando-server
     environment:
-      TALKEANDO_DOMAIN: ${TALKEANDO_DOMAIN:?set in production env}
+      API_DOMAIN: ${API_DOMAIN:?set in production env}
     ports:
       - "80:80"
       - "443:443"
@@ -52,12 +35,22 @@ services:
     image: coturn/coturn:4.7-alpine
     restart: unless-stopped
     network_mode: host
-    command: ["-c", "/etc/coturn/turnserver.conf"]
-    volumes:
-      - ./coturn/turnserver.conf:/etc/coturn/turnserver.conf:ro
+    command:
+      - -n
+      - --listening-port=3478
+      - --fingerprint
+      - --use-auth-secret
+      - --static-auth-secret=${TURN_SHARED_SECRET:?set in production env}
+      - --realm=${TURN_REALM:?set in production env}
+      - --no-multicast-peers
+      - --no-cli
+      - --no-tls
+      - --no-dtls
+      - --min-port=49160
+      - --max-port=49200
+      - --external-ip=${TURN_EXTERNAL_IP:?set the Lightsail static public IP}/${TURN_PRIVATE_IP:?set the Lightsail private IP}
 
 volumes:
-  postgres_data:
   attachments_data:
   caddy_data:
   caddy_config:

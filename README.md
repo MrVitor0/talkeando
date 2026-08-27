@@ -110,6 +110,50 @@ Log in as `alice`/`alicepass123`.
 
 ## 5. Testing with two accounts on one machine
 
+### The shortcut: `dev.cmd`
+
+From the repo root:
+
+```
+dev
+```
+
+(or `.\dev.cmd`, or `powershell -File scripts\dev.ps1`). It creates
+`server/.env` if missing, builds and `bootstrap-owner`s the server
+(idempotent), starts it in its own window, mints an invite and registers
+`bob` if he doesn't exist yet, builds the React UI, then opens **two
+client windows**, one with `TALKEANDO_PROFILE=alice` and one with `=bob`.
+Log the alice window in as `alice`/`alicepass123` and the bob window as
+`bob`/`bobpass123`.
+
+**Database:** `dev.cmd` reads `server/.env`'s `DATABASE_URL`. The
+checked-in default is the shared/managed database — no Docker needed, and
+`bootstrap-owner`/migrations run against it directly. Only if you point
+`DATABASE_URL` back at `@localhost:5434` does the script start (and need)
+the compose Postgres. The Rust server also forces `search_path = public`
+on every connection so migrations work through a managed Postgres pooler
+(Neon etc.). `cargo test` is unaffected — it uses its own
+`TEST_DATABASE_ADMIN_URL` (local by default), never `DATABASE_URL`.
+
+The stack binds **port 8090**, not 8080 — 8090 is far less likely to
+collide with another dev server, and `dev.cmd` rewrites `server/.env`'s
+`BIND_ADDR` and points both client windows there automatically. The
+by-hand steps below still use 8080 (the `.env.example` default); change
+`BIND_ADDR` yourself if 8080 is taken.
+
+Flags:
+
+- `dev -Reset` — wipe the local per-profile session/WebView2 folders (and,
+  when on the local DB, `docker compose down -v`).
+- `dev -SkipUiBuild` — skip `npm run build` (no `client/ui/src` changes
+  since last run).
+- `dev -NoClients` — bring the backend up and ensure both accounts, but
+  don't open the client windows.
+
+The rest of this section is what that script automates, done by hand.
+
+### By hand
+
 You don't need two physical machines to exercise most of this — but you do
 need to set `TALKEANDO_PROFILE` per instance, or the two windows will fight
 over one shared session file (found the hard way: a second login silently

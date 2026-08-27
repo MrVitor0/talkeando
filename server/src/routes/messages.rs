@@ -38,6 +38,15 @@ pub struct HistoryMessage {
     pub created_at: DateTime<Utc>,
     pub edited_at: Option<DateTime<Utc>>,
     pub attachments: Vec<MessageAttachment>,
+    pub link_preview: Option<LinkPreview>,
+}
+
+#[derive(Clone, Serialize, sqlx::FromRow)]
+pub struct LinkPreview {
+    pub url: String,
+    pub title: Option<String>,
+    pub site_name: Option<String>,
+    pub image_url: Option<String>,
 }
 
 #[derive(Serialize, sqlx::FromRow)]
@@ -60,6 +69,9 @@ struct HistoryRow {
     username: String,
     display_name: String,
     avatar_color: Option<String>,
+    avatar_url: Option<String>,
+    profile_tag: Option<String>,
+    profile_badge_url: Option<String>,
 }
 
 fn default_limit() -> i64 {
@@ -88,7 +100,9 @@ pub async fn history(
         Some(before_id) => {
             sqlx::query_as::<_, HistoryRow>(
                 "SELECT m.id, m.channel_id, m.author_id, m.content, m.created_at, m.edited_at, \
-                        u.username, u.display_name, u.avatar_color \
+                        u.username, u.display_name, u.avatar_color, \
+                        CASE WHEN u.avatar_storage_path IS NULL THEN NULL ELSE '/api/users/' || u.id::text || '/avatar' END AS avatar_url, u.profile_tag, \
+                        CASE WHEN u.profile_badge_storage_path IS NULL THEN NULL ELSE '/api/users/' || u.id::text || '/profile-badge' END AS profile_badge_url \
                  FROM messages m JOIN users u ON u.id = m.author_id \
                  WHERE m.channel_id = $1 AND m.deleted_at IS NULL \
                  AND (m.created_at, m.id) < (SELECT created_at, id FROM messages WHERE id = $2 AND channel_id = $1) \
@@ -103,7 +117,9 @@ pub async fn history(
         None => {
             sqlx::query_as::<_, HistoryRow>(
                 "SELECT m.id, m.channel_id, m.author_id, m.content, m.created_at, m.edited_at, \
-                        u.username, u.display_name, u.avatar_color \
+                        u.username, u.display_name, u.avatar_color, \
+                        CASE WHEN u.avatar_storage_path IS NULL THEN NULL ELSE '/api/users/' || u.id::text || '/avatar' END AS avatar_url, u.profile_tag, \
+                        CASE WHEN u.profile_badge_storage_path IS NULL THEN NULL ELSE '/api/users/' || u.id::text || '/profile-badge' END AS profile_badge_url \
                  FROM messages m JOIN users u ON u.id = m.author_id \
                  WHERE m.channel_id = $1 AND m.deleted_at IS NULL \
                  ORDER BY m.created_at DESC, m.id DESC LIMIT $2",
@@ -126,6 +142,15 @@ pub async fn history(
     .fetch_all(&state.pool)
     .await?;
 
+    let preview_rows = sqlx::query_as::<_, PreviewRow>(
+        "SELECT message_id, url, title, site_name, CASE WHEN image_storage_path IS NULL THEN NULL ELSE '/api/messages/' || message_id::text || '/preview-image' END AS image_url \
+         FROM message_link_previews WHERE message_id = ANY($1)",
+    ).bind(&message_ids).fetch_all(&state.pool).await?;
+    let previews_by_message: std::collections::HashMap<Uuid, LinkPreview> = preview_rows.into_iter().map(|preview| (
+        preview.message_id,
+        LinkPreview { url: preview.url, title: preview.title, site_name: preview.site_name, image_url: preview.image_url },
+    )).collect();
+
     let mut attachments_by_message = std::collections::HashMap::<Uuid, Vec<MessageAttachment>>::new();
     for attachment in attachment_rows {
         attachments_by_message.entry(attachment.message_id).or_default().push(MessageAttachment {
@@ -144,11 +169,15 @@ pub async fn history(
             username: row.username,
             display_name: row.display_name,
             avatar_color: row.avatar_color,
+            avatar_url: row.avatar_url,
+            profile_tag: row.profile_tag,
+            profile_badge_url: row.profile_badge_url,
         },
         content: row.content,
         created_at: row.created_at,
         edited_at: row.edited_at,
-        attachments: attachments_by_message.remove(&row.id).unwrap_or_default(),
+            attachments: attachments_by_message.remove(&row.id).unwrap_or_default(),
+            link_preview: previews_by_message.get(&row.id).cloned(),
     }).collect();
 
     Ok(Json(HistoryResponse { messages, has_more }))
@@ -161,4 +190,13 @@ struct AttachmentRow {
     filename: String,
     content_type: String,
     size_bytes: i64,
+}
+
+#[derive(sqlx::FromRow)]
+struct PreviewRow {
+    message_id: Uuid,
+    url: String,
+    title: Option<String>,
+    site_name: Option<String>,
+    image_url: Option<String>,
 }

@@ -44,7 +44,11 @@ normalizados para `[a-z0-9_]{3,24}`; erros de login são sempre
 | `DELETE /channels/categories/{id}` | — | `204` (owner) |
 | `POST /channels` | `{ name, kind, category_id?, topic?, position? }` | `201 Channel` (owner) |
 | `PATCH /channels/{id}` | `{ name?, topic?, category_id?, position? }` | `200 Channel` (owner) |
+| `PATCH /channels/{id}/name` | `{ name }` | `200 Channel` (qualquer membro; só o nome) — broadcast `channel.updated` |
 | `DELETE /channels/{id}` | — | `204` (owner) |
+| `PATCH /me` | `{ display_name }` | `200 PublicUser` — broadcast `member.updated` |
+| `POST /me/avatar` | multipart `file` (png/jpeg/gif/webp, ≤8 MiB) | `200 PublicUser` — broadcast `member.updated` |
+| `PATCH /users/{id}` | `{ display_name }` | `200 PublicUser` (qualquer membro que compartilhe comunidade) — broadcast `member.updated` |
 
 `Member = { id, username, display_name, avatar_color, role }`.
 `Category = { id, name, position, channels?: [Channel] }`.
@@ -59,6 +63,14 @@ termina sua call antes de remover o registro persistido.
 | `GET /channels/{id}/messages?before={uuid}&limit={1..100}` | — | `200 { messages, has_more }` |
 | `POST /channels/{id}/attachments` | multipart `file` | `201 Attachment` |
 | `GET /attachments/{id}` | — | bytes com Content-Type original |
+| `POST /activity-assets` | multipart `file` (png/jpeg, ≤512 KiB) | `201 { id }` — id = sha256 hex do conteúdo |
+| `GET /activity-assets/{id}` | — | bytes da imagem, `Cache-Control: immutable` — **sem auth** |
+
+`activity-assets` guarda arte de atividade (ícones de jogo — `specs/activity.md`)
+endereçada por hash de conteúdo: subir o mesmo arquivo de novo é no-op. O `GET`
+é o único endpoint sem autenticação: o id é um hash não-adivinhável, o conteúdo
+é um ícone de jogo, e a UI do WebView que o renderiza como `<img>` não tem
+token de sessão.
 
 `Message = { id, channel_id, author: User, content, created_at, edited_at,
 attachments }`; mensagens removidas não retornam conteúdo. `Attachment = {

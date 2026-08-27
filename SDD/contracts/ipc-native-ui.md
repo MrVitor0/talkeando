@@ -31,7 +31,19 @@ React usa `window.chrome.webview.postMessage`; o host responde com
 | `screen.publish_start` | UI→Native | `{ source_id }` |
 | `screen.publish_stop` | UI→Native | `{}` |
 | `screen.source_ended` | Native→UI | `{ source_id }` |
+| `activity.config` | UI→Native | `{ enabled: bool }` — liga/desliga o `ActivityMonitor` (SMTC). Desligar envia um `activity.report` vazio. Ver `specs/activity.md` ACT-FR-008. |
+| `profile.rename` | UI→Native | `{ display_name }` — `PATCH /api/me`. Resposta chega via `member.updated` no WebSocket. |
+| `profile.avatar.pick` | UI→Native | `{}` — abre um seletor de arquivo nativo e faz `POST /api/me/avatar` (multipart `file`). Resposta via `member.updated`. |
+| `member.rename` | UI→Native | `{ user_id, display_name }` — `PATCH /api/users/:id`; qualquer membro pode renomear qualquer membro (v1). |
+| `channel.rename` | UI→Native | `{ channel_id, name }` — `PATCH /api/channels/:id/name`; só o nome, sem deletar. |
+| `presence.set` | UI→Native | `{ status: "online" \| "busy" }` — relay puro para o WebSocket. |
 | `error` | Native→UI | `{ code, message }` |
+
+O menu de contexto padrão do WebView2 fica desativado
+(`AreDefaultContextMenusEnabled = false`); a UI desenha o seu próprio menu
+(renomear canal / membro / avatar). `member.updated` que chega do WebSocket
+tem seu `avatar_url` (`/api/...`) convertido para `data:` URI pelo host
+antes de ir para a UI, igual aos avatares do bootstrap.
 
 O host valida o payload e nunca executa uma operação RTC ou de captura a
 partir de dados não reconhecidos.

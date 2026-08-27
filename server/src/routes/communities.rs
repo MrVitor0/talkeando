@@ -22,6 +22,9 @@ pub struct CommunityMember {
     pub username: String,
     pub display_name: String,
     pub avatar_color: Option<String>,
+    pub avatar_url: Option<String>,
+    pub profile_tag: Option<String>,
+    pub profile_badge_url: Option<String>,
     pub role: String,
 }
 
@@ -47,7 +50,9 @@ pub async fn current(
     .await?
     .ok_or(crate::error::AppError::Forbidden)?;
     let members = sqlx::query_as::<_, CommunityMember>(
-        "SELECT u.id, u.username, u.display_name, u.avatar_color, cm.role \
+        "SELECT u.id, u.username, u.display_name, u.avatar_color, \
+                CASE WHEN u.avatar_storage_path IS NULL THEN NULL ELSE '/api/users/' || u.id::text || '/avatar' END AS avatar_url, \
+                u.profile_tag, CASE WHEN u.profile_badge_storage_path IS NULL THEN NULL ELSE '/api/users/' || u.id::text || '/profile-badge' END AS profile_badge_url, cm.role \
          FROM community_members cm JOIN users u ON u.id = cm.user_id \
          WHERE cm.community_id = $1 ORDER BY u.username",
     )

@@ -4,6 +4,7 @@ using System.Net.Http.Headers;
 using System.Net.WebSockets;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 
 namespace Talkeando.Client;
 
@@ -24,12 +25,70 @@ public sealed class NetworkClient
     private Action<string, JsonElement>? _onWebSocketEvent;
     private int _reconnectAttempt;
 
+    /// API root without a trailing slash (e.g. `http://localhost:8080/api`).
+    /// Handed to the UI in the bootstrap payload so it can build `<img>` URLs
+    /// for the unauthenticated activity-asset endpoint (SDD/specs/activity.md).
+    public string ApiBaseUrl { get; }
+
     public NetworkClient(SessionStore sessions)
     {
         _sessions = sessions;
         var baseUrl = Environment.GetEnvironmentVariable("TALKEANDO_API_BASE_URL")
+            ?? ReadEndpointSetting("apiBaseUrl")
             ?? "http://localhost:8080/api";
-        _http = new HttpClient { BaseAddress = new Uri(baseUrl.TrimEnd('/') + "/") };
+        ApiBaseUrl = baseUrl.TrimEnd('/');
+        _http = new HttpClient { BaseAddress = new Uri(ApiBaseUrl + "/") };
+    }
+
+    /// Content-addressed upload of a game icon (PNG). Returns the server's
+    /// hash id; the same bytes always map to the same id, so callers cache it.
+    public async Task<string?> UploadActivityAssetAsync(byte[] bytes, string contentType = "image/png")
+    {
+        using var form = new MultipartFormDataContent();
+        using var content = new ByteArrayContent(bytes);
+        content.Headers.ContentType = new MediaTypeHeaderValue(contentType == "image/jpeg" ? "image/jpeg" : "image/png");
+        form.Add(content, "file", contentType == "image/jpeg" ? "art.jpg" : "art.png");
+        using var request = new HttpRequestMessage(HttpMethod.Post, "activity-assets") { Content = form };
+        AddAuthorization(request);
+        using var response = await _http.SendAsync(request);
+        if (!response.IsSuccessStatusCode) return null;
+        using var result = await ReadJsonAsync(response);
+        return result.RootElement.TryGetProperty("id", out var id) ? id.GetString() : null;
+    }
+
+    /// Fetch an activity asset by hash and inline it as a `data:` URI so the
+    /// WebView renders it without any cross-origin / mixed-content / auth
+    /// concern (same approach as `HydrateMediaUrlsAsync` for REST payloads).
+    public async Task<string?> GetActivityAssetDataUriAsync(string hash)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Get, $"activity-assets/{hash}");
+        AddAuthorization(request);
+        using var response = await _http.SendAsync(request);
+        if (!response.IsSuccessStatusCode) return null;
+        var bytes = await response.Content.ReadAsByteArrayAsync();
+        if (bytes.Length == 0 || bytes.Length > 1024 * 1024) return null;
+        var type = response.Content.Headers.ContentType?.MediaType ?? "image/png";
+        return $"data:{type};base64,{Convert.ToBase64String(bytes)}";
+    }
+
+    /// Production installers ship this non-secret file beside the executable.
+    /// Environment variables still take precedence, which preserves the local
+    /// development workflow without asking beta users to configure anything.
+    private static string? ReadEndpointSetting(string name)
+    {
+        var path = Path.Combine(AppContext.BaseDirectory, "talkeando.settings.json");
+        if (!File.Exists(path)) return null;
+        try
+        {
+            using var document = JsonDocument.Parse(File.ReadAllText(path));
+            return document.RootElement.TryGetProperty(name, out var value)
+                ? value.GetString()
+                : null;
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
     }
 
     public async Task<JsonElement> LoginAsync(JsonElement data) => await AuthenticateAsync("auth/login", data);
@@ -51,15 +110,19 @@ public sealed class NetworkClient
             currentUser = me.RootElement.GetProperty("user").Clone(),
             community = community.RootElement.Clone(),
             members = community.RootElement.GetProperty("members").Clone(),
+            categories = channelData.RootElement.TryGetProperty("categories", out var categoryData)
+                ? categoryData.Clone()
+                : JsonSerializer.SerializeToElement(Array.Empty<object>()),
             channels,
+            apiBaseUrl = ApiBaseUrl,
         });
-        return payload;
+        return await HydrateMediaUrlsAsync(payload);
     }
 
     public async Task<JsonElement> HistoryAsync(Guid channelId)
     {
         using var response = await GetAsync($"channels/{channelId}/messages");
-        return response.RootElement.Clone();
+        return await HydrateMediaUrlsAsync(response.RootElement.Clone());
     }
 
     public async Task<TurnCredentials> GetTurnCredentialsAsync()
@@ -91,6 +154,73 @@ public sealed class NetworkClient
         return result.RootElement.Clone();
     }
 
+    /// PROFILE-FR: rename yourself. The server fans a `member.updated` event
+    /// back over the WebSocket, so there is nothing to return here.
+    public async Task UpdateDisplayNameAsync(string displayName)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Patch, "me")
+        {
+            Content = new StringContent(
+                JsonSerializer.Serialize(new { display_name = displayName }), Encoding.UTF8, "application/json"),
+        };
+        AddAuthorization(request);
+        using var response = await _http.SendAsync(request);
+        using var _ = await ReadJsonAsync(response);
+    }
+
+    /// PROFILE-FR: rename another member (any member may, v1's "small circle"
+    /// scoping). Broadcast handled server-side.
+    public async Task RenameMemberAsync(Guid userId, string displayName)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Patch, $"users/{userId}")
+        {
+            Content = new StringContent(
+                JsonSerializer.Serialize(new { display_name = displayName }), Encoding.UTF8, "application/json"),
+        };
+        AddAuthorization(request);
+        using var response = await _http.SendAsync(request);
+        using var _ = await ReadJsonAsync(response);
+    }
+
+    /// CHAN-FR (rename): change just a channel's name. Server broadcasts
+    /// `channel.updated`.
+    public async Task RenameChannelAsync(Guid channelId, string name)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Patch, $"channels/{channelId}/name")
+        {
+            Content = new StringContent(
+                JsonSerializer.Serialize(new { name }), Encoding.UTF8, "application/json"),
+        };
+        AddAuthorization(request);
+        using var response = await _http.SendAsync(request);
+        using var _ = await ReadJsonAsync(response);
+    }
+
+    /// PROFILE-FR: replace your own avatar with a local image file.
+    public async Task UploadAvatarAsync(string filePath)
+    {
+        if (!File.Exists(filePath)) throw new FileNotFoundException("Arquivo não encontrado.", filePath);
+        using var form = new MultipartFormDataContent();
+        await using var file = File.OpenRead(filePath);
+        using var content = new StreamContent(file);
+        content.Headers.ContentType = new MediaTypeHeaderValue(GuessContentType(filePath));
+        form.Add(content, "file", Path.GetFileName(filePath));
+        using var request = new HttpRequestMessage(HttpMethod.Post, "me/avatar") { Content = form };
+        AddAuthorization(request);
+        using var response = await _http.SendAsync(request);
+        using var _ = await ReadJsonAsync(response);
+    }
+
+    /// Best-effort variant of the private media inliner, for WebSocket events
+    /// (e.g. `member.updated`) whose avatar URL the WebView cannot fetch
+    /// itself. Returns null instead of throwing so a missing image never
+    /// drops the whole event.
+    public async Task<string?> TryGetMediaDataUriAsync(string path)
+    {
+        try { return await GetMediaDataUriAsync(path); }
+        catch { return null; }
+    }
+
     public async Task OpenAttachmentAsync(Guid attachmentId, string filename)
     {
         using var request = new HttpRequestMessage(HttpMethod.Get, $"attachments/{attachmentId}");
@@ -115,7 +245,9 @@ public sealed class NetworkClient
             if (_webSocket?.State == WebSocketState.Open) return;
             _webSocket?.Dispose();
             _webSocket = new ClientWebSocket();
-            var wsUrl = Environment.GetEnvironmentVariable("TALKEANDO_WS_URL") ?? "ws://localhost:8080/ws";
+            var wsUrl = Environment.GetEnvironmentVariable("TALKEANDO_WS_URL")
+                ?? ReadEndpointSetting("webSocketUrl")
+                ?? "ws://localhost:8080/ws";
             await _webSocket.ConnectAsync(new Uri(wsUrl), CancellationToken.None);
             var token = _sessions.Load() ?? throw new InvalidOperationException("Sessão não encontrada.");
             await SendWebSocketAsync("auth.hello", JsonSerializer.SerializeToElement(new { token }));
@@ -200,6 +332,73 @@ public sealed class NetworkClient
         AddAuthorization(request);
         using var response = await _http.SendAsync(request);
         return await ReadJsonAsync(response);
+    }
+
+    // The WebView never receives the session token, so ordinary <img> tags
+    // cannot authenticate against the API. Convert the few private avatars
+    // and preview thumbnails returned in bootstrap/history into data URLs at
+    // the native boundary instead.
+    private async Task<JsonElement> HydrateMediaUrlsAsync(JsonElement payload)
+    {
+        var root = JsonNode.Parse(payload.GetRawText());
+        if (root is null) return payload;
+        var urls = new HashSet<string>(StringComparer.Ordinal);
+        CollectMediaUrls(root, urls);
+        var replacements = new Dictionary<string, string>(StringComparer.Ordinal);
+        foreach (var url in urls)
+        {
+            try { replacements[url] = await GetMediaDataUriAsync(url); }
+            catch { /* a missing thumbnail must not make chat history fail */ }
+        }
+        ReplaceMediaUrls(root, replacements);
+        return JsonSerializer.SerializeToElement(root);
+    }
+
+    private static void CollectMediaUrls(JsonNode node, ISet<string> urls)
+    {
+        if (node is JsonObject obj)
+        {
+            foreach (var property in obj)
+            {
+                if ((property.Key == "avatar_url" || property.Key == "image_url" || property.Key == "profile_badge_url") && property.Value is JsonValue value && value.TryGetValue<string>(out var url) && url.StartsWith("/api/", StringComparison.Ordinal)) urls.Add(url);
+                if (property.Value is not null) CollectMediaUrls(property.Value, urls);
+            }
+            // An image attachment: { url: "/api/attachments/..", content_type: "image/..", .. }.
+            // Inline it too so the chat can render a thumbnail without the token.
+            if (obj["url"] is JsonValue urlValue && urlValue.TryGetValue<string>(out var attachmentUrl)
+                && attachmentUrl.StartsWith("/api/", StringComparison.Ordinal)
+                && obj["content_type"] is JsonValue typeValue && typeValue.TryGetValue<string>(out var contentType)
+                && contentType.StartsWith("image/", StringComparison.Ordinal))
+            {
+                urls.Add(attachmentUrl);
+            }
+        }
+        else if (node is JsonArray array) foreach (var item in array) if (item is not null) CollectMediaUrls(item, urls);
+    }
+
+    private static void ReplaceMediaUrls(JsonNode node, IReadOnlyDictionary<string, string> replacements)
+    {
+        if (node is JsonObject obj)
+        {
+            foreach (var property in obj.ToList())
+            {
+                if (property.Value is JsonValue value && value.TryGetValue<string>(out var url) && replacements.TryGetValue(url, out var dataUri)) obj[property.Key] = dataUri;
+                else if (property.Value is not null) ReplaceMediaUrls(property.Value, replacements);
+            }
+        }
+        else if (node is JsonArray array) foreach (var item in array) if (item is not null) ReplaceMediaUrls(item, replacements);
+    }
+
+    private async Task<string> GetMediaDataUriAsync(string path)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Get, new Uri(_http.BaseAddress!, path));
+        AddAuthorization(request);
+        using var response = await _http.SendAsync(request);
+        if (!response.IsSuccessStatusCode) throw new InvalidOperationException("Mídia privada indisponível.");
+        var bytes = await response.Content.ReadAsByteArrayAsync();
+        if (bytes.Length == 0 || bytes.Length > 8 * 1024 * 1024) throw new InvalidOperationException("Mídia grande demais para visualização.");
+        var type = response.Content.Headers.ContentType?.MediaType ?? "application/octet-stream";
+        return $"data:{type};base64,{Convert.ToBase64String(bytes)}";
     }
 
     private async Task<JsonDocument> PostAsync(string path, JsonElement data, bool includeAuth)

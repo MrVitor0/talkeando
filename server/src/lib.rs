@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod config;
 pub mod db;
+pub mod discord_import;
 pub mod error;
 pub mod routes;
 pub mod state;

@@ -8,10 +8,10 @@ use uuid::Uuid;
 
 use crate::{
     auth::AuthUser,
-    db::{Channel, ChannelCategory},
+    db::{self, Channel, ChannelCategory},
     error::{AppError, AppResult},
     state::AppState,
-    ws::protocol::{CallPeerLeft, OutboundEnvelope},
+    ws::protocol::{CallPeerLeft, ChannelUpdated, OutboundEnvelope},
 };
 
 #[derive(Serialize)]
@@ -215,6 +215,58 @@ pub async fn update(
     .await?
     .ok_or(AppError::NotFound)?;
     tracing::info!(actor_user_id = %auth.user.id, channel_id = %channel.id, "channel updated");
+    Ok(Json(channel))
+}
+
+#[derive(Deserialize)]
+pub struct RenameChannelRequest {
+    pub name: String,
+}
+
+/// CHAN-FR (rename): unlike `update`/`delete`, which stay owner-only, any
+/// member of the channel's community may change just its `name` (the
+/// "qualquer membro" scoping decision — there is deliberately no member-level
+/// delete). Broadcasts `channel.updated` so every sidebar re-labels live.
+pub async fn rename(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(channel_id): Path<Uuid>,
+    Json(req): Json<RenameChannelRequest>,
+) -> AppResult<Json<Channel>> {
+    validate_name(&req.name, "channel name")?;
+    // Membership gate: returns the channel only if the caller belongs to the
+    // community that owns it.
+    let channel = db::channel_if_member(&state.pool, channel_id, auth.user.id)
+        .await?
+        .ok_or(AppError::Forbidden)?;
+    let channel = sqlx::query_as::<_, Channel>(
+        "UPDATE channels SET name = $1 WHERE id = $2 AND community_id = $3 RETURNING *",
+    )
+    .bind(req.name.trim())
+    .bind(channel_id)
+    .bind(channel.community_id)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or(AppError::NotFound)?;
+    tracing::info!(actor_user_id = %auth.user.id, channel_id = %channel.id, "channel renamed");
+
+    if let Ok(recipients) = db::community_member_ids(&state.pool, channel.community_id).await {
+        state
+            .hub
+            .broadcast_to(
+                &recipients,
+                OutboundEnvelope::new(
+                    "channel.updated",
+                    ChannelUpdated {
+                        id: channel.id,
+                        name: channel.name.clone(),
+                        kind: channel.kind.clone(),
+                        category_id: channel.category_id,
+                    },
+                ),
+            )
+            .await;
+    }
     Ok(Json(channel))
 }
 

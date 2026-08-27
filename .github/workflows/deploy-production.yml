@@ -1,0 +1,58 @@
+name: Deploy production
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'server/**'
+      - 'infra/**'
+      - '.github/workflows/deploy-production.yml'
+  workflow_dispatch:
+
+# A second push waits instead of overlapping a Docker build on the 2 GB VPS.
+concurrency:
+  group: talkeando-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Lightsail São Paulo
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure restricted SSH access
+        env:
+          DEPLOY_HOST: ${{ secrets.LIGHTSAIL_HOST }}
+          DEPLOY_KEY: ${{ secrets.LIGHTSAIL_SSH_KEY }}
+        run: |
+          test -n "$DEPLOY_HOST"
+          test -n "$DEPLOY_KEY"
+          install -d -m 700 ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/talkeando-production
+          chmod 600 ~/.ssh/talkeando-production
+          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+
+      - name: Upload and apply release
+        env:
+          DEPLOY_HOST: ${{ secrets.LIGHTSAIL_HOST }}
+        run: |
+          tar -czf - \
+            --exclude='server/target' \
+            --exclude='infra/.env' \
+            server \
+            infra/Caddyfile \
+            infra/docker-compose.production.yml \
+          | ssh -i ~/.ssh/talkeando-production "ubuntu@$DEPLOY_HOST" '
+              set -eu
+              tar -xzf - -C /opt/talkeando
+              cd /opt/talkeando/infra
+              docker compose -f docker-compose.production.yml up -d --build --remove-orphans
+              docker compose -f docker-compose.production.yml ps
+            '
+

@@ -16,23 +16,46 @@
 // authenticated WebSocket, and every WS event is forwarded here unchanged via
 // the existing `Publish(op, data)` catch-all IpcBridge already had.
 import { send, subscribe, Envelope } from "./ipc";
+import { startNativeScreen, stopNativeScreen } from "./nativeScreen";
+import * as noiseSuppression from "./noiseSuppression";
 
 type TurnCredentials = { username: string; credential: string; uris: string[] };
 type RemoteStreamListener = (peerUserId: string, stream: MediaStream | null) => void;
 
 const peers = new Map<string, RTCPeerConnection>();
 const pendingPeers = new Map<string, Promise<RTCPeerConnection>>();
-const videoSenders = new Map<string, RTCRtpSender>();
 const pendingCandidates = new Map<string, RTCIceCandidateInit[]>();
 const remoteDescriptionSet = new Set<string>();
 const iceRestartTimers = new Map<string, ReturnType<typeof setTimeout>>();
 const remoteAudioEls = new Map<string, HTMLAudioElement>();
+// One <audio> per peer, fed by a persistent MediaStream that accumulates
+// every audio track that peer sends (mic + screen-share loopback), so a
+// second track doesn't replace the first.
+const remoteAudioStreams = new Map<string, MediaStream>();
+// Per-participant local mute (the "Silenciar" control on a tile). Kept
+// separate from deafen so unmuting a peer doesn't un-deafen everything.
+const peerAudioMuted = new Map<string, boolean>();
 const pendingTurnRequests = new Map<string, (creds: TurnCredentials) => void>();
 const remoteVideoListeners = new Set<RemoteStreamListener>();
 
 let selfUserId: string | null = null;
 let currentChannelId: string | null = null;
+// True only when we are a full call participant (joinCall). A client can also
+// hold peer connections purely as a *spectator* of someone's screen share in a
+// channel it never joined — see spectate()/stopSpectate().
+let joinedCall = false;
+// channelId + streamId for each owner we are spectating (hover preview from
+// the sidebar), so stopSpectate can unsubscribe and tear the peer down.
+const spectatedStreams = new Map<string, { channelId: string; streamId: string }>();
+// (Owner side) peers we only connected to because they asked to spectate our
+// screen — closed again as soon as they unsubscribe.
+const spectatorPeers = new Set<string>();
+// `localStream` is what peers receive — the RNNoise-denoised mic. `rawMic`
+// is the untouched getUserMedia stream, kept only so it can be stopped on
+// leave.
 let localStream: MediaStream | null = null;
+let rawMic: MediaStream | null = null;
+let noiseSuppressionOn = true;
 let localMuted = false;
 let localDeafened = false;
 
@@ -42,7 +65,35 @@ let localDeafened = false;
 // sent to a peer until it appears here, mirroring the old send-side gate
 // that avoided a renegotiation storm on every subscribe/unsubscribe.
 let localScreenTrack: MediaStreamTrack | null = null;
+let localScreenStream: MediaStream | null = null;
 const screenSubscribers = new Set<string>();
+// Per-peer transceivers for our outgoing screen tracks (one video, and one
+// audio when the source carries process-loopback audio). Created ONCE per peer
+// the first time we send it our screen, then reused for every later
+// subscribe/unsubscribe via replaceTrack + direction — never removeTrack.
+// removeTrack keeps the transceiver but re-emits its m-line on the next offer,
+// so a fresh addTrack each subscribe accumulated dead m-lines until the SDP
+// blew past the server's 64 KiB relay cap during repeated hover-previews.
+type ScreenSlots = { video: RTCRtpTransceiver; audio: RTCRtpTransceiver | null; active: boolean };
+const screenSlots = new Map<string, ScreenSlots>();
+// Peers whose screen m-lines were changed while signalling was mid-negotiation
+// (can't createOffer yet). Retried from handleIncomingOffer/Answer once stable.
+const screenNeedsOffer = new Set<string>();
+
+// Offers/answers we relay carry no value in their inline ICE candidates — we
+// trickle every candidate over rtc.ice anyway — and a full candidate list can
+// add tens of KiB to a renegotiation. Strip them before send() so the payload
+// stays well under the server's 64 KiB guard.
+function stripSdpCandidates(sdp: string | undefined): string {
+  if (!sdp) return "";
+  return sdp
+    .replace(/^a=candidate:.*(\r\n|\n)/gm, "")
+    .replace(/^a=end-of-candidates.*(\r\n|\n)/gm, "");
+}
+
+function sendSdp(op: "rtc.offer" | "rtc.answer", channelId: string, to: string, sdp: string | undefined) {
+  send(op, { channel_id: channelId, to, sdp: stripSdpCandidates(sdp) });
+}
 
 function requestTurnCredentials(): Promise<TurnCredentials> {
   const requestId = crypto.randomUUID();
@@ -82,25 +133,29 @@ async function createPeer(peerUserId: string): Promise<RTCPeerConnection> {
   console.log(`[rtc] peer connection created for ${peerUserId}`);
 
   if (localStream) for (const track of localStream.getTracks()) pc.addTrack(track, localStream);
-
-  // Single sendrecv video transceiver per peer, added once and never
-  // renegotiated afterward — screen-share subscribe/unsubscribe is a
-  // send-side gate via replaceTrack (see setScreenSubscription), exactly
-  // like the old RtcEngine.cs (SDD/12-stream-subscription-model.md).
-  const transceiver = pc.addTransceiver("video", { direction: "sendrecv" });
-  videoSenders.set(peerUserId, transceiver.sender);
+  // No microphone on this machine — still negotiate an audio m-line so we
+  // can HEAR the other side (without this the offer has no audio section
+  // and the peer never sends us any).
+  else pc.addTransceiver("audio", { direction: "recvonly" });
 
   pc.ontrack = event => {
     console.log(`[rtc] ontrack from ${peerUserId}: kind=${event.track.kind} streams=${event.streams.length} readyState=${event.track.readyState}`);
     if (event.track.kind === "audio") {
+      let audioStream = remoteAudioStreams.get(peerUserId);
+      if (!audioStream) { audioStream = new MediaStream(); remoteAudioStreams.set(peerUserId, audioStream); }
+      audioStream.addTrack(event.track);
+      event.track.onended = () => { try { audioStream!.removeTrack(event.track); } catch { /* gone */ } };
       let audioEl = remoteAudioEls.get(peerUserId);
       if (!audioEl) {
         audioEl = new Audio();
         audioEl.autoplay = true;
+        audioEl.srcObject = audioStream;
         remoteAudioEls.set(peerUserId, audioEl);
       }
-      audioEl.srcObject = event.streams[0] ?? new MediaStream([event.track]);
-      audioEl.muted = localDeafened;
+      // A pure spectator (previewing a screen share without joining the call)
+      // should never hear the call — mute every remote audio track while not
+      // an actual participant.
+      audioEl.muted = !joinedCall || localDeafened || (peerAudioMuted.get(peerUserId) ?? false);
       void audioEl.play().catch(error => console.error("[rtc] remote audio play() failed", error));
     } else if (event.track.kind === "video") {
       const stream = event.streams[0] ?? new MediaStream([event.track]);
@@ -151,41 +206,98 @@ async function restartIce(peerUserId: string, pc: RTCPeerConnection) {
     pc.restartIce();
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
-    send("rtc.offer", { channel_id: currentChannelId, to: peerUserId, sdp: offer.sdp });
+    sendSdp("rtc.offer", currentChannelId, peerUserId, offer.sdp);
   } catch (error) {
     console.error("ICE restart failed", peerUserId, error);
   }
 }
 
-async function connectToPeer(peerUserId: string) {
-  console.log(`[rtc] connectToPeer ${peerUserId} (I am offerer)`);
-  const pc = await getOrCreatePeer(peerUserId);
-  const offer = await pc.createOffer();
-  await pc.setLocalDescription(offer);
-  send("rtc.offer", { channel_id: currentChannelId, to: peerUserId, sdp: offer.sdp });
+function logTransceivers(label: string, peerUserId: string, pc: RTCPeerConnection) {
+  for (const transceiver of pc.getTransceivers()) {
+    console.log(`[rtc] ${label} peer=${peerUserId} kind=${transceiver.receiver.track?.kind ?? transceiver.sender.track?.kind ?? "?"} mid=${transceiver.mid} direction=${transceiver.direction} currentDirection=${transceiver.currentDirection}`);
+  }
 }
 
-async function handleIncomingOffer(data: any) {
-  currentChannelId = data.channel_id;
-  const peerUserId: string = data.from;
-  console.log(`[rtc] handleIncomingOffer from ${peerUserId} (I am answerer)`);
-  const pc = await getOrCreatePeer(peerUserId);
-  await pc.setRemoteDescription({ type: "offer", sdp: data.sdp });
-  remoteDescriptionSet.add(peerUserId);
-  await flushPendingCandidates(peerUserId, pc);
-  const answer = await pc.createAnswer();
-  await pc.setLocalDescription(answer);
-  send("rtc.answer", { channel_id: data.channel_id, to: peerUserId, sdp: answer.sdp });
+// The native host can deliver the same WS event more than once (observed:
+// duplicate rtc.offer/rtc.answer -> "setRemoteDescription ... wrong state:
+// stable"). Serialise every SDP operation per peer and dedupe stale ones so
+// a repeat delivery is a harmless no-op instead of a desync.
+const sdpLocks = new Map<string, Promise<unknown>>();
+const lastRemoteSdp = new Map<string, string>();
+
+function withSdpLock(peerUserId: string, task: () => Promise<void>): Promise<void> {
+  const previous = sdpLocks.get(peerUserId) ?? Promise.resolve();
+  const next = previous.then(task, task).catch(error => console.error(`[rtc] SDP op failed for ${peerUserId}`, error));
+  sdpLocks.set(peerUserId, next);
+  return next;
 }
 
-async function handleIncomingAnswer(data: any) {
+function connectToPeer(peerUserId: string, channelId?: string) {
+  if (channelId) currentChannelId = channelId;
+  return withSdpLock(peerUserId, async () => {
+    if (!currentChannelId) { console.warn(`[rtc] connectToPeer ${peerUserId}: no channel id yet, skipping`); return; }
+    const pc = await getOrCreatePeer(peerUserId);
+    if (pc.signalingState !== "stable" || pc.localDescription) {
+      console.log(`[rtc] connectToPeer ${peerUserId}: already negotiating/established (${pc.signalingState}), skipping`);
+      return;
+    }
+    console.log(`[rtc] connectToPeer ${peerUserId} (I am offerer)`);
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    logTransceivers("after setLocalDescription(offer)", peerUserId, pc);
+    sendSdp("rtc.offer", currentChannelId, peerUserId, offer.sdp);
+  });
+}
+
+function handleIncomingOffer(data: any) {
+  if (data.channel_id) currentChannelId = data.channel_id;
   const peerUserId: string = data.from;
-  console.log(`[rtc] handleIncomingAnswer from ${peerUserId}`);
-  const pc = peers.get(peerUserId);
-  if (!pc) { console.warn(`[rtc] handleIncomingAnswer: no peer connection for ${peerUserId} yet`); return; }
-  await pc.setRemoteDescription({ type: "answer", sdp: data.sdp });
-  remoteDescriptionSet.add(peerUserId);
-  await flushPendingCandidates(peerUserId, pc);
+  return withSdpLock(peerUserId, async () => {
+    if (lastRemoteSdp.get(peerUserId) === data.sdp) {
+      console.log(`[rtc] handleIncomingOffer from ${peerUserId}: duplicate offer, ignoring`);
+      return;
+    }
+    console.log(`[rtc] handleIncomingOffer from ${peerUserId} (I am answerer)`);
+    const pc = await getOrCreatePeer(peerUserId);
+    if (pc.signalingState !== "stable") {
+      // Glare: a renegotiation offer landed while our own local description
+      // was half-applied. Roll ours back and take theirs — the screen-share
+      // owner is the single source of truth for the video m-line.
+      try { await pc.setLocalDescription({ type: "rollback" }); } catch { /* already stable */ }
+    }
+    await pc.setRemoteDescription({ type: "offer", sdp: data.sdp });
+    lastRemoteSdp.set(peerUserId, data.sdp);
+    logTransceivers("after setRemoteDescription(offer)", peerUserId, pc);
+    remoteDescriptionSet.add(peerUserId);
+    await flushPendingCandidates(peerUserId, pc);
+    const answer = await pc.createAnswer();
+    await pc.setLocalDescription(answer);
+    logTransceivers("after setLocalDescription(answer)", peerUserId, pc);
+    sendSdp("rtc.answer", data.channel_id ?? currentChannelId, peerUserId, answer.sdp);
+  }).then(() => {
+    // Now that signalling is back to stable: (re)start the screen send for any
+    // peer subscribed to it, and flush a renegotiation that had to be deferred.
+    if (localScreenStream && screenSubscribers.has(peerUserId)) void applyScreenSend(peerUserId, true);
+  });
+}
+
+function handleIncomingAnswer(data: any) {
+  const peerUserId: string = data.from;
+  return withSdpLock(peerUserId, async () => {
+    const pc = peers.get(peerUserId);
+    if (!pc) { console.warn(`[rtc] handleIncomingAnswer: no peer connection for ${peerUserId} yet`); return; }
+    if (pc.signalingState !== "have-local-offer") {
+      console.log(`[rtc] handleIncomingAnswer from ${peerUserId}: not awaiting an answer (${pc.signalingState}), ignoring`);
+      return;
+    }
+    console.log(`[rtc] handleIncomingAnswer from ${peerUserId}`);
+    await pc.setRemoteDescription({ type: "answer", sdp: data.sdp });
+    logTransceivers("after setRemoteDescription(answer)", peerUserId, pc);
+    remoteDescriptionSet.add(peerUserId);
+    await flushPendingCandidates(peerUserId, pc);
+  }).then(() => {
+    if (localScreenStream && screenSubscribers.has(peerUserId)) void applyScreenSend(peerUserId, true);
+  });
 }
 
 async function flushPendingCandidates(peerUserId: string, pc: RTCPeerConnection) {
@@ -217,14 +329,20 @@ async function handleIncomingIce(data: any) {
 function closePeer(peerUserId: string) {
   const pc = peers.get(peerUserId);
   if (pc) { pc.close(); peers.delete(peerUserId); }
-  videoSenders.delete(peerUserId);
+  screenSlots.delete(peerUserId);
+  screenNeedsOffer.delete(peerUserId);
+  spectatedStreams.delete(peerUserId);
+  spectatorPeers.delete(peerUserId);
   pendingCandidates.delete(peerUserId);
   remoteDescriptionSet.delete(peerUserId);
+  sdpLocks.delete(peerUserId);
+  lastRemoteSdp.delete(peerUserId);
   screenSubscribers.delete(peerUserId);
   const timer = iceRestartTimers.get(peerUserId);
   if (timer) { clearTimeout(timer); iceRestartTimers.delete(peerUserId); }
   const audioEl = remoteAudioEls.get(peerUserId);
   if (audioEl) { audioEl.srcObject = null; remoteAudioEls.delete(peerUserId); }
+  remoteAudioStreams.delete(peerUserId);
   emitRemoteStream(peerUserId, null);
 }
 
@@ -240,17 +358,18 @@ function handleEnvelope(event: Envelope) {
       break;
     }
     case "call.snapshot": {
-      currentChannelId = data.channel_id;
+      if (data.channel_id) currentChannelId = data.channel_id;
       if (!selfUserId) break;
       for (const participant of data.participants ?? []) {
         const peerUserId: string = participant.user_id;
-        if (peerUserId !== selfUserId && selfUserId < peerUserId) void connectToPeer(peerUserId);
+        if (peerUserId !== selfUserId && selfUserId < peerUserId) void connectToPeer(peerUserId, data.channel_id);
       }
       break;
     }
     case "call.peer_joined": {
+      if (data.channel_id) currentChannelId = data.channel_id;
       const peerUserId: string = data.participant.user_id;
-      if (selfUserId && peerUserId !== selfUserId && selfUserId < peerUserId) void connectToPeer(peerUserId);
+      if (selfUserId && peerUserId !== selfUserId && selfUserId < peerUserId) void connectToPeer(peerUserId, data.channel_id);
       break;
     }
     case "call.peer_left":
@@ -270,11 +389,11 @@ function handleEnvelope(event: Envelope) {
     // stop sending its screen share to the named peer.
     case "stream.subscription_requested":
       console.log(`[rtc] stream.subscription_requested from ${data.subscriber}`);
-      setScreenSubscription(data.subscriber, true);
+      void setScreenSubscription(data.subscriber, true);
       break;
     case "stream.unsubscribed":
       console.log(`[rtc] stream.unsubscribed from ${data.subscriber}`);
-      setScreenSubscription(data.subscriber, false);
+      void setScreenSubscription(data.subscriber, false);
       break;
     case "stream.unpublished":
       // Nothing more will ever arrive for this stream — if we were watching
@@ -285,17 +404,109 @@ function handleEnvelope(event: Envelope) {
   }
 }
 
-function setScreenSubscription(peerUserId: string, subscribed: boolean) {
+async function setScreenSubscription(peerUserId: string, subscribed: boolean) {
   if (subscribed) screenSubscribers.add(peerUserId); else screenSubscribers.delete(peerUserId);
-  const sender = videoSenders.get(peerUserId);
-  if (!sender) { console.warn(`[rtc] setScreenSubscription(${peerUserId}, ${subscribed}) — no video sender for this peer yet`); return; }
-  console.log(`[rtc] replaceTrack(${subscribed ? (localScreenTrack ? localScreenTrack.label || "screen-track" : "null (no localScreenTrack!)") : "null"}) on sender for ${peerUserId}`);
-  void sender.replaceTrack(subscribed ? localScreenTrack : null);
+  // A spectator (subscribed but never joined the call) has no peer connection
+  // yet — the stream owner has to initiate one, ignoring the usual
+  // lower-id-offers rule since the spectator will never offer.
+  if (subscribed && !peers.get(peerUserId) && currentChannelId) {
+    spectatorPeers.add(peerUserId);
+    await connectToPeer(peerUserId, currentChannelId);
+  }
+  // A spectator-only peer has no reason to stay connected once it unsubscribes
+  // — just drop the whole peer connection instead of renegotiating it idle.
+  if (!subscribed && spectatorPeers.has(peerUserId)) {
+    spectatorPeers.delete(peerUserId);
+    closePeer(peerUserId);
+    return;
+  }
+  await applyScreenSend(peerUserId, subscribed && localScreenStream !== null);
+}
+
+/// Owner side: activate or idle THIS peer's dedicated screen transceiver(s),
+/// then renegotiate once. The transceivers are created a single time and then
+/// reused for the lifetime of the peer connection — toggling is replaceTrack +
+/// direction, never removeTrack — so repeated hover-previews/subscribes can no
+/// longer accumulate dead m-lines and push the SDP past the relay's 64 KiB cap.
+function applyScreenSend(peerUserId: string, sending: boolean) {
+  return withSdpLock(peerUserId, async () => {
+    const pc = peers.get(peerUserId);
+    if (!pc) { console.warn(`[rtc] applyScreenSend(${peerUserId}, ${sending}) — no peer yet`); return; }
+    let slots = screenSlots.get(peerUserId);
+
+    if (sending) {
+      if (!localScreenStream) { console.warn(`[rtc] applyScreenSend(${peerUserId}, true) — no local screen stream`); return; }
+      const videoTrack = localScreenStream.getVideoTracks()[0] ?? null;
+      const audioTrack = localScreenStream.getAudioTracks()[0] ?? null;
+      const alreadyCorrect = !!slots
+        && slots.active
+        && slots.video.sender.track === videoTrack
+        && (slots.audio?.sender.track ?? null) === audioTrack;
+
+      if (!slots) {
+        const video = pc.addTransceiver(videoTrack ?? "video", { direction: "sendonly", streams: [localScreenStream] });
+        const audio = audioTrack
+          ? pc.addTransceiver(audioTrack, { direction: "sendonly", streams: [localScreenStream] })
+          : null;
+        slots = { video, audio, active: true };
+        screenSlots.set(peerUserId, slots);
+        screenNeedsOffer.add(peerUserId);
+        console.log(`[rtc] applyScreenSend ${peerUserId}: created screen transceivers (audio=${!!audio})`);
+      } else if (!alreadyCorrect) {
+        await slots.video.sender.replaceTrack(videoTrack);
+        slots.video.direction = "sendonly";
+        if (audioTrack) {
+          if (!slots.audio) {
+            slots.audio = pc.addTransceiver(audioTrack, { direction: "sendonly", streams: [localScreenStream] });
+          } else {
+            await slots.audio.sender.replaceTrack(audioTrack);
+            slots.audio.direction = "sendonly";
+          }
+        } else if (slots.audio) {
+          await slots.audio.sender.replaceTrack(null);
+          slots.audio.direction = "inactive";
+        }
+        slots.active = true;
+        screenNeedsOffer.add(peerUserId);
+        console.log(`[rtc] applyScreenSend ${peerUserId}: reactivated screen transceivers`);
+      } else if (!screenNeedsOffer.has(peerUserId)) {
+        console.log(`[rtc] applyScreenSend ${peerUserId}: already sending`);
+        return;
+      }
+    } else {
+      if (!slots || !slots.active) return;
+      await slots.video.sender.replaceTrack(null);
+      slots.video.direction = "inactive";
+      if (slots.audio) {
+        await slots.audio.sender.replaceTrack(null);
+        slots.audio.direction = "inactive";
+      }
+      slots.active = false;
+      screenNeedsOffer.add(peerUserId);
+      console.log(`[rtc] applyScreenSend ${peerUserId}: idled screen transceivers`);
+    }
+
+    if (!screenNeedsOffer.has(peerUserId)) return;
+    // Can't renegotiate mid-flight — retried from handleIncomingOffer/Answer.
+    if (!currentChannelId || pc.signalingState !== "stable") return;
+    screenNeedsOffer.delete(peerUserId);
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    sendSdp("rtc.offer", currentChannelId, peerUserId, offer.sdp);
+  });
 }
 
 export function init(currentUserId: string) {
   selfUserId = currentUserId;
   subscribe(handleEnvelope);
+}
+
+/// Tell the engine which voice channel is active without (re)capturing the
+/// mic — used when the UI shows us already in a call (e.g. a call.snapshot
+/// that arrived before this module subscribed) so signalling has a channel
+/// id even though joinCall was never called this session.
+export function ensureChannel(channelId: string) {
+  if (!currentChannelId) currentChannelId = channelId;
 }
 
 /// Captures the microphone and applies the current mute/deafen state to it.
@@ -305,14 +516,31 @@ export function init(currentUserId: string) {
 /// renegotiation-on-late-mic path is needed.
 export async function joinCall(channelId: string, muted: boolean, deafened: boolean) {
   currentChannelId = channelId;
+  joinedCall = true;
   localMuted = muted;
   localDeafened = deafened;
   try {
-    localStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    // Chromium's built-in audio processing (WebRTC APM): steady-state noise
+    // suppression, acoustic echo cancellation, automatic gain. Free, no
+    // dependency — the baseline before any ML denoiser.
+    rawMic = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        // Chromium's own APM: echo cancellation + AGC still help; leave its
+        // noise suppression on too (RNNoise runs after it and they stack
+        // fine — this is the pre-ML baseline).
+        noiseSuppression: true,
+        echoCancellation: true,
+        autoGainControl: true,
+        channelCount: 1,
+      },
+    });
+    // Denoise locally with RNNoise before anything reaches a peer.
+    localStream = await noiseSuppression.processMic(rawMic, noiseSuppressionOn);
     applyLocalAudioState();
   } catch (error) {
     console.error("getUserMedia failed — joining call without a microphone", error);
     localStream = null;
+    rawMic = null;
   }
   send("call.join", { channel_id: channelId, req_id: crypto.randomUUID(), muted, deafened });
 }
@@ -321,10 +549,52 @@ export async function leaveCall() {
   if (!currentChannelId) return;
   send("call.leave", { channel_id: currentChannelId, req_id: crypto.randomUUID() });
   for (const peerUserId of Array.from(peers.keys())) closePeer(peerUserId);
+  stopNativeScreen();
   if (localScreenTrack) { localScreenTrack.stop(); localScreenTrack = null; }
+  localScreenStream = null;
+  screenSlots.clear();
+  screenNeedsOffer.clear();
   screenSubscribers.clear();
+  spectatedStreams.clear();
+  spectatorPeers.clear();
   if (localStream) { for (const track of localStream.getTracks()) track.stop(); localStream = null; }
+  if (rawMic) { for (const track of rawMic.getTracks()) track.stop(); rawMic = null; }
+  void noiseSuppression.teardown();
+  joinedCall = false;
   currentChannelId = null;
+}
+
+/// Spectator preview: subscribe to someone's screen share in a channel we have
+/// NOT joined, so a sidebar hover can show a live thumbnail. The stream owner
+/// initiates the peer connection on its side (setScreenSubscription).
+export function spectate(channelId: string, streamId: string, ownerUserId: string) {
+  if (!currentChannelId) currentChannelId = channelId;
+  spectatedStreams.set(ownerUserId, { channelId, streamId });
+  send("stream.subscribe", { channel_id: channelId, stream_id: streamId, owner_user_id: ownerUserId });
+}
+
+export function stopSpectate(ownerUserId: string) {
+  const entry = spectatedStreams.get(ownerUserId);
+  spectatedStreams.delete(ownerUserId);
+  if (entry) {
+    send("stream.unsubscribe", { channel_id: entry.channelId, stream_id: entry.streamId, owner_user_id: ownerUserId });
+  }
+  emitRemoteStream(ownerUserId, null);
+  // A pure spectator peer connection has no other reason to exist — drop it.
+  if (!joinedCall) {
+    closePeer(ownerUserId);
+    if (spectatedStreams.size === 0) currentChannelId = null;
+  }
+}
+
+/// Toggle RNNoise on/off (the "crisp" control). Rewires the audio graph in
+/// place, so the outgoing track — and therefore the SDP — is unaffected.
+export function setNoiseSuppression(on: boolean) {
+  noiseSuppressionOn = on;
+  noiseSuppression.setEnabled(on);
+}
+export function isNoiseSuppressionOn() {
+  return noiseSuppressionOn;
 }
 
 function applyLocalAudioState() {
@@ -337,37 +607,45 @@ export function setLocalAudioState(muted: boolean, deafened: boolean) {
   localMuted = muted;
   localDeafened = deafened;
   applyLocalAudioState();
-  for (const audioEl of remoteAudioEls.values()) audioEl.muted = deafened;
+  applyRemoteMuting();
   if (currentChannelId) send("call.state.update", { channel_id: currentChannelId, muted, deafened, req_id: crypto.randomUUID() });
 }
 
-/// SCREEN-FR-001/SUB-FR-001: capture starts immediately, but nothing is sent
-/// to any peer until each viewer's stream.subscribe arrives as
-/// stream.subscription_requested — see setScreenSubscription.
-export async function publishScreen(channelId: string, streamId: string, targetHeight: number, targetFps: number) {
-  const displayStream = await navigator.mediaDevices.getDisplayMedia({
-    video: { height: { ideal: targetHeight }, frameRate: { ideal: targetFps } },
-    audio: false,
-  });
-  localScreenTrack = displayStream.getVideoTracks()[0] ?? null;
-  console.log(`[rtc] publishScreen: got track=${localScreenTrack?.label ?? "none"} readyState=${localScreenTrack?.readyState}, current subscribers=[${Array.from(screenSubscribers).join(",")}]`);
-  if (localScreenTrack) {
-    // The system "stop sharing" control (or the user closing the shared
-    // window) ends the track without going through our own stopSharing —
-    // treat that the same as an explicit unpublish.
-    localScreenTrack.onended = () => { void unpublishScreen(channelId, streamId); };
+function applyRemoteMuting() {
+  for (const [peerUserId, audioEl] of remoteAudioEls) {
+    audioEl.muted = !joinedCall || localDeafened || (peerAudioMuted.get(peerUserId) ?? false);
   }
-  for (const peerUserId of screenSubscribers) {
-    const sender = videoSenders.get(peerUserId);
-    if (sender) void sender.replaceTrack(localScreenTrack);
-  }
-  send("stream.publish", { channel_id: channelId, stream_id: streamId, kind: "screen", has_audio: false, req_id: crypto.randomUUID() });
+}
+
+/// Local-only mute of a single participant's audio ("Silenciar" on a tile).
+export function setPeerAudioMuted(peerUserId: string, isMuted: boolean) {
+  peerAudioMuted.set(peerUserId, isMuted);
+  applyRemoteMuting();
+}
+
+/// SCREEN-FR-001/SUB-FR-001: capture starts immediately (via the native
+/// borderless GDI capture path — no getDisplayMedia, so no Chromium capture
+/// border), but nothing is sent to any peer until each viewer's
+/// stream.subscribe arrives as stream.subscription_requested — see
+/// setScreenSubscription. `sourceId` comes from the in-app picker
+/// ("screen:all" | "screen:<n>" | "window:<hwnd>").
+export async function publishScreen(channelId: string, streamId: string, sourceId: string, targetHeight: number, targetFps: number, withAudio: boolean) {
+  localScreenStream = startNativeScreen(sourceId, targetHeight, targetFps, withAudio);
+  localScreenTrack = localScreenStream?.getVideoTracks()[0] ?? null;
+  const hasAudio = (localScreenStream?.getAudioTracks().length ?? 0) > 0;
+  console.log(`[rtc] publishScreen: ${sourceId} video=${localScreenTrack?.readyState} audio=${hasAudio} subs=[${Array.from(screenSubscribers).join(",")}]`);
+  // Anyone who already subscribed (before we had a track) now gets it.
+  for (const peerUserId of screenSubscribers) await applyScreenSend(peerUserId, true);
+  send("stream.publish", { channel_id: channelId, stream_id: streamId, kind: "screen", has_audio: hasAudio, req_id: crypto.randomUUID() });
 }
 
 export async function unpublishScreen(channelId: string, streamId: string) {
-  if (localScreenTrack) { localScreenTrack.stop(); localScreenTrack = null; }
-  for (const sender of videoSenders.values()) void sender.replaceTrack(null);
+  const formerSubscribers = Array.from(screenSubscribers);
   screenSubscribers.clear();
+  for (const peerUserId of formerSubscribers) await applyScreenSend(peerUserId, false);
+  stopNativeScreen();
+  if (localScreenTrack) { localScreenTrack.stop(); localScreenTrack = null; }
+  localScreenStream = null;
   send("stream.unpublish", { channel_id: channelId, stream_id: streamId, req_id: crypto.randomUUID() });
 }
 
@@ -377,6 +655,7 @@ export function watchStream(channelId: string, streamId: string, ownerUserId: st
 }
 
 export function stopWatchingStream(channelId: string, streamId: string, ownerUserId: string) {
+  console.log(`[rtc] stopWatchingStream: unsubscribing from ${ownerUserId}'s stream ${streamId}`);
   send("stream.unsubscribe", { channel_id: channelId, stream_id: streamId, owner_user_id: ownerUserId });
   emitRemoteStream(ownerUserId, null);
 }
