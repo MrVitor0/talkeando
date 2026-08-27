@@ -7,6 +7,12 @@ using System.Text.Json;
 
 namespace Talkeando.Client;
 
+/// Formerly declared alongside the native RtcEngine (deleted — WebRTC now
+/// runs in client/ui/src/rtc.ts, see SDD/27-decisions.md ADR-009); kept here
+/// since NetworkClient is the only remaining consumer (rtc.turn_credentials
+/// is relayed to the UI via IpcBridge, itself just JSON, not this record).
+public sealed record TurnCredentials(string Username, string Credential, IReadOnlyList<string> Uris);
+
 /// HTTP boundary owned by the native host. The WebView asks for product
 /// actions, but never receives or persists the bearer token.
 public sealed class NetworkClient

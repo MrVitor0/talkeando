@@ -10,7 +10,7 @@ public sealed class SessionStore
 {
     private static readonly string DefaultPath = System.IO.Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-        "Talkeando", "session.bin");
+        "Talkeando", $"session{Profile.Suffix}.bin");
 
     private readonly string _path;
 

@@ -7,9 +7,12 @@
 .message-status{margin-left:8px;font-size:12px;color:#9094a1}
 .messages article.failed .message-status{color:#fda4af}
 .message-status button{background:transparent;border:0;color:#a78bfa;cursor:pointer;font-size:12px;margin-left:4px;padding:0}
-.monitor-picker{display:flex;flex-direction:column;gap:4px;background:#1b1c22;border:1px solid #463b65;border-radius:8px;padding:8px}
-.monitor-picker button{background:transparent;color:#c5c7d0;border:0;border-radius:6px;padding:7px;text-align:left;cursor:pointer;font-size:12px}
-.monitor-picker button:hover{background:#292b34}
-.stream-row{display:flex;justify-content:space-between;align-items:center;gap:8px;font-size:12px;color:#c4b5fd;padding:4px 0}
+.quality-picker{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:2px 2px 6px;font-size:11px;color:#9094a1}
+.quality-picker select{background:#272932;color:#e5e7eb;border:1px solid #343743;border-radius:6px;padding:4px 6px;font-size:12px}
+.stage{background:#000;border-bottom:1px solid #292b34;padding:10px 20px}
+.stage-tabs{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px}
+.stage-tabs button{background:#272932;color:#c5c7d0;border:0;border-radius:6px;padding:7px 12px;cursor:pointer;font-size:13px}
+.stage-tabs button.selected{background:#4c1d95;color:white}
+.stream-video{display:block;width:100%;max-height:60vh;border-radius:8px;background:#000}
 .stream-row button{background:#4c1d95;color:white;border:0;border-radius:6px;padding:5px 9px;cursor:pointer;font-size:12px}
 @media(max-width:800px){.shell{grid-template-columns:190px 1fr}.members{display:none}}

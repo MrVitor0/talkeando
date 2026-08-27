@@ -124,6 +124,35 @@ que descrevia, incorretamente, reenvio com `req_id` novo).
   tile embutido na janela principal — ver ADR-003 para a razão e
   `14-screen-share-pipeline.md` para o pipeline completo. Cliente e UI
   seguem compilando limpos (0 erros) após esta adição.
+- **2026-08-27: bug real corrigido — nenhum frame de vídeo jamais era
+  enviado.** Encontrado em teste manual real com dois usuários (não
+  hipotético): toda a sinalização funcionava (publish/subscribe/
+  subscription_requested confirmados nos logs), mas o viewer nunca recebia
+  quadro nenhum. Causa raiz dupla: (1) `PublishScreen` usava a classe
+  errada — `WindowsVideoEndPoint` (câmera apenas) lança exceção em toda
+  chamada a `ExternalVideoSourceRawSample`; a classe certa para injetar
+  frames externos é `SIPSorceryMedia.Encoders.VideoEncoderEndPoint`; (2)
+  mesmo trocando a classe, o parâmetro de duração estava em unidades RTP
+  quando deveria ser milissegundos por quadro, causando
+  `DivideByZeroException`. Ambas as exceções eram engolidas silenciosamente
+  por um `catch { break; }` genérico no loop de captura — corrigido para
+  logar em vez de engolir. Ver `27-decisions.md` ADR-005 (correção
+  detalhada) e ADR-006 (bug relacionado: duas janelas na mesma máquina
+  compartilhavam um único arquivo de sessão, o que confundiu o primeiro
+  teste de 2 usuários). Corrigido e testes unitários do cliente (12)
+  seguem passando.
+- **2026-08-27: segundo bug real, encontrado assim que o primeiro frame
+  finalmente chegou** — o viewer renderizava preto sólido em vez da tela
+  compartilhada. Testado por round-trip real (codificar uma imagem de cor
+  conhecida, decodificar, inspecionar os bytes): `VpxVideoEncoder.
+  DecodeVideo` ignora completamente o parâmetro `VideoPixelFormatsEnum` —
+  toda combinação testada (Bgra, Bgr, Rgb, I420) devolveu exatamente
+  `width*height*3` bytes (BGR de 3 bytes/pixel), nunca os 4 bytes/pixel de
+  BGRA que o código assumia. Corrigido: `ScreenShareViewerWindow` agora usa
+  `PixelFormats.Bgr24` com stride `width*3` em vez de `Bgra32`/`width*4`.
+  Ver `27-decisions.md` ADR-005 (mesma entrada, terceira parte). Pendente:
+  confirmação visual do usuário de que a imagem renderiza corretamente
+  (não só que não fica mais preta).
 - pendente: validação em duas máquinas Windows reais; seleção de janela
   individual (só monitor inteiro no v1); tile embutido na UI principal;
   indicador "compartilhando para N pessoas"; adaptação de qualidade de vídeo.
@@ -149,6 +178,22 @@ que descrevia, incorretamente, reenvio com `req_id` novo).
   `IpcBridge.HandleConnectionStateChangeAsync`, com o lado de menor
   `user_id` iniciando o restart (evita colisão sem Perfect Negotiation
   completo) — ver `flows/reconnect.md` camada 2.
+- **2026-08-27: WebRTC (voz + screen share) migrado de C#/SIPSorcery para o
+  próprio motor libwebrtc do WebView2** (ver ADR-008/ADR-009 em
+  `27-decisions.md`). `RtcEngine.cs` e `ScreenShareViewerWindow.xaml(.cs)`
+  foram removidos; `client/ui/src/rtc.ts` (novo) implementa a mesh via
+  `RTCPeerConnection`/`getUserMedia`/`getDisplayMedia` nativos do
+  navegador. `IpcBridge.cs` virou um relay puro de sinalização (offer/
+  answer/ice/publish/subscribe passam direto para o WebSocket autenticado,
+  sem entender WebRTC). Topologia continua P2P mesh — nada disso introduz
+  um SFU. As dependências `SIPSorcery`/`SIPSorceryMedia.*` foram removidas
+  do `.csproj`. Motivação: `VpxVideoEncoder.TargetKbps` do pacote pinado
+  provou ser um no-op real (testado empiricamente), então não havia
+  controle de qualidade/bitrate possível naquele caminho — o motor do
+  Chromium já traz isso de fábrica (GCC, NACK/PLI, simulcast/SVC,
+  screen-content-coding), então reimplementar à mão deixou de fazer
+  sentido. `RtcEngineTests.cs` foi removido (a lógica que testava não
+  existe mais em C#); não reposto em TS nesta sessão.
 
 ### Operação (M5, parte pronta)
 

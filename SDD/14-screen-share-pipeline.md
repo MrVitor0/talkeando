@@ -83,20 +83,26 @@ RTCPeerConnection.OnVideoFrameReceived (frame VP8 já reagrupado pelo
 SIPSorcery a partir dos pacotes RTP — não há depacketização manual aqui)
     │
     ▼
-VpxVideoEncoder.DecodeVideo(payload, Bgra, VP8) → IEnumerable<VideoSample>
+VpxVideoEncoder.DecodeVideo(payload, Bgr, VP8) → IEnumerable<VideoSample>
     (uma instância de decoder por peer remoto, nunca compartilhada — VP8 é
-    stateful entre frames)
+    stateful entre frames. O parâmetro VideoPixelFormatsEnum é ignorado
+    pela implementação — verificado por teste real de round-trip
+    encode/decode: toda combinação testada devolve exatamente
+    width*height*3 bytes, ou seja, BGR de 3 bytes/pixel, nunca BGRA de 4 —
+    ver 27-decisions.md ADR-005)
     │
     ▼
-RtcEngine.RemoteVideoFrameReceived(peerUserId, width, height, bgraBytes)
+RtcEngine.RemoteVideoFrameReceived(peerUserId, width, height, bgrBytes)
     │
     ▼
 IpcBridge roteia pelo peerUserId (não pelo stream_id — ver ADR-003 para a
 simplificação aceita) para a ScreenShareViewerWindow correspondente
     │
     ▼
-WriteableBitmap (PixelFormats.Bgra32 — mesmo layout de bytes, sem
-conversão) .WritePixels(...)
+WriteableBitmap (PixelFormats.Bgr24, stride = width*3 — mesmo layout de
+bytes, sem conversão; usar Bgra32/stride*4 aqui gera um buffer 25% maior
+que o real e corrompe/falha o WritePixels silenciosamente, deixando a
+imagem no preto padrão) .WritePixels(...)
 ```
 
 ## Encerramento

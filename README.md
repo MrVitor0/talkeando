@@ -110,13 +110,30 @@ Log in as `alice`/`alicepass123`.
 
 ## 5. Testing with two accounts on one machine
 
-You don't need two physical machines to exercise most of this. Run a
-**second** `dotnet run` from the same `Talkeando.Client` folder (a second
-process, second window) and register a second user with the invite code
-from step 2 ("Tenho um convite" on the login screen). Both processes talk
-to the same local backend; a voice call or screen share between them is a
-real P2P connection over loopback — this validates signaling, mute/deafen,
-the publish/subscribe screen-share gating, and the UI end to end.
+You don't need two physical machines to exercise most of this — but you do
+need to set `TALKEANDO_PROFILE` per instance, or the two windows will fight
+over one shared session file (found the hard way: a second login silently
+overwrote the first window's saved token, and REST calls could pick up the
+wrong user's bearer token mid-session — see `SDD/27-decisions.md` ADR-006).
+
+Terminal 1:
+```
+set TALKEANDO_PROFILE=alice
+dotnet run
+```
+Terminal 2 (a second terminal window, same folder):
+```
+set TALKEANDO_PROFILE=bob
+dotnet run
+```
+(PowerShell: use `$env:TALKEANDO_PROFILE="alice"` instead of `set`.)
+
+Each window's title bar shows its profile name. Log into one as the owner
+and register the other with the invite code from step 2 ("Tenho um
+convite" on the login screen). Both processes talk to the same local
+backend; a voice call or screen share between them is a real P2P
+connection over loopback — this validates signaling, mute/deafen, the
+publish/subscribe screen-share gating, and the UI end to end.
 
 What this single-machine setup does **not** validate: TURN relay (needs a
 real NAT/restrictive-network scenario), and anything specifically about

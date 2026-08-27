@@ -1,101 +1,45 @@
 using Microsoft.Web.WebView2.Core;
-using SIPSorcery.Net;
 using System.Text.Json;
 
 namespace Talkeando.Client;
 
 /// Sole native/UI boundary. Commands are envelope-shaped (`op`, `data`) and
 /// every response is posted back as an event envelope, so the React UI never
-/// sees session secrets or native WebRTC objects.
+/// sees session secrets.
+///
+/// Call/screen-share signaling ops (`rtc.offer`/`rtc.answer`/`rtc.ice`,
+/// `call.join`/`call.leave`/`call.state.update`, `stream.publish`/
+/// `stream.unpublish`/`stream.subscribe`/`stream.unsubscribe`) are pure
+/// passthrough to the authenticated WebSocket: this class no longer
+/// understands WebRTC at all. The actual RTCPeerConnection mesh now runs in
+/// the browser engine WebView2 already embeds (`client/ui/src/rtc.ts`) — see
+/// SDD/27-decisions.md ADR-009 for why (ADR-008 found the pinned SIPSorcery
+/// VP8 wrapper's bitrate control to be a no-op; real congestion
+/// control/NACK/PLI/screen-content-coding all come free with the browser's
+/// own libwebrtc instead of being reimplemented by hand). `rtc.offer`/
+/// `rtc.answer`/`rtc.ice` and every WS event this client can receive are
+/// forwarded to the UI unchanged by the catch-all `Publish(op, data)` in
+/// `HandleNetworkEvent`.
 public sealed class IpcBridge : IDisposable
 {
     public event EventHandler<string>? EventReady;
     private readonly SessionStore _sessions = new();
     private readonly NetworkClient _network;
-    private readonly RtcEngine _rtc = new();
-    private readonly Dictionary<Guid, ScreenShareViewerWindow> _watchWindows = new();
-    /// stream_id -> owner user_id, learned from `stream.published` — needed
-    /// because `stream.unpublished` only carries `stream_id` (see
-    /// server/src/ws/protocol.rs `StreamUnpublished`), not who owned it.
-    private readonly Dictionary<Guid, Guid> _streamOwners = new();
-    private Guid? _currentCallChannel;
-    private Guid? _currentUser;
-
-    private readonly Dictionary<Guid, CancellationTokenSource> _iceRestartTimers = new();
 
     public IpcBridge()
     {
         _network = new NetworkClient(_sessions);
-        _rtc.IceCandidateReady += (peerUserId, candidate) => _ = SendIceAsync(peerUserId, candidate);
-        // v1 simplification: a peer publishes at most one screen share at a
-        // time (see SDD/30-v1-delivery-plan.md M1.3), so routing decoded
-        // frames by peerUserId alone (not by stream_id) is sufficient.
-        _rtc.RemoteVideoFrameReceived += (peerUserId, width, height, bgra) =>
-        {
-            if (_watchWindows.TryGetValue(peerUserId, out var window))
-                window.UpdateFrame(width, height, bgra);
-        };
-        _rtc.ConnectionStateChanged += (peerUserId, state) => _ = HandleConnectionStateChangeAsync(peerUserId, state);
-    }
-
-    /// flows/reconnect.md layer 2 (peer WebRTC reconnect): only the
-    /// deterministically "lower id" side initiates ICE restart — the same
-    /// convention already used to decide who offers first on a fresh
-    /// connection — so both ends of a degraded link do not restart ICE at
-    /// the same time and race each other (a scoped simplification, not full
-    /// Perfect Negotiation collision recovery — see SDD/27-decisions.md).
-    private async Task HandleConnectionStateChangeAsync(Guid peerUserId, RTCPeerConnectionState state)
-    {
-        if (_iceRestartTimers.Remove(peerUserId, out var previous)) previous.Cancel();
-        if (_currentUser is not Guid self || self.CompareTo(peerUserId) >= 0) return;
-
-        if (state == RTCPeerConnectionState.disconnected)
-        {
-            // "disconnected" is often transient (a brief packet-loss burst);
-            // give it a grace period before treating it as real network
-            // failure, per flows/reconnect.md.
-            var cts = new CancellationTokenSource();
-            _iceRestartTimers[peerUserId] = cts;
-            try
-            {
-                await Task.Delay(TimeSpan.FromSeconds(5), cts.Token);
-                await TriggerIceRestartAsync(peerUserId);
-            }
-            catch (OperationCanceledException) { /* recovered before the grace period elapsed */ }
-        }
-        else if (state == RTCPeerConnectionState.failed)
-        {
-            await TriggerIceRestartAsync(peerUserId);
-        }
-    }
-
-    private async Task TriggerIceRestartAsync(Guid peerUserId)
-    {
-        if (_currentCallChannel is not Guid channelId) return;
-        try
-        {
-            var sdp = await _rtc.RestartIceAsync(peerUserId);
-            await _network.SendWebSocketAsync("rtc.offer", JsonSerializer.SerializeToElement(new { channel_id = channelId, to = peerUserId, sdp }));
-        }
-        catch (Exception exception)
-        {
-            Publish("error", new { code = "ice_restart_failed", message = exception.Message });
-        }
     }
 
     public async void HandleWebMessage(object? sender, CoreWebView2WebMessageReceivedEventArgs args)
     {
-        // Temporary diagnostic logging (2026-08-27): tracking down a
-        // "clicking login does nothing, no errors" report. Console.WriteLine
-        // — not Debug.WriteLine — because this needs to be visible in the
-        // terminal `dotnet run` was launched from, not just a debugger.
-        Console.WriteLine($"[IPC] received: {args.WebMessageAsJson}");
+        DebugLog.Write($"received: {args.WebMessageAsJson}");
         try
         {
             using var document = JsonDocument.Parse(args.WebMessageAsJson);
             var root = document.RootElement;
             var op = root.GetProperty("op").GetString();
-            Console.WriteLine($"[IPC] dispatching op={op}");
+            DebugLog.Write($"dispatching op={op}");
             switch (op)
             {
                 case "auth.session.restore":
@@ -141,73 +85,29 @@ public sealed class IpcBridge : IDisposable
                         openData.GetProperty("filename").GetString() ?? "attachment"
                     );
                     break;
+                // Everything below is a pure relay to the authenticated
+                // WebSocket — the JS RTC engine (client/ui/src/rtc.ts) owns
+                // all of the actual call/screen-share semantics now.
                 case "call.join":
-                    await _network.SendWebSocketAsync(op!, root.GetProperty("data"));
-                    await _rtc.StartMicrophoneAsync();
-                    break;
                 case "call.leave":
-                    await _network.SendWebSocketAsync(op!, root.GetProperty("data"));
-                    await _rtc.LeaveCallAsync();
-                    _currentCallChannel = null;
-                    break;
                 case "call.state.update":
-                    var stateData = root.GetProperty("data");
-                    if (stateData.TryGetProperty("muted", out var mutedEl) && mutedEl.ValueKind is JsonValueKind.True or JsonValueKind.False)
-                        _rtc.SetMuted(mutedEl.GetBoolean());
-                    if (stateData.TryGetProperty("deafened", out var deafenedEl) && deafenedEl.ValueKind is JsonValueKind.True or JsonValueKind.False)
-                        _rtc.SetDeafened(deafenedEl.GetBoolean());
-                    await _network.SendWebSocketAsync(op!, stateData);
-                    break;
-                case "screen.sources.list":
-                    Publish("screen.sources", RtcEngine.ListMonitors());
-                    break;
                 case "stream.publish":
-                    var publishData = root.GetProperty("data");
-                    var streamId = publishData.GetProperty("stream_id").GetGuid();
-                    // `monitor_index` is native-only (selects which GDI
-                    // screen to capture) and is not part of the server's
-                    // stream.publish contract, so it is read here and not
-                    // forwarded over the WebSocket.
-                    var monitorIndex = publishData.TryGetProperty("monitor_index", out var monitorEl) ? monitorEl.GetInt32() : 0;
-                    _rtc.PublishScreen(streamId, monitorIndex);
-                    await _network.SendWebSocketAsync(op!, publishData);
-                    break;
                 case "stream.unpublish":
-                    var unpublishStreamId = root.GetProperty("data").GetProperty("stream_id").GetGuid();
-                    _rtc.UnpublishScreen(unpublishStreamId);
-                    await _network.SendWebSocketAsync(op!, root.GetProperty("data"));
-                    break;
-                case "stream.watch":
-                    var watchData = root.GetProperty("data");
-                    var watchOwner = watchData.GetProperty("owner_user_id").GetGuid();
-                    if (!_watchWindows.ContainsKey(watchOwner))
-                    {
-                        var window = new ScreenShareViewerWindow { Title = $"Talkeando — assistindo {watchOwner}" };
-                        // Closing the window (either via the "x" button or
-                        // from the stream.stop_watching case below) is the
-                        // single place that both forgets the window and
-                        // tells the server to stop this subscription — no
-                        // duplicate unsubscribe path to drift out of sync.
-                        window.Closed += (_, _) =>
-                        {
-                            _watchWindows.Remove(watchOwner);
-                            _ = _network.SendWebSocketAsync("stream.unsubscribe", watchData);
-                        };
-                        _watchWindows[watchOwner] = window;
-                        window.Show();
-                    }
-                    await _network.SendWebSocketAsync("stream.subscribe", watchData);
-                    break;
-                case "stream.stop_watching":
-                    var stopOwner = root.GetProperty("data").GetProperty("owner_user_id").GetGuid();
-                    if (_watchWindows.TryGetValue(stopOwner, out var watchWindow)) watchWindow.Close();
-                    else await _network.SendWebSocketAsync("stream.unsubscribe", root.GetProperty("data"));
-                    break;
+                case "stream.subscribe":
+                case "stream.unsubscribe":
+                case "rtc.offer":
+                case "rtc.answer":
+                case "rtc.ice":
                 case "chat.message.create":
                 case "chat.message.edit":
                 case "chat.message.delete":
                 case "chat.typing":
                     await _network.SendWebSocketAsync(op!, root.GetProperty("data"));
+                    break;
+                case "rtc.turn_credentials.request":
+                    var requestId = root.GetProperty("data").GetProperty("request_id").GetString();
+                    var turn = await _network.GetTurnCredentialsAsync();
+                    Publish("rtc.turn_credentials", new { request_id = requestId, username = turn.Username, credential = turn.Credential, uris = turn.Uris });
                     break;
                 default:
                     Publish("error", new { code = "unknown_ipc_op", op });
@@ -216,6 +116,7 @@ public sealed class IpcBridge : IDisposable
         }
         catch (Exception exception)
         {
+            DebugLog.Write($"FAILED: {exception}");
             Publish("error", new { code = "ipc_request_failed", message = exception.Message });
         }
     }
@@ -223,121 +124,25 @@ public sealed class IpcBridge : IDisposable
     private async Task PublishBootstrapAsync()
     {
         var bootstrap = await _network.BootstrapAsync();
-        _currentUser = bootstrap.GetProperty("currentUser").GetProperty("id").GetGuid();
         await _network.ConnectWebSocketAsync(HandleNetworkEvent);
         Publish("app.bootstrap", bootstrap);
         Publish("auth.state_changed", new { state = "authenticated" });
     }
 
-    private void HandleNetworkEvent(string op, JsonElement data)
-    {
-        try
-        {
-            if (op == "call.snapshot")
-            {
-                var channel = data.GetProperty("channel_id").GetGuid();
-                _currentCallChannel = channel;
-                if (_currentUser is Guid self)
-                {
-                    foreach (var participant in data.GetProperty("participants").EnumerateArray())
-                    {
-                        var peer = participant.GetProperty("user_id").GetGuid();
-                        if (self != peer && self.CompareTo(peer) < 0) _ = OfferRtcAsync(channel, peer);
-                    }
-                }
-            }
-            else if (op == "call.peer_left")
-            {
-                var departedPeer = data.GetProperty("user_id").GetGuid();
-                _rtc.RemovePeer(departedPeer);
-                CloseWatchWindow(departedPeer);
-            }
-            else if (op == "stream.published")
-            {
-                _streamOwners[data.GetProperty("stream_id").GetGuid()] = data.GetProperty("owner").GetGuid();
-            }
-            else if (op == "stream.unpublished")
-            {
-                // Owner stopped sharing (or left the call, which the server
-                // also reports as stream.unpublished per channel_id cleanup)
-                // — nothing more will ever arrive for this stream.
-                var unpublishedStreamId = data.GetProperty("stream_id").GetGuid();
-                if (_streamOwners.Remove(unpublishedStreamId, out var owner)) CloseWatchWindow(owner);
-            }
-            else if (op == "rtc.offer")
-            {
-                _ = AnswerRtcOfferAsync(data);
-            }
-            else if (op == "rtc.answer")
-            {
-                _rtc.AcceptAnswer(data.GetProperty("from").GetGuid(), data.GetProperty("sdp").GetString() ?? String.Empty);
-            }
-            else if (op == "rtc.ice")
-            {
-                var candidate = data.GetProperty("candidate").Deserialize<RTCIceCandidateInit>();
-                if (candidate is not null) _rtc.AddIceCandidate(data.GetProperty("from").GetGuid(), candidate);
-            }
-            else if (op == "call.peer_joined" && _currentCallChannel is Guid channel && _currentUser is Guid self)
-            {
-                var peer = data.GetProperty("participant").GetProperty("user_id").GetGuid();
-                if (self.CompareTo(peer) < 0) _ = OfferRtcAsync(channel, peer);
-            }
-            // SUB-FR-001: these two ops are only ever routed to the stream's
-            // *owner* by the server (see ws/handler.rs handle_stream_subscribe/
-            // unsubscribe) — receiving one here means this client must start
-            // or stop sending that stream's video to the named peer.
-            else if (op == "stream.subscription_requested")
-            {
-                _rtc.SetScreenSubscription(data.GetProperty("stream_id").GetGuid(), data.GetProperty("subscriber").GetGuid(), subscribed: true);
-            }
-            else if (op == "stream.unsubscribed")
-            {
-                _rtc.SetScreenSubscription(data.GetProperty("stream_id").GetGuid(), data.GetProperty("subscriber").GetGuid(), subscribed: false);
-            }
-        }
-        catch (Exception exception)
-        {
-            Publish("error", new { code = "rtc_signal_failed", message = exception.Message });
-        }
-        Publish(op, data);
-    }
+    /// Every event the server sends over the WebSocket is forwarded to the
+    /// UI verbatim — chat/presence ops are consumed by App.tsx, RTC signaling
+    /// ops (`rtc.offer`/`rtc.answer`/`rtc.ice`, `call.snapshot`,
+    /// `call.peer_joined`, `call.peer_left`, `stream.published`,
+    /// `stream.unpublished`, `stream.subscription_requested`,
+    /// `stream.unsubscribed`) are consumed by rtc.ts. This class does not
+    /// need to understand which is which.
+    private void HandleNetworkEvent(string op, JsonElement data) => Publish(op, data);
 
-    private async Task OfferRtcAsync(Guid channelId, Guid peerUserId)
+    public void Publish(string op, object data)
     {
-        var sdp = await _rtc.CreateOfferAsync(peerUserId, await _network.GetTurnCredentialsAsync());
-        await _network.SendWebSocketAsync("rtc.offer", JsonSerializer.SerializeToElement(new { channel_id = channelId, to = peerUserId, sdp }));
-    }
-
-    private async Task AnswerRtcOfferAsync(JsonElement data)
-    {
-        var channelId = data.GetProperty("channel_id").GetGuid();
-        var peerUserId = data.GetProperty("from").GetGuid();
-        var sdp = await _rtc.AcceptOfferAsync(peerUserId, await _network.GetTurnCredentialsAsync(), data.GetProperty("sdp").GetString() ?? String.Empty);
-        await _network.SendWebSocketAsync("rtc.answer", JsonSerializer.SerializeToElement(new { channel_id = channelId, to = peerUserId, sdp }));
-    }
-
-    private async Task SendIceAsync(Guid peerUserId, RTCIceCandidate candidate)
-    {
-        if (_currentCallChannel is not Guid channelId) return;
-        await _network.SendWebSocketAsync("rtc.ice", JsonSerializer.SerializeToElement(new
-        {
-            channel_id = channelId,
-            to = peerUserId,
-            candidate = new { candidate = candidate.candidate, sdpMid = candidate.sdpMid, sdpMLineIndex = candidate.sdpMLineIndex },
-        }));
-    }
-
-    private void CloseWatchWindow(Guid ownerUserId)
-    {
-        if (_watchWindows.TryGetValue(ownerUserId, out var window)) window.Close();
-    }
-
-    public void Publish(string op, object data) =>
+        DebugLog.Write($"publishing to UI: op={op} hasSubscriber={EventReady is not null}");
         EventReady?.Invoke(this, JsonSerializer.Serialize(new { v = 1, op, data }));
-
-    public void Dispose()
-    {
-        foreach (var window in _watchWindows.Values.ToArray()) window.Close();
-        _rtc.Dispose();
     }
+
+    public void Dispose() { }
 }
