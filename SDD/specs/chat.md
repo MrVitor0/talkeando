@@ -134,9 +134,16 @@ UI, no read receipts in v1 (explicit scope cuts).
   (covers silent drops that don't produce an explicit error, e.g. a
   connection that died without a clean close frame).
 - **CHAT-FR-012**: A `failed` message shows a retry affordance; retrying
-  re-sends `chat.message.create` with a freshly generated `req_id` (the old
-  temp id/content is reused, old `req_id` discarded) and returns the entry
-  to `pending`.
+  re-sends `chat.message.create` **reusing the same `req_id`** (corrected
+  from an earlier draft of this spec that said to generate a fresh one —
+  verified at runtime to matter: see `27-decisions.md` ADR-004). Reusing
+  the id is what makes the retry safe: the server stores `req_id` as an
+  idempotency key (`channel_id`, `author_id`, `req_id`) and a second
+  `chat.message.create` with a key that already exists resolves to the
+  original row instead of inserting a duplicate. A fresh `req_id` on retry
+  would defeat that protection — if the original send actually succeeded
+  and only its confirmation was lost, a fresh-id retry creates a second,
+  duplicate message.
 - **CHAT-FR-013**: A `pending` or `failed` message that the user chooses to
   discard (explicit "cancel"/delete-before-send affordance) is simply
   removed from local UI state; nothing is sent to the server if it never
@@ -292,14 +299,19 @@ specified in `specs/notifications.md`, not here.
 ## Data model
 
 Per canon §7: `messages`, `reactions` (schema present, unused by UI in v1).
-No additive columns needed.
+One additive column beyond the original canon schema, added to make
+CHAT-FR-012's same-req_id retry safe: `messages.client_req_id TEXT`, with a
+partial unique index on `(channel_id, author_id, client_req_id) WHERE
+client_req_id IS NOT NULL` — see `migrations/0002_message_idempotency.sql`
+and `27-decisions.md` ADR-004.
 
 ## State transitions
 
 Message lifecycle (server-side): `created` → optionally `edited` (any
 number of times, in place) → optionally `deleted` (terminal, soft). Client
 optimistic-send lifecycle: `pending` → (`confirmed` | `failed`); `failed` →
-`pending` (on retry, new `req_id`) → (`confirmed` | `failed`).
+`pending` (on retry, **same** `req_id` — see CHAT-FR-012) → (`confirmed` |
+`failed`).
 
 ## Concurrency model
 

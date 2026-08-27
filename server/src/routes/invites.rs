@@ -12,7 +12,6 @@ use crate::{
 
 #[derive(Deserialize)]
 pub struct CreateInviteRequest {
-    pub community_id: Uuid,
     pub max_uses: Option<i32>,
     pub expires_in_seconds: Option<i64>,
 }
@@ -20,6 +19,7 @@ pub struct CreateInviteRequest {
 #[derive(Serialize)]
 pub struct InviteResponse {
     pub code: String,
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// AUTH-FR-001/SEC-NFR: only a community owner can mint invites, keeping
@@ -28,19 +28,13 @@ pub async fn create(
     State(state): State<AppState>,
     auth: AuthUser,
     Json(req): Json<CreateInviteRequest>,
-) -> AppResult<Json<InviteResponse>> {
-    let role: Option<(String,)> = sqlx::query_as(
-        "SELECT role FROM community_members WHERE community_id = $1 AND user_id = $2",
-    )
-    .bind(req.community_id)
-    .bind(auth.user.id)
-    .fetch_optional(&state.pool)
-    .await?;
-
-    match role {
-        Some((r,)) if r == "owner" => {}
-        Some(_) => return Err(AppError::Forbidden),
-        None => return Err(AppError::Forbidden),
+) -> AppResult<(StatusCode, Json<InviteResponse>)> {
+    let community_id = owner_community_id(&state, auth.user.id).await?;
+    if req.max_uses.is_some_and(|uses| uses < 1) {
+        return Err(AppError::Validation("max_uses must be at least 1".into()));
+    }
+    if req.expires_in_seconds.is_some_and(|seconds| seconds < 1) {
+        return Err(AppError::Validation("expires_in_seconds must be positive".into()));
     }
 
     let code: String = rand::thread_rng()
@@ -56,7 +50,7 @@ pub async fn create(
         "INSERT INTO invites (community_id, created_by, code, max_uses, expires_at) \
          VALUES ($1, $2, $3, $4, $5) RETURNING *",
     )
-    .bind(req.community_id)
+    .bind(community_id)
     .bind(auth.user.id)
     .bind(&code)
     .bind(req.max_uses)
@@ -64,7 +58,7 @@ pub async fn create(
     .fetch_one(&state.pool)
     .await?;
 
-    Ok(Json(InviteResponse { code: invite.code }))
+    Ok((StatusCode::CREATED, Json(InviteResponse { code: invite.code, expires_at: invite.expires_at })))
 }
 
 #[derive(Serialize, sqlx::FromRow)]
@@ -76,7 +70,7 @@ pub struct InviteListItem {
     pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-pub async fn list(State(state): State<AppState>, auth: AuthUser) -> AppResult<Json<Vec<InviteListItem>>> {
+pub async fn list(State(state): State<AppState>, auth: AuthUser) -> AppResult<Json<InviteListResponse>> {
     let community_id = owner_community_id(&state, auth.user.id).await?;
     let invites = sqlx::query_as::<_, InviteListItem>(
         "SELECT id, code, max_uses, uses, expires_at FROM invites WHERE community_id = $1 ORDER BY created_at DESC",
@@ -84,7 +78,12 @@ pub async fn list(State(state): State<AppState>, auth: AuthUser) -> AppResult<Js
     .bind(community_id)
     .fetch_all(&state.pool)
     .await?;
-    Ok(Json(invites))
+    Ok(Json(InviteListResponse { invites }))
+}
+
+#[derive(Serialize)]
+pub struct InviteListResponse {
+    pub invites: Vec<InviteListItem>,
 }
 
 pub async fn revoke(

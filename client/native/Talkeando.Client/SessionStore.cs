@@ -1,3 +1,4 @@
+using System.IO;
 using System.Security.Cryptography;
 using System.Text;
 
@@ -7,25 +8,35 @@ namespace Talkeando.Client;
 /// never the bearer token itself.
 public sealed class SessionStore
 {
-    private static readonly string Path = System.IO.Path.Combine(
+    private static readonly string DefaultPath = System.IO.Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
         "Talkeando", "session.bin");
+
+    private readonly string _path;
+
+    /// `path` is only ever overridden by tests — production always uses the
+    /// real per-user DPAPI file (`DefaultPath`). Never point this at a path
+    /// shared with a real installation: `Clear()` deletes it outright.
+    public SessionStore(string? path = null)
+    {
+        _path = path ?? DefaultPath;
+    }
 
     public bool HasToken => Load() is not null;
 
     public void Save(string token)
     {
-        Directory.CreateDirectory(System.IO.Path.GetDirectoryName(Path)!);
+        Directory.CreateDirectory(System.IO.Path.GetDirectoryName(_path)!);
         var protectedBytes = ProtectedData.Protect(Encoding.UTF8.GetBytes(token), null, DataProtectionScope.CurrentUser);
-        File.WriteAllBytes(Path, protectedBytes);
+        File.WriteAllBytes(_path, protectedBytes);
     }
 
     public string? Load()
     {
-        if (!File.Exists(Path)) return null;
-        try { return Encoding.UTF8.GetString(ProtectedData.Unprotect(File.ReadAllBytes(Path), null, DataProtectionScope.CurrentUser)); }
+        if (!File.Exists(_path)) return null;
+        try { return Encoding.UTF8.GetString(ProtectedData.Unprotect(File.ReadAllBytes(_path), null, DataProtectionScope.CurrentUser)); }
         catch (CryptographicException) { Clear(); return null; }
     }
 
-    public void Clear() { if (File.Exists(Path)) File.Delete(Path); }
+    public void Clear() { if (File.Exists(_path)) File.Delete(_path); }
 }

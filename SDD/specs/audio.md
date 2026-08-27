@@ -2,7 +2,17 @@
 
 Status: Draft v1
 Owner/Domain: Client native (client/native/*/Audio, SIPSorceryMedia.Windows integration)
-Related canon sections: §1 (SIPSorcery/Opus/WASAPI), §3 (RTC architecture), §9 (ID catalog)
+Related canon sections: §1 (SIPSorcery/WASAPI), §3 (RTC architecture), §9 (ID catalog)
+Codec correction (post-verification, see `../27-decisions.md`): the codec is
+**G722**, not Opus. `SIPSorcery.Media.AudioEncoder` (the core SIPSorcery
+package, no extra native dependency) was reflected against directly and its
+`SupportedFormats` only ever contains PCMU, PCMA, G722 and G729 — Opus is
+not available without adding `SIPSorceryMedia.FFmpeg` (a native
+libopus/libavcodec dependency), which this product avoids per its
+simplicity mandate. Every mention of Opus below should be read as G722; the
+prose is left otherwise intact where the reasoning still applies (mute
+timing, per-peer decode isolation, etc.) and corrected inline where the
+specific numbers (sample rate, native-rate rationale) depended on Opus.
 
 ## Objetivo
 
@@ -17,13 +27,13 @@ Unlike screen share/camera, audio is not gated by `stream.subscribe` — every
 call participant always sends their mic track (unless muted) to, and always
 receives every other participant's mic track from, all peers in the mesh
 (canon §3: "one PeerConnection per remote peer... all tracks... ride the
-same PeerConnection"; `specs/rtc-signaling.md` RTC-FR-022). Audio uses Opus
-via SIPSorcery's built-in codec support; capture/render uses WASAPI via
-`SIPSorceryMedia.Windows`.
+same PeerConnection"; `specs/rtc-signaling.md` RTC-FR-022). Audio uses G722
+via SIPSorcery's built-in codec support (`SIPSorcery.Media.AudioEncoder`);
+capture/render uses WASAPI via `SIPSorceryMedia.Windows`.
 
 ## Escopo
 
-- Microphone capture pipeline (WASAPI via SIPSorceryMedia.Windows), Opus
+- Microphone capture pipeline (WASAPI via SIPSorceryMedia.Windows), G722
   encode, attaching the local audio track to every `PeerConnection`
 - Remote audio decode/render/mixing (N remote tracks → output device)
 - Mute (stop sending, or send silence) and deafen (stop rendering all
@@ -69,15 +79,22 @@ via SIPSorcery's built-in codec support; capture/render uses WASAPI via
   layer opens the currently-selected input device (per `specs/devices.md`,
   default: OS default communications device if the user has not chosen
   one explicitly) via `SIPSorceryMedia.Windows`'s WASAPI capture, wraps it
-  in SIPSorcery's audio source pipeline with the Opus encoder, and adds the
+  in SIPSorcery's audio source pipeline with the G722 encoder, and adds the
   resulting local audio track to every `PeerConnection` created for that
   call (both ones created immediately at join time and any created later
-  for peers who join afterward — RTC-FR-002/RTC-FR-022).
-- **AUDIO-FR-002**: Opus encoding parameters: 48kHz sample rate (Opus's
-  native rate, avoids resampling), mono (single channel — voice calls do
-  not need stereo capture), variable bitrate targeting ~32kbps nominal for
-  voice (adjustable later by `QUAL-FR-*` adaptive logic; v1 ships this as a
-  fixed default, not user-configurable).
+  for peers who join afterward — RTC-FR-002/RTC-FR-022). One microphone
+  capture session is shared across all `PeerConnection`s in the mesh (not
+  one per peer); the encoded frame is fanned out to every connected peer's
+  `RTCPeerConnection.SendAudio`.
+- **AUDIO-FR-002**: G722 encoding parameters: 16kHz sample rate (declared as
+  an 8kHz RTP clock rate in SDP — a long-standing G.722 quirk, not a bug),
+  mono (single channel — voice calls do not need stereo capture), fixed
+  ~64kbps bitrate (G722 is not variable-bitrate like Opus; there is no
+  encoder-side rate knob to tune — see AUDIO-NFR-002 for the resulting
+  bandwidth-budget consequence). Every peer and the shared microphone
+  source call `RestrictFormats` to G722 only, so the whole mesh negotiates
+  one consistent codec (a single shared capture cannot serve two different
+  negotiated formats at once).
 - **AUDIO-FR-003**: Mute (`specs/calls.md` `call.state.update { muted:
   true }`) stops the local audio track from producing/sending RTP to all
   peers — implementation: disable/stop the WASAPI capture read loop feeding
@@ -182,17 +199,20 @@ via SIPSorcery's built-in codec support; capture/render uses WASAPI via
 
 - **AUDIO-NFR-001**: End-to-end voice latency (mic capture to remote
   playback) target: <150ms p95 on a direct P2P path with no TURN relay,
-  <250ms p95 via TURN relay — dominated by network RTT and Opus's inherent
-  ~20-40ms algorithmic delay, not by any Talkeando-added buffering (the
-  app must not add its own jitter buffer beyond what SIPSorcery's RTP
-  pipeline already provides).
-- **AUDIO-NFR-002**: CPU overhead of Opus encode + N-peer decode + mixing
+  <250ms p95 via TURN relay — dominated by network RTT and G722's
+  algorithmic delay (lower than Opus's would have been — G722 is a simple
+  sub-band ADPCM codec with no look-ahead), not by any Talkeando-added
+  buffering (the app must not add its own jitter buffer beyond what
+  SIPSorcery's RTP pipeline already provides).
+- **AUDIO-NFR-002**: CPU overhead of G722 encode + N-peer decode
   must remain reasonable for a 10-participant mesh on typical consumer
-  hardware — no specific numeric budget mandated in v1 (no profiling
-  infrastructure exists yet), but this is called out as a QUAL/perf area
-  to watch in phase-09.
+  hardware — G722 is computationally cheap (no psychoacoustic modeling,
+  unlike Opus), so this is a smaller risk than originally assumed; no
+  specific numeric budget mandated in v1 (no profiling infrastructure
+  exists yet), but this is called out as a QUAL/perf area to watch in
+  phase-09.
 - **AUDIO-NFR-003**: Mute must take effect (stop sending) within one audio
-  frame interval (~20ms Opus frame) of the toggle — perceived by peers as
+  frame interval (~20ms) of the toggle — perceived by peers as
   effectively instant, no audible trailing fragment.
 - **AUDIO-NFR-004**: Speaking-indicator threshold-crossing latency (actual
   speech onset → UI ring appears) should be under ~300ms combined
@@ -205,7 +225,7 @@ via SIPSorcery's built-in codec support; capture/render uses WASAPI via
   local gap (no renegotiation-caused silence for others).
 - **AUDIO-NFR-006**: No audio data of any kind is ever transmitted to or
   through the Rust backend — confirmed by canon §3's control-plane-only
-  design; this spec's implementation must never route PCM/Opus bytes over
+  design; this spec's implementation must never route PCM/G722 bytes over
   the WebSocket signaling connection under any circumstance (including
   error/fallback paths).
 
@@ -356,7 +376,7 @@ retry attempt outcome) — no content, no remote telemetry backend in v1.
 
 - Joining a call with a working mic results in other participants
   receiving audio with no explicit "enable" step.
-- Muting stops all outbound audio to every peer within one Opus frame,
+- Muting stops all outbound audio to every peer within one audio frame,
   verified by packet inspection in tests.
 - No audio bytes are ever observed on the server/backend side under any
   test scenario.
@@ -380,6 +400,8 @@ retry attempt outcome) — no content, no remote telemetry backend in v1.
 - Push-to-talk.
 - Per-peer volume control.
 - User-facing toggles for echo cancellation/noise suppression/AGC.
-- Adaptive Opus bitrate under `QUAL-FR-*` (phase-09).
+- Adaptive audio bitrate under `QUAL-FR-*` (phase-09) — moot for v1's fixed-
+  rate G722, revisit if a future codec change reintroduces Opus via
+  `SIPSorceryMedia.FFmpeg`.
 - Custom noise suppression (e.g. RNNoise) if OS-level suppression proves
   insufficient.

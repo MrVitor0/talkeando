@@ -1,17 +1,7 @@
-mod auth;
-mod config;
-mod db;
-mod error;
-mod routes;
-mod state;
-mod telemetry;
-mod ws;
-
 use clap::{Parser, Subcommand};
 use sqlx::postgres::PgPoolOptions;
-use tower_http::{cors::CorsLayer, trace::TraceLayer};
 
-use crate::{config::Config, state::AppState};
+use talkeando_server::{auth, build_app, config::Config, run_migrations, state::AppState, telemetry};
 
 #[derive(Parser)]
 struct Cli {
@@ -48,7 +38,7 @@ async fn main() -> anyhow::Result<()> {
         .max_connections(10)
         .connect(&config.database_url)
         .await?;
-    sqlx::migrate!("./migrations").run(&pool).await?;
+    run_migrations(&pool).await?;
 
     match cli.command.unwrap_or(Command::Serve) {
         Command::Serve => serve(pool, config).await,
@@ -63,18 +53,57 @@ async fn main() -> anyhow::Result<()> {
 
 async fn serve(pool: sqlx::PgPool, config: Config) -> anyhow::Result<()> {
     let bind_addr = config.bind_addr.clone();
+    tokio::fs::create_dir_all(&config.attachment_storage_path).await?;
     let state = AppState::new(pool, config);
+    spawn_attachment_cleanup(state.clone());
 
-    let app = routes::router()
-        .route("/ws", axum::routing::get(ws::ws_upgrade))
-        .layer(CorsLayer::permissive())
-        .layer(TraceLayer::new_for_http())
-        .with_state(state);
+    let app = build_app(state);
 
     tracing::info!(%bind_addr, "starting talkeando-server");
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await?;
     Ok(())
+}
+
+/// Uploads are intentionally created before a WebSocket message references
+/// them. Remove abandoned uploads periodically so a cancelled composer cannot
+/// become permanent disk usage. A conditional delete prevents removing an
+/// attachment that was associated between the scan and cleanup.
+fn spawn_attachment_cleanup(state: AppState) {
+    tokio::spawn(async move {
+        let interval = std::time::Duration::from_secs(60 * 60);
+        loop {
+            tokio::time::sleep(interval).await;
+            let rows: Result<Vec<(uuid::Uuid, String)>, sqlx::Error> = sqlx::query_as(
+                "SELECT id, storage_path FROM attachments \
+                 WHERE message_id IS NULL AND created_at < now() - ($1 * INTERVAL '1 hour')",
+            )
+            .bind(state.config.unattached_attachment_ttl_hours)
+            .fetch_all(&state.pool)
+            .await;
+            let Ok(rows) = rows else {
+                tracing::warn!("failed to scan unattached attachments for cleanup");
+                continue;
+            };
+            for (id, storage_path) in rows {
+                match sqlx::query("DELETE FROM attachments WHERE id = $1 AND message_id IS NULL")
+                    .bind(id)
+                    .execute(&state.pool)
+                    .await
+                {
+                    Ok(result) if result.rows_affected() == 1 => {
+                        if let Err(error) = tokio::fs::remove_file(&storage_path).await {
+                            if error.kind() != std::io::ErrorKind::NotFound {
+                                tracing::warn!(%id, %error, "failed to remove orphaned attachment file");
+                            }
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(error) => tracing::warn!(%id, %error, "failed to delete orphaned attachment row"),
+                }
+            }
+        }
+    });
 }
 
 async fn bootstrap_owner(

@@ -78,6 +78,12 @@ pub struct Message {
     pub created_at: DateTime<Utc>,
     pub edited_at: Option<DateTime<Utc>>,
     pub deleted_at: Option<DateTime<Utc>>,
+    /// Idempotency key for `chat.message.create` retries (CHAT-FR) —
+    /// internal only, never serialized to REST/WS clients (the *creating*
+    /// request's req_id is echoed explicitly by the WS handler instead, see
+    /// ws/handler.rs).
+    #[serde(skip_serializing)]
+    pub client_req_id: Option<String>,
 }
 
 #[derive(Debug, Clone, sqlx::FromRow, Serialize)]

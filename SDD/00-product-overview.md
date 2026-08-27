@@ -64,7 +64,7 @@ deliberadamente) várias decisões de arquitetura — ver `01-scope.md` e
 | Backend | Rust, Tokio, Axum, SQLx, Postgres 16, Tracing, UUID v4 |
 | Cliente nativo | C#/.NET 6, WPF host, `Microsoft.Web.WebView2` |
 | UI | TypeScript + React + Vite, rodando dentro do WebView2 |
-| Mídia RTC | SIPSorcery + `SIPSorceryMedia.Windows` (Opus, H.264/VP8, WGC) |
+| Mídia RTC | SIPSorcery + `SIPSorceryMedia.Windows` (áudio G722 — Opus não está disponível no `AudioEncoder` do SIPSorcery sem dependência nativa extra, ver `27-decisions.md`; vídeo H.264/VP8, WGC) |
 | Infra | Caddy (TLS reverso), coturn (TURN) |
 
 ## Não-objetivos explícitos

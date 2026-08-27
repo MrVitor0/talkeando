@@ -90,6 +90,8 @@ pub struct ChatMessageCreate {
     pub channel_id: Uuid,
     pub content: String,
     #[serde(default)]
+    pub attachment_ids: Vec<Uuid>,
+    #[serde(default)]
     pub req_id: Option<String>,
 }
 
@@ -116,12 +118,28 @@ pub struct MessageDto {
     pub content: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
     pub edited_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub attachment_ids: Vec<Uuid>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ChatMessageCreated {
+    pub message: MessageDto,
+    pub in_reply_to: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ChatMessageEdited {
+    pub message_id: Uuid,
+    pub content: String,
+    pub edited_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub in_reply_to: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
 pub struct ChatMessageDeleted {
     pub message_id: Uuid,
     pub channel_id: Uuid,
+    pub in_reply_to: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]

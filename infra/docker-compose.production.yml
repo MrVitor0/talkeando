@@ -1,0 +1,63 @@
+name: talkeando
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?set in production env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in production env}
+      POSTGRES_DB: ${POSTGRES_DB:-talkeando}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  talkeando-server:
+    build:
+      context: ../server
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATABASE_URL: postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-talkeando}
+      BIND_ADDR: 0.0.0.0:8080
+      TURN_SHARED_SECRET: ${TURN_SHARED_SECRET:?set in production env}
+      TURN_REALM: ${TURN_REALM:?set in production env}
+      TURN_URIS: ${TURN_URIS:?set in production env}
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-https://${TALKEANDO_DOMAIN}}
+    volumes:
+      - attachments_data:/var/lib/talkeando/attachments
+
+  caddy:
+    image: caddy:2.10-alpine
+    restart: unless-stopped
+    depends_on:
+      - talkeando-server
+    environment:
+      TALKEANDO_DOMAIN: ${TALKEANDO_DOMAIN:?set in production env}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+
+  coturn:
+    image: coturn/coturn:4.7-alpine
+    restart: unless-stopped
+    network_mode: host
+    command: ["-c", "/etc/coturn/turnserver.conf"]
+    volumes:
+      - ./coturn/turnserver.conf:/etc/coturn/turnserver.conf:ro
+
+volumes:
+  postgres_data:
+  attachments_data:
+  caddy_data:
+  caddy_config:

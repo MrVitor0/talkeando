@@ -1,4 +1,6 @@
-use axum::{extract::State, Json};
+use std::net::SocketAddr;
+
+use axum::{extract::{ConnectInfo, State}, http::StatusCode, Json};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -21,6 +23,7 @@ pub struct RegisterRequest {
 pub struct AuthResponse {
     pub token: String,
     pub user: PublicUser,
+    pub session_expires_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// AUTH-FR-001: registration is invite-code gated, matching the "private
@@ -95,6 +98,7 @@ pub async fn register(
     Ok(Json(AuthResponse {
         token,
         user: user.into(),
+        session_expires_at: expires_at,
     }))
 }
 
@@ -108,10 +112,12 @@ pub struct LoginRequest {
 /// error message regardless of which check failed (username vs password).
 pub async fn login(
     State(state): State<AppState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Json(req): Json<LoginRequest>,
 ) -> AppResult<Json<AuthResponse>> {
     let username = req.username.trim().to_ascii_lowercase();
-    if !state.check_login_rate_limit(&username).await {
+    let rate_limit_key = format!("{}:{username}", peer.ip());
+    if !state.check_login_rate_limit(&rate_limit_key).await {
         return Err(AppError::RateLimited);
     }
 
@@ -138,15 +144,16 @@ pub async fn login(
     Ok(Json(AuthResponse {
         token,
         user: user.into(),
+        session_expires_at: expires_at,
     }))
 }
 
-pub async fn logout(State(state): State<AppState>, auth: AuthUser) -> AppResult<Json<serde_json::Value>> {
+pub async fn logout(State(state): State<AppState>, auth: AuthUser) -> AppResult<StatusCode> {
     sqlx::query("UPDATE sessions SET revoked_at = now() WHERE id = $1")
         .bind(auth.session_id)
         .execute(&state.pool)
         .await?;
-    Ok(Json(serde_json::json!({ "ok": true })))
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Serialize)]

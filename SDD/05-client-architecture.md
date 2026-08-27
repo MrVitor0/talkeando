@@ -81,7 +81,9 @@ por IPC via `postMessage` (ver `contracts/ipc-native-ui.md`).
   só emite intents ("mute", "publish screen", "subscribe to stream X") que
   o `RtcEngine` traduz em ações de protocolo.
 - **`AudioPipeline`**: captura via WASAPI (`SIPSorceryMedia.Windows`),
-  encoda Opus, entrega frames ao `RtcEngine`; no sentido inverso, decodifica
+  encoda G722 (não Opus — indisponível sem dependência nativa extra no
+  SIPSorcery core, ver `27-decisions.md`), entrega frames ao `RtcEngine`; no
+  sentido inverso, decodifica
   e renderiza áudio recebido. Aplica mute/deafen localmente antes de
   qualquer envio/render (`AUDIO-FR-001/002`).
 - **`ScreenCapturePipeline`**: usa `Windows.Graphics.Capture` via projeções

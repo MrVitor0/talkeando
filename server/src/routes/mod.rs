@@ -1,4 +1,5 @@
 mod auth;
+mod attachments;
 mod channels;
 mod communities;
 mod invites;
@@ -22,6 +23,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/auth/register", post(auth::register))
         .route("/api/auth/login", post(auth::login))
         .route("/api/auth/logout", post(auth::logout))
+        .route("/api/auth/me", get(auth::me))
         .route("/api/me", get(auth::me))
         .route("/api/community", get(communities::current))
         .route("/api/communities", get(communities::list))
@@ -35,6 +37,8 @@ pub fn router() -> Router<AppState> {
         )
         .route("/api/communities/:id/channels", get(channels::list_for_community))
         .route("/api/channels/:id/messages", get(messages::history))
+        .route("/api/channels/:id/attachments", post(attachments::upload))
+        .route("/api/attachments/:id", get(attachments::download))
         .route("/api/invites", post(invites::create).get(invites::list))
         .route("/api/invites/:id", delete(invites::revoke))
         .route("/api/turn-credentials", get(turn::credentials))

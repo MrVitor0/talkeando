@@ -2,12 +2,13 @@ use axum::{
     extract::{Path, Query, State},
     Json,
 };
-use serde::Deserialize;
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::{
     auth::AuthUser,
-    db::{self, Message},
+    db::{self, PublicUser},
     error::{AppError, AppResult},
     state::AppState,
 };
@@ -22,6 +23,45 @@ pub struct HistoryQuery {
     pub limit: i64,
 }
 
+#[derive(Serialize)]
+pub struct HistoryResponse {
+    pub messages: Vec<HistoryMessage>,
+    pub has_more: bool,
+}
+
+#[derive(Serialize)]
+pub struct HistoryMessage {
+    pub id: Uuid,
+    pub channel_id: Uuid,
+    pub author: PublicUser,
+    pub content: String,
+    pub created_at: DateTime<Utc>,
+    pub edited_at: Option<DateTime<Utc>>,
+    pub attachments: Vec<MessageAttachment>,
+}
+
+#[derive(Serialize, sqlx::FromRow)]
+pub struct MessageAttachment {
+    pub id: Uuid,
+    pub filename: String,
+    pub content_type: String,
+    pub size_bytes: i64,
+    pub url: String,
+}
+
+#[derive(sqlx::FromRow)]
+struct HistoryRow {
+    id: Uuid,
+    channel_id: Uuid,
+    author_id: Uuid,
+    content: String,
+    created_at: DateTime<Utc>,
+    edited_at: Option<DateTime<Utc>>,
+    username: String,
+    display_name: String,
+    avatar_color: Option<String>,
+}
+
 fn default_limit() -> i64 {
     50
 }
@@ -33,7 +73,7 @@ pub async fn history(
     auth: AuthUser,
     Path(channel_id): Path<Uuid>,
     Query(q): Query<HistoryQuery>,
-) -> AppResult<Json<Vec<Message>>> {
+) -> AppResult<Json<HistoryResponse>> {
     let channel = db::channel_if_member(&state.pool, channel_id, auth.user.id)
         .await?
         .ok_or(AppError::Forbidden)?;
@@ -42,30 +82,83 @@ pub async fn history(
     }
     let limit = q.limit.clamp(1, 100);
 
-    let messages = match q.before {
+    // Fetch one extra row, so the client can tell whether another backfill
+    // request is useful without relying on an unstable offset.
+    let mut rows = match q.before {
         Some(before_id) => {
-            sqlx::query_as::<_, Message>(
-                "SELECT * FROM messages WHERE channel_id = $1 AND deleted_at IS NULL \
-                 AND created_at < (SELECT created_at FROM messages WHERE id = $2 AND channel_id = $1) \
-                 ORDER BY created_at DESC LIMIT $3",
+            sqlx::query_as::<_, HistoryRow>(
+                "SELECT m.id, m.channel_id, m.author_id, m.content, m.created_at, m.edited_at, \
+                        u.username, u.display_name, u.avatar_color \
+                 FROM messages m JOIN users u ON u.id = m.author_id \
+                 WHERE m.channel_id = $1 AND m.deleted_at IS NULL \
+                 AND (m.created_at, m.id) < (SELECT created_at, id FROM messages WHERE id = $2 AND channel_id = $1) \
+                 ORDER BY m.created_at DESC, m.id DESC LIMIT $3",
             )
             .bind(channel_id)
             .bind(before_id)
-            .bind(limit)
+            .bind(limit + 1)
             .fetch_all(&state.pool)
             .await?
         }
         None => {
-            sqlx::query_as::<_, Message>(
-                "SELECT * FROM messages WHERE channel_id = $1 AND deleted_at IS NULL \
-                 ORDER BY created_at DESC LIMIT $2",
+            sqlx::query_as::<_, HistoryRow>(
+                "SELECT m.id, m.channel_id, m.author_id, m.content, m.created_at, m.edited_at, \
+                        u.username, u.display_name, u.avatar_color \
+                 FROM messages m JOIN users u ON u.id = m.author_id \
+                 WHERE m.channel_id = $1 AND m.deleted_at IS NULL \
+                 ORDER BY m.created_at DESC, m.id DESC LIMIT $2",
             )
             .bind(channel_id)
-            .bind(limit)
+            .bind(limit + 1)
             .fetch_all(&state.pool)
             .await?
         }
     };
 
-    Ok(Json(messages))
+    let has_more = rows.len() > limit as usize;
+    rows.truncate(limit as usize);
+    let message_ids: Vec<Uuid> = rows.iter().map(|row| row.id).collect();
+    let attachment_rows = sqlx::query_as::<_, AttachmentRow>(
+        "SELECT id, message_id, filename, content_type, size_bytes FROM attachments \
+         WHERE message_id = ANY($1) ORDER BY created_at ASC",
+    )
+    .bind(&message_ids)
+    .fetch_all(&state.pool)
+    .await?;
+
+    let mut attachments_by_message = std::collections::HashMap::<Uuid, Vec<MessageAttachment>>::new();
+    for attachment in attachment_rows {
+        attachments_by_message.entry(attachment.message_id).or_default().push(MessageAttachment {
+            id: attachment.id,
+            filename: attachment.filename,
+            content_type: attachment.content_type,
+            size_bytes: attachment.size_bytes,
+            url: format!("/api/attachments/{}", attachment.id),
+        });
+    }
+    let messages = rows.into_iter().map(|row| HistoryMessage {
+        id: row.id,
+        channel_id: row.channel_id,
+        author: PublicUser {
+            id: row.author_id,
+            username: row.username,
+            display_name: row.display_name,
+            avatar_color: row.avatar_color,
+        },
+        content: row.content,
+        created_at: row.created_at,
+        edited_at: row.edited_at,
+        attachments: attachments_by_message.remove(&row.id).unwrap_or_default(),
+    }).collect();
+
+    Ok(Json(HistoryResponse { messages, has_more }))
+}
+
+#[derive(sqlx::FromRow)]
+struct AttachmentRow {
+    id: Uuid,
+    message_id: Uuid,
+    filename: String,
+    content_type: String,
+    size_bytes: i64,
 }

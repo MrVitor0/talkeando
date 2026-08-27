@@ -67,6 +67,7 @@ pub enum CallOpError {
     CallFull,
     StreamNotFound,
     NotStreamOwner,
+    StreamAlreadyPublished,
 }
 
 impl CallRegistry {
@@ -182,6 +183,11 @@ impl CallRegistry {
         let call = self.calls.get_mut(&channel_id).ok_or(CallOpError::NotInCall)?;
         if !call.participants.contains_key(&owner) {
             return Err(CallOpError::NotInCall);
+        }
+        if call.streams.contains_key(&stream_id)
+            || call.streams.values().any(|stream| stream.owner == owner && stream.kind == kind)
+        {
+            return Err(CallOpError::StreamAlreadyPublished);
         }
         call.streams.insert(
             stream_id,

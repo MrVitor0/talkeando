@@ -9,6 +9,10 @@ pub struct Config {
     pub turn_realm: String,
     pub turn_uris: Vec<String>,
     pub turn_credential_ttl_seconds: i64,
+    pub max_attachment_size_bytes: usize,
+    pub attachment_storage_path: String,
+    pub allowed_origins: Vec<String>,
+    pub unattached_attachment_ttl_hours: i64,
 }
 
 impl Config {
@@ -33,6 +37,22 @@ impl Config {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(3600),
+            max_attachment_size_bytes: env::var("MAX_ATTACHMENT_SIZE_BYTES")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(25 * 1024 * 1024),
+            attachment_storage_path: env::var("ATTACHMENT_STORAGE_PATH")
+                .unwrap_or_else(|_| "./data/attachments".to_string()),
+            allowed_origins: env::var("ALLOWED_ORIGINS")
+                .unwrap_or_else(|_| "http://localhost:5173".to_string())
+                .split(',')
+                .map(|origin| origin.trim().to_string())
+                .filter(|origin| !origin.is_empty())
+                .collect(),
+            unattached_attachment_ttl_hours: env::var("UNATTACHED_ATTACHMENT_TTL_HOURS")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(24),
         }
     }
 }

@@ -370,26 +370,112 @@ async fn handle_chat_create(state: &AppState, user_id: Uuid, data: ChatMessageCr
             .await;
         return;
     }
-    let row = sqlx::query_as::<_, db::Message>(
-        "INSERT INTO messages (channel_id, author_id, content) VALUES ($1, $2, $3) RETURNING *",
+    if data.attachment_ids.len() > 10 || data.attachment_ids.iter().collect::<HashSet<_>>().len() != data.attachment_ids.len() {
+        state.hub.send_to(user_id, OutboundEnvelope::error("validation_error", "attachments must contain at most 10 unique ids", data.req_id.as_deref())).await;
+        return;
+    }
+    let mut tx = match state.pool.begin().await {
+        Ok(tx) => tx,
+        Err(error) => {
+            tracing::error!(%error, "failed to start message transaction");
+            state.hub.send_to(user_id, OutboundEnvelope::error("internal_error", "failed to send message", data.req_id.as_deref())).await;
+            return;
+        }
+    };
+    // CHAT-FR (retry-safe send): when the client supplies a req_id, a retry
+    // after a client-side timeout resolves to the original row instead of
+    // inserting a duplicate — see migrations/0002_message_idempotency.sql.
+    // `xmax = 0` is the standard Postgres tell for "this RETURNING row came
+    // from the INSERT, not the ON CONFLICT DO UPDATE" — used below to skip
+    // re-running attachment association (idempotent but pointless on a
+    // retry) and, more importantly, to avoid re-broadcasting an already-
+    // delivered message to every other client: a retry only means *this*
+    // client didn't see its own confirmation, not that nobody did.
+    #[derive(sqlx::FromRow)]
+    struct CreateMessageRow {
+        id: Uuid,
+        channel_id: Uuid,
+        author_id: Uuid,
+        content: String,
+        created_at: chrono::DateTime<chrono::Utc>,
+        edited_at: Option<chrono::DateTime<chrono::Utc>>,
+        is_new_insert: bool,
+    }
+    let row = sqlx::query_as::<_, CreateMessageRow>(
+        "INSERT INTO messages (channel_id, author_id, content, client_req_id) VALUES ($1, $2, $3, $4) \
+         ON CONFLICT (channel_id, author_id, client_req_id) WHERE client_req_id IS NOT NULL \
+         DO UPDATE SET content = messages.content \
+         RETURNING id, channel_id, author_id, content, created_at, edited_at, (xmax = 0) AS is_new_insert",
     )
     .bind(data.channel_id)
     .bind(user_id)
     .bind(&data.content)
-    .fetch_one(&state.pool)
+    .bind(&data.req_id)
+    .fetch_one(&mut *tx)
     .await;
 
     match row {
-        Ok(m) => {
-            broadcast_to_community(state, channel.community_id, OutboundEnvelope::new(
-                    "chat.message.created",
-                    MessageDto {
+        Ok(m) if !m.is_new_insert => {
+            let _ = tx.rollback().await;
+            state.hub.send_to(user_id, OutboundEnvelope::new(
+                "chat.message.created",
+                ChatMessageCreated {
+                    message: MessageDto {
                         id: m.id,
                         channel_id: m.channel_id,
                         author_id: m.author_id,
                         content: m.content,
                         created_at: m.created_at,
                         edited_at: m.edited_at,
+                        attachment_ids: data.attachment_ids,
+                    },
+                    in_reply_to: data.req_id,
+                },
+            )).await;
+        }
+        Ok(m) => {
+            if !data.attachment_ids.is_empty() {
+                let associated = sqlx::query(
+                    "UPDATE attachments SET message_id = $1 WHERE id = ANY($2) AND uploader_id = $3 AND message_id IS NULL",
+                )
+                .bind(m.id)
+                .bind(&data.attachment_ids)
+                .bind(user_id)
+                .execute(&mut *tx)
+                .await;
+                match associated {
+                    Ok(result) if result.rows_affected() == data.attachment_ids.len() as u64 => {}
+                    Ok(_) => {
+                        let _ = tx.rollback().await;
+                        state.hub.send_to(user_id, OutboundEnvelope::error("validation_error", "one or more attachments are unavailable", data.req_id.as_deref())).await;
+                        return;
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, "failed to associate message attachments");
+                        let _ = tx.rollback().await;
+                        state.hub.send_to(user_id, OutboundEnvelope::error("internal_error", "failed to send message", data.req_id.as_deref())).await;
+                        return;
+                    }
+                }
+            }
+            if let Err(error) = tx.commit().await {
+                tracing::error!(%error, "failed to commit message transaction");
+                state.hub.send_to(user_id, OutboundEnvelope::error("internal_error", "failed to send message", data.req_id.as_deref())).await;
+                return;
+            }
+            broadcast_to_community(state, channel.community_id, OutboundEnvelope::new(
+                    "chat.message.created",
+                    ChatMessageCreated {
+                        message: MessageDto {
+                            id: m.id,
+                            channel_id: m.channel_id,
+                            author_id: m.author_id,
+                            content: m.content,
+                            created_at: m.created_at,
+                            edited_at: m.edited_at,
+                            attachment_ids: data.attachment_ids,
+                        },
+                        in_reply_to: data.req_id,
                     },
                 )).await;
         }
@@ -432,13 +518,11 @@ async fn handle_chat_edit(state: &AppState, user_id: Uuid, data: ChatMessageEdit
             if let Ok(Some(channel)) = db::channel_if_member(&state.pool, m.channel_id, user_id).await {
                 broadcast_to_community(state, channel.community_id, OutboundEnvelope::new(
                     "chat.message.edited",
-                    MessageDto {
-                        id: m.id,
-                        channel_id: m.channel_id,
-                        author_id: m.author_id,
+                    ChatMessageEdited {
+                        message_id: m.id,
                         content: m.content,
-                        created_at: m.created_at,
                         edited_at: m.edited_at,
+                        in_reply_to: data.req_id,
                     },
                 )).await;
             }
@@ -471,7 +555,7 @@ async fn handle_chat_delete(state: &AppState, user_id: Uuid, data: ChatMessageDe
             if let Ok(Some(channel)) = db::channel_if_member(&state.pool, channel_id, user_id).await {
                 broadcast_to_community(state, channel.community_id, OutboundEnvelope::new(
                     "chat.message.deleted",
-                    ChatMessageDeleted { message_id, channel_id },
+                    ChatMessageDeleted { message_id, channel_id, in_reply_to: data.req_id },
                 )).await;
             }
         }
@@ -670,6 +754,10 @@ async fn relay_rtc(
             return;
         }
     };
+    if serde_json::to_vec(&payload).map_or(true, |encoded| encoded.len() > 64 * 1024) {
+        state.hub.send_to(from, OutboundEnvelope::error("validation_error", "RTC signal exceeds 64 KiB", None)).await;
+        return;
+    }
     // Inbound RTC messages name only their target. The recipient needs an
     // authenticated sender identity to route the signal to its PeerController;
     // it is injected server-side rather than trusted from the client payload.
@@ -681,10 +769,10 @@ async fn relay_rtc(
 }
 
 async fn handle_stream_publish(state: &AppState, user_id: Uuid, data: StreamPublish) {
-    if data.kind != "screen" && data.kind != "camera" {
+    if data.kind != "screen" {
         state
             .hub
-            .send_to(user_id, OutboundEnvelope::error("validation_error", "kind must be screen|camera", None))
+            .send_to(user_id, OutboundEnvelope::error("validation_error", "only screen streams are available in v1", None))
             .await;
         return;
     }
@@ -699,11 +787,13 @@ async fn handle_stream_publish(state: &AppState, user_id: Uuid, data: StreamPubl
             data.has_audio,
         )
     };
-    if let Err(_e @ CallOpError::NotInCall) = result {
-        state
-            .hub
-            .send_to(user_id, OutboundEnvelope::error("forbidden", "join the call before publishing", None))
-            .await;
+    if let Err(error) = result {
+        let (code, message) = match error {
+            CallOpError::NotInCall => ("forbidden", "join the call before publishing"),
+            CallOpError::StreamAlreadyPublished => ("conflict", "only one screen stream per publisher is allowed"),
+            _ => ("validation_error", "unable to publish stream"),
+        };
+        state.hub.send_to(user_id, OutboundEnvelope::error(code, message, None)).await;
         return;
     }
     let participants = state.hub.calls.read().await.participant_ids(data.channel_id);

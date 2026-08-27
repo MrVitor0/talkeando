@@ -27,6 +27,8 @@ pub enum AppError {
     Validation(String),
     #[error("rate limited")]
     RateLimited,
+    #[error("payload too large")]
+    PayloadTooLarge,
     #[error("internal error")]
     Internal(#[from] anyhow::Error),
     #[error("database error")]
@@ -42,6 +44,7 @@ impl AppError {
             AppError::Conflict(_) => "conflict",
             AppError::Validation(_) => "validation_error",
             AppError::RateLimited => "rate_limited",
+            AppError::PayloadTooLarge => "payload_too_large",
             AppError::Internal(_) => "internal_error",
             AppError::Database(_) => "internal_error",
         }
@@ -55,6 +58,7 @@ impl AppError {
             AppError::Conflict(_) => StatusCode::CONFLICT,
             AppError::Validation(_) => StatusCode::BAD_REQUEST,
             AppError::RateLimited => StatusCode::TOO_MANY_REQUESTS,
+            AppError::PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             AppError::Internal(_) | AppError::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }

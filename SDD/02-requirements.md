@@ -126,7 +126,7 @@ apagado da lista.
 |---|---|---|---|
 | SCREEN-FR-001 | Publicar tela (`stream.publish`, kind=`screen`) registra o stream no servidor sem iniciar envio de mídia | P0 | phase-07 |
 | SCREEN-FR-002 | Despublicar (`stream.unpublish`) remove o stream e força unsubscribe de todos os viewers | P0 | phase-07 |
-| SCREEN-FR-003 | Seleção de fonte de captura (monitor/janela) via `Windows.Graphics.Capture` | P0 | phase-07 |
+| SCREEN-FR-003 | Seleção de monitor via GDI (`System.Windows.Forms.Screen.AllScreens`) — corrigido de `Windows.Graphics.Capture`/seleção de janela individual, ver `27-decisions.md` ADR-003 | P0 | phase-07 |
 | SCREEN-FR-004 | Assinatura de stream de tela segue exatamente o modelo em `SUB-FR-*` | P0 | phase-07 |
 | SCREEN-FR-005 | Se a janela capturada for fechada durante o compartilhamento, o publisher despublica automaticamente e a UI mostra estado "fonte perdida" (ver `18-ux-spec.md`) | P0 | phase-07 |
 
@@ -159,7 +159,7 @@ apagado da lista.
 | AUDIO-FR-001 | Mute local para de enviar áudio (silencia a track de saída, não desconecta) | P0 | phase-06 |
 | AUDIO-FR-002 | Deafen local para de reproduzir todo áudio recebido, e implica mute automático | P0 | phase-06 |
 | AUDIO-FR-003 | Enumeração e seleção de dispositivo de entrada/saída de áudio (`DEV-FR-001`) | P0 | phase-06 |
-| AUDIO-FR-004 | Codec de voz é Opus | P0 | phase-06 |
+| AUDIO-FR-004 | Codec de voz é G722 (16kHz wideband) — corrigido de Opus após verificação: `SIPSorcery.Media.AudioEncoder` não implementa Opus sem dependência nativa adicional, ver `27-decisions.md` | P0 | phase-06 |
 | AUDIO-FR-005 | Remoção do dispositivo de áudio em uso durante a call é detectada e tratada sem derrubar a call (fallback para default, UI notifica) | P0 | phase-10 |
 | AUDIO-FR-006 | Troca do dispositivo default do Windows durante a call é detectada; comportamento (auto-switch vs. manter) documentado em `13-audio-pipeline.md` | P0 | phase-10 |
 | AUDIO-NFR-001 | Latência de áudio ponta-a-ponta alvo <150ms em condições de rede razoáveis (P2P direto) | P0 | phase-06 |

@@ -76,7 +76,7 @@ Postgres, coturn e Caddy — tipicamente na mesma máquina ou LAN.
 │ └──────┬──────┘ │        │ └───────┬──────┘ │        │ └────────┬───────┘   │
 └────────┼────────┘        └─────────┼────────┘        └──────────┼───────────┘
          │                            │                            │
-         │◀════════ RTCPeerConnection A↔B (Opus/H.264, DTLS-SRTP) ═▶│
+         │◀════════ RTCPeerConnection A↔B (G722/H.264, DTLS-SRTP) ═▶│
          │◀══════════════════════ RTCPeerConnection A↔C ════════════▶
                       │◀═══════════════════ RTCPeerConnection B↔C ══▶│
 

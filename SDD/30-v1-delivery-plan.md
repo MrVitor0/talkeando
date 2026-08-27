@@ -158,7 +158,9 @@ aceite e a evidência de teste indicados abaixo.
    serializada e Perfect Negotiation (papel determinístico por UUID).
 3. Implementar offer/answer/trickle ICE, coleta de stats e ICE restart antes
    de recriar conexão.
-4. Implementar `AudioPipeline`: WASAPI input/output, Opus 48 kHz, mic track
+4. Implementar `AudioPipeline`: WASAPI input/output, G722 16 kHz (corrigido
+   de Opus — indisponível no SIPSorcery core sem dependência nativa extra,
+   ver `27-decisions.md`), mic track
    em todo PeerConnection, render/mix de áudio remoto, VAD local/remoto,
    mute e deafen locais.
 5. Conectar os eventos IPC de call/RTC/audio à UI e mostrar estados por peer.

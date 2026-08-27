@@ -1,0 +1,15 @@
+{$TALKEANDO_DOMAIN} {
+    encode zstd gzip
+
+    @api path /api/*
+    handle @api {
+        reverse_proxy talkeando-server:8080
+    }
+
+    @websocket path /ws
+    handle @websocket {
+        reverse_proxy talkeando-server:8080
+    }
+
+    respond "Talkeando server is running" 200
+}

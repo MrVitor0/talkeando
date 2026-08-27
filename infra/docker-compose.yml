@@ -9,7 +9,12 @@ services:
       POSTGRES_PASSWORD: talkeando
       POSTGRES_DB: talkeando
     ports:
-      - "5432:5432"
+      # Host port 5434, not the default 5432 — chosen so this doesn't
+      # collide with a Postgres someone already has running locally for a
+      # different project (a real conflict found on the dev machine this
+      # was written on). Keep this in sync with server/.env(.example)'s
+      # DATABASE_URL if you change it.
+      - "5434:5432"
     volumes:
       - talkeando_pg_data:/var/lib/postgresql/data
     healthcheck:

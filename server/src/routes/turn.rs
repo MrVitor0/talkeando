@@ -9,7 +9,7 @@ use crate::{auth::AuthUser, error::AppResult, state::AppState};
 #[derive(Serialize)]
 pub struct TurnCredentials {
     pub username: String,
-    pub password: String,
+    pub credential: String,
     pub ttl_seconds: i64,
     pub uris: Vec<String>,
     pub realm: String,
@@ -30,11 +30,11 @@ pub async fn credentials(
     let mut mac = Hmac::<Sha1>::new_from_slice(state.config.turn_shared_secret.as_bytes())
         .expect("HMAC accepts any key length");
     mac.update(username.as_bytes());
-    let password = STANDARD.encode(mac.finalize().into_bytes());
+    let credential = STANDARD.encode(mac.finalize().into_bytes());
 
     Ok(Json(TurnCredentials {
         username,
-        password,
+        credential,
         ttl_seconds: state.config.turn_credential_ttl_seconds,
         uris: state.config.turn_uris.clone(),
         realm: state.config.turn_realm.clone(),

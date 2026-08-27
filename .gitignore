@@ -1,1 +1,25 @@
-server/target/debug/*
+# Rust
+server/target/
+
+# .NET
+client/native/**/bin/
+client/native/**/obj/
+*.user
+
+# Node / Vite
+client/ui/node_modules/
+client/ui/dist/
+
+# Env files with real secrets (see .env.example templates)
+.env
+.env.local
+.env.production
+*.env
+!*.env.example
+
+# OS / editor
+.vs/
+.vscode/
+*.swp
+Thumbs.db
+.DS_Store

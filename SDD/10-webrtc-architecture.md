@@ -17,9 +17,14 @@ simultânea).
 
 Biblioteca: **SIPSorcery** (`RTCPeerConnection`) + `SIPSorceryMedia.Windows`
 para captura/render WASAPI e encode/decode H.264 via Media Foundation.
-Codec de áudio: Opus. Codec de vídeo primário: H.264 (fallback documentado
-para VP8 se o encoder MF de hardware não estiver disponível na máquina —
-preferência de codec configurável, não hard-coded).
+Codec de áudio: **G722** (não Opus — verificado por reflexão sobre
+`SIPSorcery.Media.AudioEncoder.SupportedFormats` na versão 6.2.4: apenas
+PCMU/PCMA/G722/G729 estão disponíveis sem a dependência nativa adicional de
+`SIPSorceryMedia.FFmpeg`; G722 é o único de banda larga do conjunto, ver
+`27-decisions.md` e `13-audio-pipeline.md`). Codec de vídeo primário: H.264
+(fallback documentado para VP8 se o encoder MF de hardware não estiver
+disponível na máquina — preferência de codec configurável, não
+hard-coded).
 
 ## Topologia: uma PeerConnection por peer, não por track
 

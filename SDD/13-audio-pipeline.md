@@ -14,9 +14,25 @@ tratados sem derrubar a call.
 
 ## Contexto
 
-Captura/render via WASAPI (`SIPSorceryMedia.Windows`), codec Opus. Voz é o
-único stream de mídia que **sempre** existe em uma call ativa (mesmo
-mutado) — diferente de tela/câmera, que são `PublishedStream`s opcionais.
+Captura/render via WASAPI (`SIPSorceryMedia.Windows`), codec **G722** (não
+Opus — ver nota de correção abaixo). Voz é o único stream de mídia que
+**sempre** existe em uma call ativa (mesmo mutado) — diferente de tela/
+câmera, que são `PublishedStream`s opcionais.
+
+**Correção de decisão (verificada em implementação, ver `27-decisions.md`):**
+o pacote `SIPSorcery.Media.AudioEncoder` (núcleo do SIPSorcery, sem
+dependências nativas extras) não implementa Opus — foi confirmado por
+reflexão sobre `AudioEncoder.SupportedFormats` na versão 6.2.4 usada pelo
+cliente: apenas PCMU, PCMA, G722 e G729 estão disponíveis. Opus exigiria
+`SIPSorceryMedia.FFmpeg` (binário nativo libopus/libavcodec adicional), o
+que contradiz a diretriz de simplicidade operacional do produto (seção 31
+do prompt original: "não overengineering"). **G722 foi escolhido**: é o
+único codec de banda larga (16kHz) do conjunto disponível, sem dependência
+nativa adicional, com qualidade de voz adequada para uma comunidade de ~10
+pessoas. Cada `PeerConnection` e a captura de microfone compartilhada
+chamam `RestrictFormats(f => f.Codec == AudioCodecsEnum.G722)` para
+garantir que toda a mesh negocie o mesmo codec. Ver
+`client/native/Talkeando.Client/RtcEngine.cs`.
 
 ## Pipeline de envio (captura → rede)
 
@@ -27,33 +43,47 @@ Microfone (WASAPI capture, dispositivo selecionado)
 Buffer de frames PCM (20ms, taxa nativa do dispositivo)
     │
     ▼
-Resample (se necessário) para a taxa esperada pelo encoder Opus (48kHz)
+Resample (se necessário) para a taxa esperada pelo encoder G722 (16kHz;
+observação: o RTP clock rate declarado no SDP para G722 é 8000 por uma
+particularidade histórica do codec — a taxa de amostragem real é 16kHz)
     │
     ▼
-Encoder Opus (via SIPSorcery)
+Encoder G722 (via `SIPSorcery.Media.AudioEncoder`)
     │
-    ├── se muted == true: frames NÃO são enviados (ver "mute" abaixo)
+    ├── se muted == true OU deafened == true: frames NÃO são enviados (ver
+    │   "mute" abaixo — deafen implica mute de saída, ver `12`)
     ▼
 RTP packetizer → RTCRtpSender da track de áudio (por PeerConnection, uma vez
 por peer — não há "N encodes" para N peers; o mesmo frame codificado é
-replicado ao RTP sender de cada PeerConnection)
+replicado ao RTP sender de cada PeerConnection via `RTCPeerConnection.
+SendAudio(durationRtpUnits, sample)`)
 ```
+
+Captura de microfone é **única e compartilhada** (uma sessão WASAPI, não uma
+por peer) — o mesmo frame codificado é enviado a todos os `PeerConnection`s
+conectados. Isso implica que todos os peers da mesh devem negociar o mesmo
+codec (G722); `RestrictFormats` em cada endpoint garante isso.
 
 ## Pipeline de recepção (rede → alto-falante)
 
 ```
 RTCRtpReceiver (por PeerConnection remota) → depacketizer RTP
     │
+    ├── se deafened == true: o pacote é descartado aqui, antes do decode
+    │   (implementação real: `WindowsAudioEndPoint` não expõe um modo
+    │   "decodificar mas não tocar", então deafen evita a chamada a
+    │   `GotAudioRtp` inteiramente — mais simples e igualmente correto em
+    │   efeito percebido; não há jitter buffer "aquecido" para retomar,
+    │   diferença aceita e documentada aqui em vez de assumida)
     ▼
-Decoder Opus (uma instância por peer remoto — nunca compartilhada)
+Decoder G722 (uma instância por peer remoto, dentro do `WindowsAudioEndPoint`
+de cada peer — nunca compartilhada)
     │
     ▼
-Mixer de áudio (soma os N streams decodificados dos N peers remotos em um
-único buffer de saída — mixagem acontece no cliente, nunca no servidor)
-    │
-    ├── se deafened == true: buffer de saída é silenciado antes do render
-    │   (mas a decodificação continua acontecendo normalmente — deafen não
-    │   para o recebimento de RTP, apenas o playback local, ver abaixo)
+Render por peer via `WindowsAudioEndPoint.GotAudioRtp` (o próprio endpoint
+mistura/agenda a reprodução; não há um mixer explícito em código do
+Talkeando somando N buffers — cada sink escreve para o dispositivo de saída
+padrão do Windows, que faz a mixagem de sistema)
     ▼
 WASAPI render (dispositivo de saída selecionado)
 ```
@@ -62,9 +92,11 @@ WASAPI render (dispositivo de saída selecionado)
 
 Mute é um estado de aplicação local, não uma remoção de track. Quando
 `muted == true`:
-- O encoder Opus para de receber frames do microfone **ou** os frames
+- O encoder G722 para de receber frames do microfone **ou** os frames
   capturados são descartados antes de chegar ao encoder (equivalente em
-  efeito de rede — nenhum pacote RTP de áudio novo é enviado).
+  efeito de rede — nenhum pacote RTP de áudio novo é enviado). Implementação
+  real: `RtcEngine` verifica `_muted || _deafened` no callback
+  `OnAudioSourceEncodedSample` antes de chamar `SendAudio` em cada peer.
 - A track de áudio permanece anexada à PeerConnection (não é removida nem
   renegociada) — só o fluxo de pacotes para. Isso evita o mesmo problema de
   tempestade de renegociação discutido em `12-stream-subscription-model.md`
@@ -137,5 +169,5 @@ dispositivo sem eu pedir".
 | Falha | Comportamento esperado |
 |---|---|
 | Nenhum dispositivo de entrada disponível ao entrar na call | Cliente entra mesmo assim, em modo "sem microfone" (equivalente a mutado permanentemente até um dispositivo aparecer); UI mostra aviso, `AUDIO-FR-003` |
-| Encoder Opus falha ao inicializar | Erro tratado, call continua sem áudio de saída daquele cliente (equivalente a mute forçado), logado (`OBS-NFR-*`) |
+| Encoder G722 falha ao inicializar | Erro tratado, call continua sem áudio de saída daquele cliente (equivalente a mute forçado), logado (`OBS-NFR-*`) |
 | Buffer de jitter estoura (rede ruim) | Frames mais antigos são descartados silenciosamente (comportamento padrão de jitter buffer), nunca trava o pipeline de áudio dos demais peers |
