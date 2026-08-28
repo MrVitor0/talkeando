@@ -822,12 +822,33 @@ export function App() {
   }
   function pickAttachment() { if (!activeChannel) return; setUploading(true); send("attachment.pick", { channel_id: activeChannel.id }); }
   function joinCall(channel: Channel) { setMuted(false); setDeafened(false); joinedAtRef.current = Date.now(); playSound("joinCall"); void rtc.joinCall(channel.id, false, false); }
-  function leaveCall() { if (!call) return; playSound("leaveCall"); void rtc.leaveCall(); musicStreamRef.current = null; setCall(null); setStreams([]); setMySharingStreamId(null); setMyMusicStreamId(null); setWatching({}); setRemoteVideos({}); cancelPeekHide(); peekMetaRef.current = null; peekOwnerRef.current = null; setPeekOwner(null); setPreviewHot(false); }
+  function leaveCall() {
+    if (call) { playSound("leaveCall"); void rtc.leaveCall(); }
+    musicStreamRef.current = null;
+    setCall(null); setStreams([]); setMySharingStreamId(null); setMyMusicStreamId(null);
+    setWatching({}); setRemoteVideos({}); cancelPeekHide(); peekMetaRef.current = null;
+    peekOwnerRef.current = null; setPeekOwner(null); setPreviewHot(false);
+
+    // Leaving voice should return the member to the community's landing text
+    // channel rather than leaving the voice-stage UI frozen on screen.
+    const normalize = (value: string) => value.normalize("NFD").replace(/[\u0300-\u036f]/g, "").toLowerCase();
+    const textChannels = channels.filter(channel => channel.kind === "text");
+    const atrium = textChannels.find(channel => normalize(channel.name) === "atrio-principal")
+      ?? textChannels.find(channel => normalize(channel.name).includes("atrio-principal"))
+      ?? textChannels[0];
+    if (atrium) chooseChannel(atrium);
+  }
   function updateAudioState(nextMuted: boolean, nextDeafened: boolean) {
+    const deafenChanged = nextDeafened !== deafened;
+    const muteChanged = nextMuted !== muted;
     // Deafen implies mic muted: on the way into deafen, remember the mic
     // state so it can be restored when deafen is turned back off.
     if (nextDeafened && !deafened) { preDeafenMutedRef.current = nextMuted; nextMuted = true; }
     else if (!nextDeafened && deafened) { nextMuted = preDeafenMutedRef.current; }
+    // A headphone action can also mute/restore the microphone. Play one sound
+    // for the action the user actually clicked, rather than both at once.
+    if (deafenChanged) playSound(nextDeafened ? "headphoneMuted" : "headphoneUnmuted");
+    else if (muteChanged) playSound(nextMuted ? "micMuted" : "micUnmuted");
     setMuted(nextMuted); setDeafened(nextDeafened);
     if (call) rtc.setLocalAudioState(nextMuted, nextDeafened);
   }

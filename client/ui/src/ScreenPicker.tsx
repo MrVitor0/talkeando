@@ -102,8 +102,7 @@ export function ScreenPicker({
     <button
       key={source.id}
       className={selected === source.id ? "sp-card is-selected" : "sp-card"}
-      onClick={() => setSelected(source.id)}
-      onDoubleClick={() => choose(source.id)}
+      onClick={() => choose(source.id)}
       title={source.title}
     >
       <div className="sp-card__thumb">

@@ -9,6 +9,7 @@ services:
       DATABASE_URL: ${DATABASE_URL:?set the Neon production connection string}
       BIND_ADDR: 0.0.0.0:8080
       TURN_SHARED_SECRET: ${TURN_SHARED_SECRET:?set in production env}
+      MUSIC_BOT_TOKEN: ${MUSIC_BOT_TOKEN:-}
       TURN_REALM: ${TURN_REALM:?set in production env}
       TURN_URIS: ${TURN_URIS:?set in production env}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:?set in production env}

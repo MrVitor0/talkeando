@@ -10,6 +10,10 @@ const files = {
   stopScreen: "stop_screen.mp3",
   startCamera: "start_camera.mp3",
   stopCamera: "stop_camera.mp3",
+  micMuted: "mic-muted.MP3",
+  micUnmuted: "mic-unmuted.MP3",
+  headphoneMuted: "headphone-muted.MP3",
+  headphoneUnmuted: "headphone-umuted.MP3",
 } as const;
 
 export type SoundName = keyof typeof files;

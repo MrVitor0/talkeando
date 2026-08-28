@@ -1,6 +1,11 @@
 FROM node:18-bookworm-slim
-RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg python3-pip ca-certificates \
-    && pip3 install --no-cache-dir yt-dlp \
+# Debian Bookworm marks its system Python as externally managed (PEP 668), so
+# yt-dlp must live in its own virtual environment instead of `pip3 install`
+# into the OS package set.
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg python3-venv ca-certificates \
+    && python3 -m venv /opt/yt-dlp \
+    && /opt/yt-dlp/bin/pip install --no-cache-dir yt-dlp \
+    && ln -s /opt/yt-dlp/bin/yt-dlp /usr/local/bin/yt-dlp \
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY package.json ./
