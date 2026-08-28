@@ -125,30 +125,53 @@ function cookiesFile() {
   } catch { return null; }
 }
 
+function getStreamUrl(source, cookies) {
+  return new Promise((resolve, reject) => {
+    const ytArgs = [
+      "--no-progress", "--no-warnings",
+      "--geo-bypass",
+      "--js-runtimes", "deno",
+      "--remote-components", "ejs:github",
+      "-f", "251/140/bestaudio/best",
+      "-g",
+    ];
+    if (cookies) ytArgs.push("--cookies", cookies);
+    ytArgs.push(source);
+    const proc = spawn("yt-dlp", ytArgs, { stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "", stderr = "";
+    proc.stdout.on("data", d => { stdout += d.toString(); });
+    proc.stderr.on("data", d => { stderr += d.toString(); process.stderr.write(`[yt-dlp] ${d}`); });
+    proc.on("close", code => {
+      const url = stdout.trim().split("\n").find(line => line.startsWith("http"));
+      if (code === 0 && url) {
+        resolve(url);
+      } else {
+        reject(new Error(`yt-dlp URL extraction failed (code ${code}): ${stderr || stdout}`));
+      }
+    });
+  });
+}
+
 async function startPlayback(query) {
   stopPlayback();
   const sources = await resolveSources(query);
   const cookies = cookiesFile();
   log(`startPlayback: ${JSON.stringify(sources)} (cookies: ${cookies ? "yes" : "NONE — YouTube will block this"})`);
-  const ytArgs = [
-    "--no-progress", "--no-warnings",
-    "--geo-bypass",
-    "--js-runtimes", "deno",
-    "--remote-components", "ejs:github",
-    "-f", "251/140/bestaudio/best", "-o", "-",
-  ];
-  if (cookies) ytArgs.push("--cookies", cookies);
-  ytArgs.push(...sources);
-  const yt = spawn("yt-dlp", ytArgs, { stdio: ["ignore", "pipe", "pipe"] });
-  const ffmpeg = spawn("ffmpeg", ["-hide_banner", "-loglevel", "error", "-re", "-i", "pipe:0", "-f", "s16le", "-ar", "48000", "-ac", "2", "pipe:1"], { stdio: ["pipe", "pipe", "pipe"] });
-  yt.stdout.pipe(ffmpeg.stdin);
-  // Surface both toolchains' errors — without this a blocked download or a
-  // broken stream just produces silence with no explanation.
-  yt.stderr.on("data", d => process.stderr.write(`[yt-dlp] ${d}`));
+  const streamUrl = await getStreamUrl(sources[0], cookies);
+  log(`stream URL resolved: ${streamUrl.substring(0, 60)}...`);
+
+  const ffmpeg = spawn("ffmpeg", [
+    "-hide_banner", "-loglevel", "error",
+    "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
+    "-re",
+    "-i", streamUrl,
+    "-f", "s16le", "-ar", "48000", "-ac", "2",
+    "pipe:1"
+  ], { stdio: ["ignore", "pipe", "pipe"] });
+
   ffmpeg.stderr.on("data", d => process.stderr.write(`[ffmpeg] ${d}`));
-  yt.on("close", code => log(`yt-dlp exited (code ${code})`));
   const audio = new wrtc.nonstandard.RTCAudioSource(); const track = audio.createTrack();
-  current = { yt, ffmpeg, track, audio, label: query };
+  current = { ffmpeg, track, audio, label: query };
   idleSince = 0;
   let bytesOut = 0;
   let pcmBuffer = Buffer.alloc(0);
