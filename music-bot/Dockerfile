@@ -18,7 +18,7 @@ RUN curl -fsSL https://github.com/denoland/deno/releases/latest/download/deno-x8
 WORKDIR /app
 COPY package.json ./
 RUN npm install --omit=dev
-COPY index.js ./
+COPY index.js test.js ./
 # Pre-create the yt-dlp cache dir owned by `node` so the named volume mounted
 # there (docker-compose) inherits that ownership instead of root's.
 RUN mkdir -p /home/node/.cache/yt-dlp && chown -R node:node /home/node/.cache
