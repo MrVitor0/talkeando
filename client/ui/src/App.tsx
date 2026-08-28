@@ -200,6 +200,7 @@ function VideoTile({
   focused,
   onToggleMute,
   onToggleFocus,
+  isSelf = false,
 }: {
   stream: MediaStream;
   name: string;
@@ -208,6 +209,7 @@ function VideoTile({
   focused: boolean;
   onToggleMute: () => void;
   onToggleFocus: () => void;
+  isSelf?: boolean;
 }) {
   const wrapRef = useRef<HTMLDivElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -244,16 +246,40 @@ function VideoTile({
 
   return (
     <div ref={wrapRef} className={focused ? "vtile is-video is-focused" : "vtile is-video"} onDoubleClick={toggleFullscreen}>
-      <video ref={videoRef} autoPlay playsInline muted={peerMuted} className="vtile__video" />
+      <video ref={videoRef} autoPlay playsInline muted={isSelf || peerMuted} className="vtile__video" />
       {!ready && <StreamLoading label={`Carregando a tela de ${name}`} />}
+      {isSelf && (
+        <div style={{
+          position: "absolute",
+          top: "12px",
+          right: "12px",
+          background: "rgba(0, 0, 0, 0.75)",
+          color: "#fff",
+          padding: "6px 12px",
+          borderRadius: "16px",
+          fontSize: "12px",
+          display: "flex",
+          alignItems: "center",
+          gap: "6px",
+          zIndex: 10,
+          border: "1px solid rgba(255, 255, 255, 0.15)",
+          backdropFilter: "blur(4px)",
+          pointerEvents: "none"
+        }}>
+          <span style={{ display: "inline-block", width: "8px", height: "8px", borderRadius: "50%", background: "#23a55a" }} />
+          <span>Sua tela (Espelhamento)</span>
+        </div>
+      )}
       <div className="vtile__name">
         {micMuted && <Icon name="mic-muted" size={14} />}
         <span>{name}</span>
       </div>
       <div className="vtile__hud">
-        <button className={peerMuted ? "vhud-btn is-on" : "vhud-btn"} title={peerMuted ? "Ativar som" : "Silenciar"} onClick={onToggleMute}>
-          <Icon name={peerMuted ? "headphone-muted" : "headphone"} size={16} />
-        </button>
+        {!isSelf && (
+          <button className={peerMuted ? "vhud-btn is-on" : "vhud-btn"} title={peerMuted ? "Ativar som" : "Silenciar"} onClick={onToggleMute}>
+            <Icon name={peerMuted ? "headphone-muted" : "headphone"} size={16} />
+          </button>
+        )}
         <button className="vhud-btn" title="Janela flutuante" onClick={popOut}><PipIcon size={16} /></button>
         <button className={focused ? "vhud-btn is-on" : "vhud-btn"} title={focused ? "Sair do foco" : "Modo teatro"} onClick={onToggleFocus}><TheaterIcon size={16} /></button>
         <button className="vhud-btn" title={isFullscreen ? "Sair da tela cheia" : "Tela cheia"} onClick={toggleFullscreen}>
@@ -1060,7 +1086,10 @@ export function App() {
     const name = isSelf ? selfName : memberName(participant.user_id);
     const stream = streams.find(s => s.owner === participant.user_id && s.kind === "screen");
     const watchable = !!stream && !isSelf;
-    const video = watching[participant.user_id] ? remoteVideos[participant.user_id] : undefined;
+    const localStream = isSelf && mySharingStreamId ? rtc.getLocalScreenStream() : null;
+    const video = (isSelf && mySharingStreamId)
+      ? (localStream ?? undefined)
+      : (watching[participant.user_id] ? remoteVideos[participant.user_id] : undefined);
     const isMicMuted = isSelf ? muted : participant.muted;
 
     if (video) {
@@ -1074,6 +1103,7 @@ export function App() {
           focused={focusedUser === participant.user_id}
           onToggleMute={() => togglePeerMute(participant.user_id)}
           onToggleFocus={() => toggleFocus(participant.user_id)}
+          isSelf={isSelf}
         />
       );
     }

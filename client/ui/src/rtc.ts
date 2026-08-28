@@ -700,3 +700,7 @@ export function onRemoteStream(listener: RemoteStreamListener) {
   remoteVideoListeners.add(listener);
   return () => { remoteVideoListeners.delete(listener); };
 }
+
+export function getLocalScreenStream(): MediaStream | null {
+  return localScreenStream;
+}

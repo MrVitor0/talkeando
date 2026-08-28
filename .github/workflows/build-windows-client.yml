@@ -9,7 +9,7 @@ on:
         default: beta
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   build:
@@ -55,9 +55,35 @@ jobs:
           Esta build usa a API de produção configurada em tupi.settings.json.
           "@ | Set-Content -NoNewline release/Tupi-win-x64/LEIA-ME.txt
 
+      - name: Zip build files
+        shell: pwsh
+        run: |
+          Compress-Archive -Path release/Tupi-win-x64/* -DestinationPath "release/Tupi-${{ inputs.version_label }}-win-x64.zip"
+
+      - name: Download WebView2 Bootstrapper
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri "https://go.microsoft.com/fwlink/p/?LinkId=2124703" -OutFile "client/native/installer/MicrosoftEdgeWebview2Setup.exe"
+
+      - name: Build Installer (Inno Setup)
+        shell: pwsh
+        run: |
+          iscc /DAppVersion="${{ inputs.version_label }}" /DPublishDir="${{ github.workspace }}\release\Tupi-win-x64" client/native/installer/Tupi.iss
+
       - uses: actions/upload-artifact@v4
         with:
           name: Tupi-${{ inputs.version_label }}-win-x64
-          path: release/Tupi-win-x64
+          path: |
+            release/Tupi-win-x64
+            release/Tupi-${{ inputs.version_label }}-win-x64.zip
+            client/native/installer/output/Tupi-Setup-${{ inputs.version_label }}-x64.exe
           if-no-files-found: error
           retention-days: 30
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          $tag = "v${{ inputs.version_label }}-${{ github.run_number }}"
+          gh release create $tag "release/Tupi-${{ inputs.version_label }}-win-x64.zip" "client/native/installer/output/Tupi-Setup-${{ inputs.version_label }}-x64.exe" --title "Tupi Client v${{ inputs.version_label }} (Build #${{ github.run_number }})" --notes "Manual release build from main branch."
