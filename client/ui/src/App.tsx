@@ -4,7 +4,7 @@ import * as rtc from "./rtc";
 import { playSound, setSoundsMuted } from "./sounds";
 import { Icon, IconName } from "./Icon";
 import { HashIcon, SearchIcon, PencilIcon, TrashIcon, CrownIcon, FullscreenIcon, ContractIcon, PipIcon, DotsIcon, TheaterIcon } from "./Glyphs";
-import { ScreenPicker, CaptureSource, ShareOptions } from "./ScreenPicker";
+import { ScreenPicker, QualityControls, CaptureSource, ShareOptions } from "./ScreenPicker";
 import logoUrl from "../icons/logo.webp";
 
 type Channel = { id: string; name: string; kind: "text" | "voice"; topic?: string | null };
@@ -36,6 +36,8 @@ type Message = {
 // the server's idempotency key (channel_id, author_id, req_id) resolves a
 // duplicate send to the original row instead of inserting a second message.
 const SEND_TIMEOUT_MS = 8000;
+// Virtual music bot's fixed id (server: MUSIC_BOT_ID = Uuid::from_u128(1)).
+const MUSIC_BOT_ID = "00000000-0000-0000-0000-000000000001";
 
 // Slash-command palette (Discord-style autocomplete). All of these are Tupi
 // Música commands — see submitMessage's `/(play|pause|...)` parser and the
@@ -703,6 +705,12 @@ export function App() {
   const [pickerOpen, setPickerOpen] = useState(false);
   const [sources, setSources] = useState<CaptureSource[]>([]);
   const [sourcesLoading, setSourcesLoading] = useState(false);
+  // While a share is live, the share button opens this little menu instead of
+  // stopping immediately: change quality (reuses the wizard's step-2 controls,
+  // applied live) or actually stop.
+  const [shareMenuOpen, setShareMenuOpen] = useState(false);
+  const [shareQualityOpen, setShareQualityOpen] = useState(false);
+  const [shareQuality, setShareQuality] = useState<{ height: number; fps: number }>({ height: 720, fps: 30 });
   const [watching, setWatching] = useState<Record<string, boolean>>({});
   const [peekOwner, setPeekOwner] = useState<string | null>(null);
   // Voice channel currently under a member-drag, for the drop-target highlight.
@@ -824,6 +832,10 @@ export function App() {
           ?? { id: destId, name: "", kind: "voice" as const };
         setActiveChannel(dest);
         joinCall(dest);
+      }
+      // The owner kicked us out of the voice channel — tear our call down.
+      if (event.op === "voice.disconnected") {
+        leaveCall();
       }
       if (event.op === "voice.rooms") {
         const rooms: Array<{ channel_id: string; participants: VoiceRosterEntry[]; streams?: StreamInfo[] }> = event.data.rooms ?? [];
@@ -1115,7 +1127,7 @@ export function App() {
   // The "you're sharing" toast shows briefly on start, then hides — there's
   // no OS capture border, but a permanent banner is nagging.
   useEffect(() => {
-    if (!mySharingStreamId) { setShowSharingToast(false); return; }
+    if (!mySharingStreamId) { setShowSharingToast(false); setShareMenuOpen(false); setShareQualityOpen(false); return; }
     setShowSharingToast(true);
     const timer = setTimeout(() => setShowSharingToast(false), 4000);
     return () => clearTimeout(timer);
@@ -1268,13 +1280,54 @@ export function App() {
     try {
       await rtc.publishScreen(call.channelId, streamId, sourceId, options.height, options.fps, options.withAudio);
       setMySharingStreamId(streamId);
+      setShareQuality({ height: options.height, fps: options.fps });
       playSound("startScreen");
     } catch (error) {
       console.error("[ui] publishScreen failed", error);
       setError("Não foi possível iniciar o compartilhamento de tela.");
     }
   }
-  function stopSharing() { if (!call || !mySharingStreamId) return; playSound("stopScreen"); void rtc.unpublishScreen(call.channelId, mySharingStreamId); setMySharingStreamId(null); }
+  // Clicking the share button while already sharing: open the menu instead of
+  // stopping outright.
+  function onShareButton() {
+    if (mySharingStreamId) setShareMenuOpen(open => !open);
+    else startSharing();
+  }
+  function closeShareMenu() { setShareMenuOpen(false); setShareQualityOpen(false); }
+  function applyShareQuality(next: { height: number; fps: number }) {
+    setShareQuality(next);
+    rtc.reconfigureScreen(next.height, next.fps);
+  }
+  function renderSharePopover() {
+    if (!shareMenuOpen || !mySharingStreamId) return null;
+    return (
+      <div className="share-menu" onMouseLeave={closeShareMenu}>
+        {shareQualityOpen ? (
+          <div className="share-menu__quality">
+            <div className="share-menu__title">Qualidade da transmissão</div>
+            <QualityControls height={shareQuality.height} fps={shareQuality.fps} onChange={applyShareQuality} />
+            <button className="share-menu__done" onClick={() => setShareQualityOpen(false)}>Voltar</button>
+          </div>
+        ) : (
+          <>
+            <button onClick={() => setShareQualityOpen(true)}>
+              <Icon name="share-screen" size={16} /> Alterar qualidade
+            </button>
+            <button className="is-danger" onClick={stopSharing}>
+              <Icon name="hangout-call" size={16} /> Parar de compartilhar
+            </button>
+          </>
+        )}
+      </div>
+    );
+  }
+  function stopSharing() {
+    closeShareMenu();
+    if (!call || !mySharingStreamId) return;
+    playSound("stopScreen");
+    void rtc.unpublishScreen(call.channelId, mySharingStreamId);
+    setMySharingStreamId(null);
+  }
 
   async function startCamera(deviceId?: string | null) {
     if (!call) return;
@@ -1491,6 +1544,18 @@ export function App() {
       });
     }
     if (member) items.push({ label: "Renomear usuário", onClick: () => renameOtherMember(member) });
+    // Which voice channel (if any) is the target sitting in right now?
+    const voiceChannelId = Object.entries(voiceRooms).find(
+      ([, entries]) => entries.some(entry => entry.user_id === userId),
+    )?.[0];
+    if (voiceChannelId) {
+      const isBot = userId === MUSIC_BOT_ID;
+      items.push({
+        label: isBot ? "Desconectar Tupi Música" : "Desconectar do canal de voz",
+        danger: true,
+        onClick: () => send("voice.disconnect_member", { user_id: userId, channel_id: voiceChannelId }),
+      });
+    }
     return items;
   }
   const channelMenuItems = (channel: Channel): MenuItem[] => [
@@ -1870,13 +1935,16 @@ export function App() {
                 <Icon name={noiseSup ? "crisp-nois-cenaceling-on" : "crisp-off"} size={18} />
               </button>
               <button className="vp-btn" title="Efeitos sonoros"><Icon name="sound-effects" size={18} /></button>
-              <button
-                className={mySharingStreamId ? "vp-btn is-danger is-on" : "vp-btn"}
-                onClick={mySharingStreamId ? stopSharing : startSharing}
-                title="Compartilhar tela"
-              >
-                <Icon name="share-screen" size={18} />
-              </button>
+              <div className="vp-share">
+                <button
+                  className={mySharingStreamId ? "vp-btn is-danger is-on" : "vp-btn"}
+                  onClick={onShareButton}
+                  title={mySharingStreamId ? "Opções de transmissão" : "Compartilhar tela"}
+                >
+                  <Icon name="share-screen" size={18} />
+                </button>
+                {renderSharePopover()}
+              </div>
               <button
                 className={myCameraStreamId ? "vp-btn is-on" : "vp-btn"}
                 onClick={toggleCamera}
@@ -2014,13 +2082,16 @@ export function App() {
             <div className="voice-controls">
               <button className="vc-btn" title="Atividades"><Icon name="activities" size={22} /></button>
               <button className="vc-btn" title="Efeitos sonoros"><Icon name="sound-effects" size={22} /></button>
-              <button
-                className={mySharingStreamId ? "vc-btn is-on" : "vc-btn"}
-                onClick={mySharingStreamId ? stopSharing : startSharing}
-                title={mySharingStreamId ? "Parar de compartilhar" : "Compartilhar tela"}
-              >
-                <Icon name="share-screen" size={22} />
-              </button>
+              <div className="vc-share">
+                <button
+                  className={mySharingStreamId ? "vc-btn is-on" : "vc-btn"}
+                  onClick={onShareButton}
+                  title={mySharingStreamId ? "Opções de transmissão" : "Compartilhar tela"}
+                >
+                  <Icon name="share-screen" size={22} />
+                </button>
+                {renderSharePopover()}
+              </div>
               <div className="vc-cam">
                 <button
                   className={myCameraStreamId ? "vc-btn is-on" : "vc-btn"}

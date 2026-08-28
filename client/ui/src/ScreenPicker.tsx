@@ -28,6 +28,79 @@ const RESOLUTIONS = [
 
 const FRAME_RATES = [15, 30, 60] as const;
 
+/// The "Qualidade da transmissão" controls (preset dropdown + resolution +
+/// frame-rate). Shared between the share wizard's config step and the
+/// "Alterar qualidade" popover shown while a share is already live.
+export function QualityControls({
+  height,
+  fps,
+  onChange,
+}: {
+  height: number;
+  fps: number;
+  onChange: (next: { height: number; fps: number }) => void;
+}) {
+  const [presetOpen, setPresetOpen] = useState(false);
+  const presetLabel = useMemo(() => {
+    const match = QUALITY_PRESETS.find(preset => preset.height === height && preset.fps === fps);
+    return match ? match.label : "Personalizado";
+  }, [height, fps]);
+  return (
+    <>
+      <div className="sp-dropdown">
+        <button className="sp-dropdown__toggle" onClick={() => setPresetOpen(open => !open)}>
+          <span>{presetLabel}</span>
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M7 10l5 5 5-5z" /></svg>
+        </button>
+        {presetOpen && (
+          <div className="sp-dropdown__menu" onMouseLeave={() => setPresetOpen(false)}>
+            {QUALITY_PRESETS.map(preset => (
+              <button
+                key={preset.id}
+                className={preset.height === height && preset.fps === fps ? "is-active" : ""}
+                onClick={() => { onChange({ height: preset.height, fps: preset.fps }); setPresetOpen(false); }}
+              >
+                {preset.label}
+              </button>
+            ))}
+          </div>
+        )}
+      </div>
+
+      <div className="sp-seg-grid">
+        <div className="sp-seg-col">
+          <div className="sp-seg-col__label">Resolução</div>
+          <div className="sp-seg">
+            {RESOLUTIONS.map(option => (
+              <button
+                key={option.label}
+                className={height === option.height ? "is-active" : ""}
+                onClick={() => onChange({ height: option.height, fps })}
+              >
+                {option.label}
+              </button>
+            ))}
+          </div>
+        </div>
+        <div className="sp-seg-col">
+          <div className="sp-seg-col__label">Taxa de quadros</div>
+          <div className="sp-seg">
+            {FRAME_RATES.map(rate => (
+              <button
+                key={rate}
+                className={fps === rate ? "is-active" : ""}
+                onClick={() => onChange({ height, fps: rate })}
+              >
+                {rate}
+              </button>
+            ))}
+          </div>
+        </div>
+      </div>
+    </>
+  );
+}
+
 function ShareHero() {
   return (
     <div className="sp-hero" aria-hidden="true">
@@ -73,7 +146,6 @@ export function ScreenPicker({
   const [notify, setNotify] = useState(false);
   const [height, setHeight] = useState<number>(720);
   const [fps, setFps] = useState<number>(30);
-  const [presetOpen, setPresetOpen] = useState(false);
   const [sourceTab, setSourceTab] = useState<"window" | "screen">("window");
   const [showAllSources, setShowAllSources] = useState(false);
 
@@ -82,11 +154,6 @@ export function ScreenPicker({
   const tabSources = sourceTab === "window" ? windows : screens;
   const visibleSources = showAllSources ? tabSources : tabSources.slice(0, 4);
   const selectedSource = sources.find(source => source.id === selected) ?? null;
-
-  const presetLabel = useMemo(() => {
-    const match = QUALITY_PRESETS.find(preset => preset.height === height && preset.fps === fps);
-    return match ? match.label : "Personalizado";
-  }, [height, fps]);
 
   function choose(sourceId: string) {
     setSelected(sourceId);
@@ -205,56 +272,11 @@ export function ScreenPicker({
 
               <div className="sp-field">
                 <div className="sp-field__label">Qualidade da transmissão</div>
-                <div className="sp-dropdown">
-                  <button className="sp-dropdown__toggle" onClick={() => setPresetOpen(open => !open)}>
-                    <span>{presetLabel}</span>
-                    <svg viewBox="0 0 24 24" width="18" height="18" fill="currentColor"><path d="M7 10l5 5 5-5z" /></svg>
-                  </button>
-                  {presetOpen && (
-                    <div className="sp-dropdown__menu" onMouseLeave={() => setPresetOpen(false)}>
-                      {QUALITY_PRESETS.map(preset => (
-                        <button
-                          key={preset.id}
-                          className={preset.height === height && preset.fps === fps ? "is-active" : ""}
-                          onClick={() => { setHeight(preset.height); setFps(preset.fps); setPresetOpen(false); }}
-                        >
-                          {preset.label}
-                        </button>
-                      ))}
-                    </div>
-                  )}
-                </div>
-
-                <div className="sp-seg-grid">
-                  <div className="sp-seg-col">
-                    <div className="sp-seg-col__label">Resolução</div>
-                    <div className="sp-seg">
-                      {RESOLUTIONS.map(option => (
-                        <button
-                          key={option.label}
-                          className={height === option.height ? "is-active" : ""}
-                          onClick={() => setHeight(option.height)}
-                        >
-                          {option.label}
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-                  <div className="sp-seg-col">
-                    <div className="sp-seg-col__label">Taxa de quadros</div>
-                    <div className="sp-seg">
-                      {FRAME_RATES.map(rate => (
-                        <button
-                          key={rate}
-                          className={fps === rate ? "is-active" : ""}
-                          onClick={() => setFps(rate)}
-                        >
-                          {rate}
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-                </div>
+                <QualityControls
+                  height={height}
+                  fps={fps}
+                  onChange={next => { setHeight(next.height); setFps(next.fps); }}
+                />
               </div>
             </div>
 

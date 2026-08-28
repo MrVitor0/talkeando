@@ -16,6 +16,9 @@ pub struct User {
     pub profile_tag: Option<String>,
     pub profile_badge_storage_path: Option<String>,
     pub profile_badge_content_type: Option<String>,
+    /// Hex `#rrggbb` for the display name everywhere it is shown, or NULL for
+    /// the client-side default.
+    pub name_color: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 

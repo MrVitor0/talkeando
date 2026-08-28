@@ -156,6 +156,7 @@ public sealed class IpcBridge : IDisposable
                 case "call.leave":
                 case "call.state.update":
                 case "voice.move_member":
+                case "voice.disconnect_member":
                 case "stream.publish":
                 case "stream.unpublish":
                 case "stream.subscribe":

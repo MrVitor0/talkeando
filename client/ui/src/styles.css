@@ -1872,6 +1872,56 @@ a:hover {
   font-size: 13px;
   color: var(--text-muted, #949ba4);
 }
+
+/* ---- "share options" popover (shown while a share is live) ---- */
+.vp-share { position: relative; display: flex; }
+.vp-share > .vp-btn { width: 100%; }
+.vc-share { position: relative; display: inline-flex; align-items: center; }
+.share-menu {
+  position: absolute;
+  bottom: calc(100% + 10px);
+  left: 50%;
+  transform: translateX(-50%);
+  width: max-content;
+  min-width: 220px;
+  max-width: 320px;
+  background: var(--bg-floating, #111214);
+  border: 1px solid rgba(0, 0, 0, 0.4);
+  border-radius: 8px;
+  padding: 6px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+  z-index: 30;
+}
+.share-menu > button {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  text-align: left;
+  padding: 8px 10px;
+  border-radius: 4px;
+  font-size: 14px;
+  color: var(--interactive-normal, #b5bac1);
+}
+.share-menu > button:hover { background: var(--brand, #5865f2); color: #fff; }
+.share-menu > button.is-danger { color: var(--red, #f23f42); }
+.share-menu > button.is-danger:hover { background: var(--red, #f23f42); color: #fff; }
+.share-menu__quality { padding: 4px 6px 6px; display: grid; gap: 10px; }
+.share-menu__title {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--text-muted, #949ba4);
+}
+.share-menu__done {
+  justify-self: start;
+  padding: 6px 10px;
+  border-radius: 4px;
+  font-size: 13px;
+  color: var(--interactive-normal, #b5bac1);
+}
+.share-menu__done:hover { background: var(--bg-hover); color: var(--interactive-hover); }
 /* ==========================================================================
    Auth
    ========================================================================== */

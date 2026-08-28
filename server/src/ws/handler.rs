@@ -515,6 +515,10 @@ async fn dispatch(state: &AppState, user_id: Uuid, text: &str, joined_calls: &mu
             let data: VoiceMoveMember = parse_or_reject!(VoiceMoveMember);
             handle_voice_move_member(state, user_id, data).await;
         }
+        "voice.disconnect_member" => {
+            let data: VoiceDisconnectMember = parse_or_reject!(VoiceDisconnectMember);
+            handle_voice_disconnect_member(state, user_id, data).await;
+        }
         "rtc.offer" => {
             let data: RtcOffer = parse_or_reject!(RtcOffer);
             relay_rtc(state, user_id, data.channel_id, data.to, "rtc.offer", data).await;
@@ -1107,6 +1111,55 @@ async fn handle_voice_move_member(state: &AppState, actor_id: Uuid, data: VoiceM
         "voice.moved", VoiceMoved { channel_id: data.channel_id, moved_by: actor_id },
     )).await;
     tracing::info!(%actor_id, target = %data.user_id, channel_id = %data.channel_id, "voice.move_member");
+}
+
+/// Kick a member out of a voice channel. Humans: community-owner only. The
+/// music bot: any member of that channel's community — and it gets a full
+/// reset (stop playback / playlist, leave), not just a removal.
+async fn handle_voice_disconnect_member(state: &AppState, actor_id: Uuid, data: VoiceDisconnectMember) {
+    let dest = match db::channel_by_id(&state.pool, data.channel_id).await {
+        Ok(Some(channel)) if channel.kind == "voice" => channel,
+        _ => {
+            state.hub.send_to(actor_id, OutboundEnvelope::error("not_found", "voice channel not found", None)).await;
+            return;
+        }
+    };
+
+    let is_bot = data.user_id == MUSIC_BOT_ID;
+    let allowed = if is_bot {
+        matches!(db::channel_if_member(&state.pool, dest.id, actor_id).await, Ok(Some(_)))
+    } else {
+        matches!(db::is_community_owner(&state.pool, dest.community_id, actor_id).await, Ok(true))
+    };
+    if !allowed {
+        let msg = if is_bot { "join this community first" } else { "only the community owner can disconnect members" };
+        state.hub.send_to(actor_id, OutboundEnvelope::error("forbidden", msg, None)).await;
+        return;
+    }
+
+    if !state.hub.calls.read().await.is_participant(data.channel_id, data.user_id) {
+        state.hub.send_to(actor_id, OutboundEnvelope::error("validation_error", "that member is not in this voice channel", None)).await;
+        return;
+    }
+
+    if is_bot {
+        // Full reset — the bot's `music.command stop` handler stops yt-dlp /
+        // ffmpeg / any playlist and leaves the channel.
+        state.hub.music_djs.write().await.remove(&data.channel_id);
+        state.hub.send_to(MUSIC_BOT_ID, OutboundEnvelope::new(
+            "music.command", serde_json::json!({ "command": "stop", "voice_channel_id": data.channel_id }),
+        )).await;
+    } else {
+        // The kicked client leaves the call on this event.
+        state.hub.send_to(data.user_id, OutboundEnvelope::new(
+            "voice.disconnected", VoiceDisconnected { channel_id: data.channel_id, by: actor_id },
+        )).await;
+    }
+
+    // Remove from the registry now so the roster clears immediately even if
+    // the target's client is slow to react.
+    teardown_call_membership(state, data.channel_id, data.user_id, "disconnected").await;
+    tracing::info!(%actor_id, target = %data.user_id, channel_id = %data.channel_id, bot = is_bot, "voice.disconnect_member");
 }
 
 async fn relay_rtc(

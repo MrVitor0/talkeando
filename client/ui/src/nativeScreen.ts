@@ -154,6 +154,16 @@ export function startNativeScreen(sourceId: string, maxHeight: number, fps: numb
   return new MediaStream(tracks);
 }
 
+/// Re-issues the capture for an already-running share at a new resolution /
+/// frame-rate. The host's `ScreenCapture.Start()` stops and restarts its
+/// capture thread, but our canvas + its `captureStream()` track are untouched —
+/// `onVideoFrame` just starts drawing frames at the new size — so the WebRTC
+/// sender needs no renegotiation. Audio target is left as-is.
+export function reconfigureNativeScreen(sourceId: string, maxHeight: number, fps: number, withAudio: boolean) {
+  if (!active) return;
+  send("screen.capture.start", { source_id: sourceId, max_height: maxHeight, max_fps: fps, audio: withAudio });
+}
+
 export function stopNativeScreen() {
   if (!active) return;
   active = false;

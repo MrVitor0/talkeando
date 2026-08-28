@@ -16,7 +16,7 @@
 // authenticated WebSocket, and every WS event is forwarded here unchanged via
 // the existing `Publish(op, data)` catch-all IpcBridge already had.
 import { send, subscribe, Envelope } from "./ipc";
-import { startNativeScreen, stopNativeScreen } from "./nativeScreen";
+import { startNativeScreen, stopNativeScreen, reconfigureNativeScreen } from "./nativeScreen";
 import { pauseNativeMusic, startNativeMusic, stopNativeMusic } from "./nativeMusic";
 import * as noiseSuppression from "./noiseSuppression";
 
@@ -88,6 +88,10 @@ let localDeafened = false;
 // that avoided a renegotiation storm on every subscribe/unsubscribe.
 let localScreenTrack: MediaStreamTrack | null = null;
 let localScreenStream: MediaStream | null = null;
+// Remembered so "change quality" can re-issue the native capture in place
+// (same source, same audio) without tearing down the WebRTC track.
+let localScreenSourceId: string | null = null;
+let localScreenAudioOn = false;
 const screenSubscribers = new Set<string>();
 // Per-peer transceivers for our outgoing screen tracks (one video, and one
 // audio when the source carries process-loopback audio). Created ONCE per peer
@@ -699,6 +703,7 @@ export async function leaveCall() {
   emitLocalCamera(null);
   if (localScreenTrack) { localScreenTrack.stop(); localScreenTrack = null; }
   localScreenStream = null;
+  localScreenSourceId = null;
   screenSlots.clear();
   screenNeedsOffer.clear();
   screenSubscribers.clear();
@@ -823,11 +828,22 @@ export function getPeerVolume(peerUserId: string): number {
 export async function publishScreen(channelId: string, streamId: string, sourceId: string, targetHeight: number, targetFps: number, withAudio: boolean) {
   localScreenStream = startNativeScreen(sourceId, targetHeight, targetFps, withAudio);
   localScreenTrack = localScreenStream?.getVideoTracks()[0] ?? null;
+  localScreenSourceId = sourceId;
+  localScreenAudioOn = withAudio;
   const hasAudio = (localScreenStream?.getAudioTracks().length ?? 0) > 0;
   console.log(`[rtc] publishScreen: ${sourceId} video=${localScreenTrack?.readyState} audio=${hasAudio} subs=[${Array.from(screenSubscribers).join(",")}]`);
   // Anyone who already subscribed (before we had a track) now gets it.
   for (const peerUserId of screenSubscribers) await applyScreenSend(peerUserId, true);
   send("stream.publish", { channel_id: channelId, stream_id: streamId, kind: "screen", has_audio: hasAudio, msid: localScreenStream?.id, req_id: crypto.randomUUID() });
+}
+
+/// Change resolution / frame-rate of a live screen share in place. The native
+/// host stops+restarts its capture thread, but the canvas MediaStreamTrack we
+/// handed to WebRTC keeps running — so viewers just see the new resolution,
+/// with no renegotiation and no re-subscribe.
+export function reconfigureScreen(targetHeight: number, targetFps: number) {
+  if (!localScreenSourceId) return;
+  reconfigureNativeScreen(localScreenSourceId, targetHeight, targetFps, localScreenAudioOn);
 }
 
 export async function unpublishScreen(channelId: string, streamId: string) {
@@ -837,6 +853,7 @@ export async function unpublishScreen(channelId: string, streamId: string) {
   stopNativeScreen();
   if (localScreenTrack) { localScreenTrack.stop(); localScreenTrack = null; }
   localScreenStream = null;
+  localScreenSourceId = null;
   send("stream.unpublish", { channel_id: channelId, stream_id: streamId, req_id: crypto.randomUUID() });
 }
 

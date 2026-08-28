@@ -281,6 +281,23 @@ pub struct VoiceMoved {
     pub moved_by: Uuid,
 }
 
+/// Inbound `voice.disconnect_member` — kick someone out of a voice channel.
+/// Owner-only for humans; any community member may target the music bot
+/// (which fully resets: stops playback, playlists, leaves).
+#[derive(Debug, Deserialize)]
+pub struct VoiceDisconnectMember {
+    pub user_id: Uuid,
+    pub channel_id: Uuid,
+}
+
+/// Outbound `voice.disconnected` — delivered only to the kicked member so
+/// their client tears its own call down.
+#[derive(Debug, Serialize, Clone)]
+pub struct VoiceDisconnected {
+    pub channel_id: Uuid,
+    pub by: Uuid,
+}
+
 #[derive(Debug, Serialize, Clone)]
 pub struct ParticipantDto {
     pub user_id: Uuid,
