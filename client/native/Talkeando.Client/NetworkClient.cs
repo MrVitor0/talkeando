@@ -6,7 +6,7 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 
-namespace Talkeando.Client;
+namespace Tupi.Client;
 
 /// Formerly declared alongside the native RtcEngine (deleted — WebRTC now
 /// runs in client/ui/src/rtc.ts, see SDD/27-decisions.md ADR-009); kept here
@@ -33,7 +33,7 @@ public sealed class NetworkClient
     public NetworkClient(SessionStore sessions)
     {
         _sessions = sessions;
-        var baseUrl = Environment.GetEnvironmentVariable("TALKEANDO_API_BASE_URL")
+        var baseUrl = Environment.GetEnvironmentVariable("TUPI_API_BASE_URL")
             ?? ReadEndpointSetting("apiBaseUrl")
             ?? "http://localhost:8080/api";
         ApiBaseUrl = baseUrl.TrimEnd('/');
@@ -76,7 +76,7 @@ public sealed class NetworkClient
     /// development workflow without asking beta users to configure anything.
     private static string? ReadEndpointSetting(string name)
     {
-        var path = Path.Combine(AppContext.BaseDirectory, "talkeando.settings.json");
+        var path = Path.Combine(AppContext.BaseDirectory, "tupi.settings.json");
         if (!File.Exists(path)) return null;
         try
         {
@@ -228,7 +228,7 @@ public sealed class NetworkClient
         using var response = await _http.SendAsync(request);
         if (!response.IsSuccessStatusCode) throw new InvalidOperationException("Não foi possível baixar o anexo.");
         var safeName = String.Concat(filename.Select(character => Path.GetInvalidFileNameChars().Contains(character) ? '_' : character));
-        var directory = Path.Combine(Path.GetTempPath(), "Talkeando", "attachments");
+        var directory = Path.Combine(Path.GetTempPath(), "Tupi", "attachments");
         Directory.CreateDirectory(directory);
         var target = Path.Combine(directory, $"{attachmentId}-{safeName}");
         await File.WriteAllBytesAsync(target, await response.Content.ReadAsByteArrayAsync());
@@ -245,7 +245,7 @@ public sealed class NetworkClient
             if (_webSocket?.State == WebSocketState.Open) return;
             _webSocket?.Dispose();
             _webSocket = new ClientWebSocket();
-            var wsUrl = Environment.GetEnvironmentVariable("TALKEANDO_WS_URL")
+            var wsUrl = Environment.GetEnvironmentVariable("TUPI_WS_URL")
                 ?? ReadEndpointSetting("webSocketUrl")
                 ?? "ws://localhost:8080/ws";
             await _webSocket.ConnectAsync(new Uri(wsUrl), CancellationToken.None);

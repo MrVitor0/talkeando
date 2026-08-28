@@ -2,7 +2,7 @@ using Microsoft.Web.WebView2.Core;
 using System.Text.Json;
 using System.Text.Json.Nodes;
 
-namespace Talkeando.Client;
+namespace Tupi.Client;
 
 /// Sole native/UI boundary. Commands are envelope-shaped (`op`, `data`) and
 /// every response is posted back as an event envelope, so the React UI never
@@ -40,6 +40,7 @@ public sealed class IpcBridge : IDisposable
     private readonly NetworkClient _network;
     private readonly ScreenCapture _screen = new();
     private readonly AudioCapture _audio = new();
+    private readonly MusicPlayback _music = new();
     private readonly ActivityMonitor _activity;
     private int _frameSeq;
     private int _audioSeq;
@@ -157,6 +158,7 @@ public sealed class IpcBridge : IDisposable
                 case "stream.unpublish":
                 case "stream.subscribe":
                 case "stream.unsubscribe":
+                case "music.command":
                 case "rtc.offer":
                 case "rtc.answer":
                 case "rtc.ice":
@@ -205,6 +207,19 @@ public sealed class IpcBridge : IDisposable
                     _screen.Stop();
                     _audio.Stop();
                     break;
+                case "music.play":
+                {
+                    var query = RequiredString(root, "query");
+                    _ = _music.PlayAsync(query, pcm =>
+                    {
+                        var slot = (int)((uint)System.Threading.Interlocked.Increment(ref _audioSeq) % (uint)AudioSlotCount);
+                        WriteAudioSlot?.Invoke(pcm, slot);
+                        Publish("music.pcm", new { slot, len = pcm.Length });
+                    }, title => Publish("music.started", new { title }), error => Publish("music.failed", new { message = error }));
+                    break;
+                }
+                case "music.pause": _music.Pause(root.GetProperty("data").TryGetProperty("paused", out var paused) && paused.GetBoolean()); break;
+                case "music.stop": _music.Stop(); break;
                 case "activity.config":
                     _activity.SetEnabled(root.GetProperty("data").GetProperty("enabled").GetBoolean());
                     break;
@@ -344,5 +359,5 @@ public sealed class IpcBridge : IDisposable
         EventReady?.Invoke(this, JsonSerializer.Serialize(new { v = 1, op, data }));
     }
 
-    public void Dispose() { _screen.Dispose(); _audio.Dispose(); _activity.Dispose(); }
+    public void Dispose() { _music.Dispose(); _screen.Dispose(); _audio.Dispose(); _activity.Dispose(); }
 }

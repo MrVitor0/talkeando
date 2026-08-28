@@ -127,6 +127,15 @@ pub async fn channel_if_member(
     .await
 }
 
+/// Unscoped channel lookup for the internal music participant. Public callers
+/// must use `channel_if_member` instead.
+pub async fn channel_by_id(pool: &PgPool, channel_id: Uuid) -> Result<Option<Channel>, sqlx::Error> {
+    sqlx::query_as::<_, Channel>("SELECT * FROM channels WHERE id = $1")
+        .bind(channel_id)
+        .fetch_optional(pool)
+        .await
+}
+
 /// The community that owns a channel, if it exists. Used to fan a voice-roster
 /// update out to the right community without loading the whole `Channel` row.
 pub async fn channel_community(

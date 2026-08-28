@@ -17,6 +17,7 @@ pub struct ParticipantState {
     pub user_id: UserId,
     pub muted: bool,
     pub deafened: bool,
+    pub is_bot: bool,
 }
 
 impl From<&ParticipantState> for ParticipantDto {
@@ -25,6 +26,7 @@ impl From<&ParticipantState> for ParticipantDto {
             user_id: p.user_id,
             muted: p.muted,
             deafened: p.deafened,
+            is_bot: p.is_bot,
         }
     }
 }
@@ -77,9 +79,10 @@ impl CallRegistry {
         user_id: UserId,
         muted: bool,
         deafened: bool,
+        is_bot: bool,
     ) -> Result<CallSnapshotView, CallOpError> {
         let call = self.calls.entry(channel_id).or_default();
-        if !call.participants.contains_key(&user_id) && call.participants.len() >= 10 {
+        if !call.participants.contains_key(&user_id) && call.participants.values().filter(|p| !p.is_bot).count() >= 10 {
             return Err(CallOpError::CallFull);
         }
         call.participants.insert(
@@ -88,12 +91,20 @@ impl CallRegistry {
                 user_id,
                 muted,
                 deafened,
+                is_bot,
             },
         );
         Ok(CallSnapshotView {
             participants: call.participants.values().map(Into::into).collect(),
             streams: call.streams.values().map(Into::into).collect(),
         })
+    }
+
+    pub fn add_bot(&mut self, channel_id: ChannelId, user_id: UserId) -> bool {
+        let call = self.calls.entry(channel_id).or_default();
+        if call.participants.contains_key(&user_id) { return false; }
+        call.participants.insert(user_id, ParticipantState { user_id, muted: true, deafened: false, is_bot: true });
+        true
     }
 
     /// Removes the participant and any streams they published (a departed
@@ -129,7 +140,7 @@ impl CallRegistry {
     pub fn is_full(&self, channel_id: ChannelId) -> bool {
         self.calls
             .get(&channel_id)
-            .map(|call| call.participants.len() >= 10)
+            .map(|call| call.participants.values().filter(|p| !p.is_bot).count() >= 10)
             .unwrap_or(false)
     }
 
@@ -154,6 +165,7 @@ impl CallRegistry {
                 muted: p.muted,
                 deafened: p.deafened,
                 sharing: call.streams.values().any(|s| s.owner == p.user_id),
+                is_bot: p.is_bot,
             })
             .collect()
     }

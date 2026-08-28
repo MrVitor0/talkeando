@@ -10,7 +10,7 @@ using Windows.Graphics.DirectX;
 using Windows.Graphics.DirectX.Direct3D11;
 using WinRT;
 
-namespace Talkeando.Client;
+namespace Tupi.Client;
 
 /// Windows.Graphics.Capture backend. Captures fullscreen-exclusive games and
 /// GPU-composited windows that the GDI path renders black, and pulls the

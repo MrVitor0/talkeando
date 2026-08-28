@@ -1,5 +1,5 @@
 /* ==========================================================================
-   Talkeando — Discord-style dark theme
+   Tupi — Discord-style dark theme
    Palette + metrics tracked to the Discord desktop client "Dark" theme.
    ========================================================================== */
 
@@ -422,6 +422,9 @@ a:hover {
   gap: 1px;
   margin: 0 0 4px 0;
 }
+.voice-members--bots { padding-top: 5px; }
+.voice-members__label { padding: 2px 8px; color: var(--muted); font-size: 10px; font-weight: 700; letter-spacing: .06em; }
+.voice-member--bot .voice-member__av { background: linear-gradient(135deg, #5865f2, #a36bff) !important; }
 .voice-member {
   position: relative;
   display: flex;
@@ -478,6 +481,19 @@ a:hover {
 .voice-member__watch:hover {
   background: var(--red-hover);
 }
+
+.voice-panel__music {
+  margin: 7px 0 2px;
+  padding: 6px 8px;
+  border-radius: 5px;
+  color: #c9cdfb;
+  background: rgba(88, 101, 242, .16);
+  font-size: 12px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.voice-panel__music span { color: #aeb4c4; }
 .voice-member__preview {
   position: fixed;
   aspect-ratio: 16 / 9;

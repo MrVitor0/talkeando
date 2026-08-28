@@ -1,4 +1,4 @@
-// Mesh WebRTC engine — moved here from client/native/Talkeando.Client/RtcEngine.cs
+// Mesh WebRTC engine — moved here from client/native/Tupi.Client/RtcEngine.cs
 // (see SDD/27-decisions.md ADR-009). Runs on the real browser RTCPeerConnection
 // inside WebView2's Chromium engine instead of a thin hand-rolled C#/libvpx
 // wrapper: real congestion control (GCC), real bitrate/rate control, real
@@ -17,6 +17,7 @@
 // the existing `Publish(op, data)` catch-all IpcBridge already had.
 import { send, subscribe, Envelope } from "./ipc";
 import { startNativeScreen, stopNativeScreen } from "./nativeScreen";
+import { pauseNativeMusic, startNativeMusic, stopNativeMusic } from "./nativeMusic";
 import * as noiseSuppression from "./noiseSuppression";
 
 type TurnCredentials = { username: string; credential: string; uris: string[] };
@@ -79,6 +80,8 @@ const screenSlots = new Map<string, ScreenSlots>();
 // Peers whose screen m-lines were changed while signalling was mid-negotiation
 // (can't createOffer yet). Retried from handleIncomingOffer/Answer once stable.
 const screenNeedsOffer = new Set<string>();
+let localMusicTrack: MediaStreamTrack | null = null;
+const musicSlots = new Map<string, RTCRtpTransceiver>();
 
 // Offers/answers we relay carry no value in their inline ICE candidates — we
 // trickle every candidate over rtc.ice anyway — and a full candidate list can
@@ -278,6 +281,7 @@ function handleIncomingOffer(data: any) {
     // Now that signalling is back to stable: (re)start the screen send for any
     // peer subscribed to it, and flush a renegotiation that had to be deferred.
     if (localScreenStream && screenSubscribers.has(peerUserId)) void applyScreenSend(peerUserId, true);
+    if (localMusicTrack) void applyMusicSend(peerUserId, true);
   });
 }
 
@@ -297,6 +301,7 @@ function handleIncomingAnswer(data: any) {
     await flushPendingCandidates(peerUserId, pc);
   }).then(() => {
     if (localScreenStream && screenSubscribers.has(peerUserId)) void applyScreenSend(peerUserId, true);
+    if (localMusicTrack) void applyMusicSend(peerUserId, true);
   });
 }
 
@@ -330,6 +335,7 @@ function closePeer(peerUserId: string) {
   const pc = peers.get(peerUserId);
   if (pc) { pc.close(); peers.delete(peerUserId); }
   screenSlots.delete(peerUserId);
+  musicSlots.delete(peerUserId);
   screenNeedsOffer.delete(peerUserId);
   spectatedStreams.delete(peerUserId);
   spectatorPeers.delete(peerUserId);
@@ -344,6 +350,20 @@ function closePeer(peerUserId: string) {
   if (audioEl) { audioEl.srcObject = null; remoteAudioEls.delete(peerUserId); }
   remoteAudioStreams.delete(peerUserId);
   emitRemoteStream(peerUserId, null);
+}
+
+async function applyMusicSend(peerUserId: string, sending: boolean) {
+  return withSdpLock(peerUserId, async () => {
+    const pc = peers.get(peerUserId); if (!pc) return;
+    let slot = musicSlots.get(peerUserId);
+    if (sending && localMusicTrack) {
+      if (!slot) { slot = pc.addTransceiver(localMusicTrack, { direction: "sendonly" }); musicSlots.set(peerUserId, slot); }
+      else { await slot.sender.replaceTrack(localMusicTrack); slot.direction = "sendonly"; }
+    } else if (slot) { await slot.sender.replaceTrack(null); slot.direction = "inactive"; }
+    if (!currentChannelId || pc.signalingState !== "stable") return;
+    const offer = await pc.createOffer(); await pc.setLocalDescription(offer);
+    sendSdp("rtc.offer", currentChannelId, peerUserId, offer.sdp);
+  });
 }
 
 /// Handles every WS event forwarded by the native host. Call this from the
@@ -362,14 +382,14 @@ function handleEnvelope(event: Envelope) {
       if (!selfUserId) break;
       for (const participant of data.participants ?? []) {
         const peerUserId: string = participant.user_id;
-        if (peerUserId !== selfUserId && selfUserId < peerUserId) void connectToPeer(peerUserId, data.channel_id);
+        if (peerUserId !== selfUserId && selfUserId < peerUserId) void connectToPeer(peerUserId, data.channel_id).then(() => { if (localMusicTrack) void applyMusicSend(peerUserId, true); });
       }
       break;
     }
     case "call.peer_joined": {
       if (data.channel_id) currentChannelId = data.channel_id;
       const peerUserId: string = data.participant.user_id;
-      if (selfUserId && peerUserId !== selfUserId && selfUserId < peerUserId) void connectToPeer(peerUserId, data.channel_id);
+      if (selfUserId && peerUserId !== selfUserId && selfUserId < peerUserId) void connectToPeer(peerUserId, data.channel_id).then(() => { if (localMusicTrack) void applyMusicSend(peerUserId, true); });
       break;
     }
     case "call.peer_left":
@@ -550,6 +570,7 @@ export async function leaveCall() {
   send("call.leave", { channel_id: currentChannelId, req_id: crypto.randomUUID() });
   for (const peerUserId of Array.from(peers.keys())) closePeer(peerUserId);
   stopNativeScreen();
+  stopNativeMusic(); localMusicTrack = null; musicSlots.clear();
   if (localScreenTrack) { localScreenTrack.stop(); localScreenTrack = null; }
   localScreenStream = null;
   screenSlots.clear();
@@ -648,6 +669,21 @@ export async function unpublishScreen(channelId: string, streamId: string) {
   localScreenStream = null;
   send("stream.unpublish", { channel_id: channelId, stream_id: streamId, req_id: crypto.randomUUID() });
 }
+
+/** Publish local-DJ audio to every call peer. The server's music stream
+ * metadata makes it visible in the roster; audio remains direct WebRTC. */
+export async function playMusic(channelId: string, streamId: string, query: string) {
+  localMusicTrack = startNativeMusic(query);
+  if (!localMusicTrack) throw new Error("Seu WebView2 não oferece AudioData/TrackGenerator.");
+  for (const peerUserId of peers.keys()) await applyMusicSend(peerUserId, true);
+  send("stream.publish", { channel_id: channelId, stream_id: streamId, kind: "music", label: query, has_audio: true, req_id: crypto.randomUUID() });
+}
+export async function stopMusic(channelId: string, streamId: string) {
+  for (const peerUserId of peers.keys()) await applyMusicSend(peerUserId, false);
+  stopNativeMusic(); localMusicTrack = null;
+  send("stream.unpublish", { channel_id: channelId, stream_id: streamId, req_id: crypto.randomUUID() });
+}
+export function setMusicPaused(paused: boolean) { pauseNativeMusic(paused); }
 
 export function watchStream(channelId: string, streamId: string, ownerUserId: string) {
   console.log(`[rtc] watchStream: subscribing to ${ownerUserId}'s stream ${streamId}`);

@@ -8,7 +8,7 @@ using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 
-namespace Talkeando.Client;
+namespace Tupi.Client;
 
 /// One selectable capture target shown in the in-app (Discord-style) picker.
 /// `Thumbnail` is a small `data:image/jpeg;base64,...` URL so the React side
@@ -114,7 +114,7 @@ public sealed class ScreenCapture : IDisposable
             var title = new StringBuilder(512);
             GetWindowText(hWnd, title, title.Capacity);
             var name = title.ToString();
-            if (name is "Talkeando" || name.StartsWith("Talkeando (")) return true;
+            if (name is "Tupi" || name.StartsWith("Tupi (")) return true;
 
             var handle = hWnd;
             sources.Add(new CaptureSource($"window:{hWnd.ToInt64()}", "window", name,
@@ -201,8 +201,8 @@ public sealed class ScreenCapture : IDisposable
     {
         // Prefer WGC (fullscreen games, GPU-composited windows, native cursor);
         // fall back to the GDI loop if it can't attach to this source.
-        // TALKEANDO_DISABLE_WGC=1 forces the GDI path (escape hatch, no rebuild).
-        if (Environment.GetEnvironmentVariable("TALKEANDO_DISABLE_WGC") is "1" or "true")
+        // TUPI_DISABLE_WGC=1 forces the GDI path (escape hatch, no rebuild).
+        if (Environment.GetEnvironmentVariable("TUPI_DISABLE_WGC") is "1" or "true")
         {
             DebugLog.Write("ScreenCapture: WGC disabled by env var, using GDI");
             GdiLoop();

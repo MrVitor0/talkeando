@@ -1,5 +1,5 @@
 //! Ephemeral per-user "rich presence" — what a member is playing or
-//! listening to outside Talkeando. Sibling of the presence registry: held
+//! listening to outside Tupi. Sibling of the presence registry: held
 //! in memory on the `Hub`, never persisted, rebuilt empty on restart
 //! (canon §6). Spec: SDD/specs/activity.md.
 

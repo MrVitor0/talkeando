@@ -8,7 +8,7 @@ using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
 
-namespace Talkeando.Client;
+namespace Tupi.Client;
 
 /// A game's rich presence, as received over the Discord IPC pipe.
 public sealed record RpcActivity(
@@ -305,13 +305,13 @@ public sealed class DiscordRpcListener : IDisposable
     private const string ReadyFrame =
         "{\"cmd\":\"DISPATCH\",\"evt\":\"READY\",\"data\":{\"v\":1," +
         "\"config\":{\"cdn_host\":\"cdn.discordapp.com\",\"api_endpoint\":\"//discord.com/api\",\"environment\":\"production\"}," +
-        "\"user\":{\"id\":\"0\",\"username\":\"talkeando\",\"discriminator\":\"0000\",\"avatar\":null}}}";
+        "\"user\":{\"id\":\"0\",\"username\":\"tupi\",\"discriminator\":\"0000\",\"avatar\":null}}}";
 
     private static HttpClient CreateHttpClient()
     {
         var client = new HttpClient { Timeout = TimeSpan.FromSeconds(6) };
         // The Discord API rejects requests without a User-Agent.
-        client.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue("Talkeando", "1.0"));
+        client.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue("Tupi", "1.0"));
         return client;
     }
 

@@ -1,0 +1,63 @@
+name: Build Windows client
+
+on:
+  workflow_dispatch:
+    inputs:
+      version_label:
+        description: 'Rótulo opcional do artefato (ex.: beta-1)'
+        required: false
+        default: beta
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Tupi Windows x64
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: client/ui/package-lock.json
+
+      - name: Build web interface
+        working-directory: client/ui
+        run: |
+          npm ci
+          npm run build
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '6.0.x'
+
+      - name: Publish self-contained executable
+        run: >
+          dotnet publish client/native/Talkeando.Client/Talkeando.Client.csproj
+          --configuration Release
+          --runtime win-x64
+          --self-contained true
+          -p:PublishSingleFile=true
+          -p:IncludeNativeLibrariesForSelfExtract=true
+          --output release/Tupi-win-x64
+
+      - name: Write release notes
+        shell: pwsh
+        run: |
+          @"
+          Talkeando — ${{ inputs.version_label }}
+
+          Extraia todo o ZIP e execute Tupi.exe.
+          Esta build usa a API de produção configurada em tupi.settings.json.
+          "@ | Set-Content -NoNewline release/Tupi-win-x64/LEIA-ME.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Tupi-${{ inputs.version_label }}-win-x64
+          path: release/Tupi-win-x64
+          if-no-files-found: error
+          retention-days: 30

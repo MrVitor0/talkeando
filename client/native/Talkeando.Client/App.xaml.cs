@@ -1,3 +1,3 @@
-namespace Talkeando.Client;
+namespace Tupi.Client;
 
 public partial class App : System.Windows.Application { }

@@ -1,14 +1,14 @@
 [package]
-name = "talkeando-server"
+name = "tupi-server"
 version = "0.1.0"
 edition = "2021"
 
 [lib]
-name = "talkeando_server"
+name = "tupi_server"
 path = "src/lib.rs"
 
 [[bin]]
-name = "talkeando-server"
+name = "tupi-server"
 path = "src/main.rs"
 
 [dependencies]

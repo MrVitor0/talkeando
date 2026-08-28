@@ -124,7 +124,7 @@ async fn a_user_outside_the_community_cannot_download_an_attachment() {
         .await
         .unwrap();
     let outsider_token = {
-        let password_hash = talkeando_server::auth::hash_password("outsider-pass-123").unwrap();
+        let password_hash = tupi_server::auth::hash_password("outsider-pass-123").unwrap();
         let outsider_id: (uuid::Uuid,) = sqlx::query_as(
             "INSERT INTO users (username, display_name, password_hash) VALUES ('outsider', 'Outsider', $1) RETURNING id",
         )

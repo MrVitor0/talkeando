@@ -2,7 +2,7 @@
 ; Build input: dotnet publish Talkeando.Client.csproj -c Release -r win-x64
 ; The build pipeline supplies AppVersion and PublishDir; no secrets belong here.
 
-#define AppName "Talkeando"
+#define AppName "Tupi"
 #ifndef AppVersion
   #define AppVersion "0.1.0"
 #endif
@@ -14,18 +14,18 @@
 AppId={{C4DAA7EE-29E3-46D0-95F3-83464A9CD006}
 AppName={#AppName}
 AppVersion={#AppVersion}
-AppPublisher=Talkeando
-DefaultDirName={autopf}\Talkeando
-DefaultGroupName=Talkeando
+AppPublisher=Tupi
+DefaultDirName={autopf}\Tupi
+DefaultGroupName=Tupi
 OutputDir=output
-OutputBaseFilename=Talkeando-Setup-{#AppVersion}-x64
+OutputBaseFilename=Tupi-Setup-{#AppVersion}-x64
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 PrivilegesRequired=lowest
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
-UninstallDisplayIcon={app}\Talkeando.Client.exe
+UninstallDisplayIcon={app}\Tupi.exe
 
 [Files]
 Source: "{#PublishDir}\*"; DestDir: "{app}"; Flags: recursesubdirs ignoreversion
@@ -33,15 +33,15 @@ Source: "{#PublishDir}\*"; DestDir: "{app}"; Flags: recursesubdirs ignoreversion
 Source: "MicrosoftEdgeWebview2Setup.exe"; DestDir: "{tmp}"; Flags: deleteafterinstall skipifsourcedoesntexist
 
 [Icons]
-Name: "{autoprograms}\Talkeando"; Filename: "{app}\Talkeando.Client.exe"
-Name: "{autodesktop}\Talkeando"; Filename: "{app}\Talkeando.Client.exe"; Tasks: desktopicon
+Name: "{autoprograms}\Tupi"; Filename: "{app}\Tupi.exe"
+Name: "{autodesktop}\Tupi"; Filename: "{app}\Tupi.exe"; Tasks: desktopicon
 
 [Tasks]
 Name: "desktopicon"; Description: "Criar atalho na área de trabalho"; Flags: unchecked
 
 [Run]
 Filename: "{tmp}\MicrosoftEdgeWebview2Setup.exe"; Parameters: "/silent /install"; Flags: waituntilterminated skipifdoesntexist; Check: not WebViewRuntimeInstalled
-Filename: "{app}\Talkeando.Client.exe"; Description: "Abrir Talkeando"; Flags: nowait postinstall skipifsilent
+Filename: "{app}\Tupi.exe"; Description: "Abrir Tupi"; Flags: nowait postinstall skipifsilent
 
 [Code]
 // GUID verified against a real WebView2 Runtime install (2026-08-27):

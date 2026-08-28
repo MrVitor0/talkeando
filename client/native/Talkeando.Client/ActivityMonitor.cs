@@ -8,9 +8,9 @@ using Windows.Media;
 using Windows.Media.Control;
 using Windows.Storage.Streams;
 
-namespace Talkeando.Client;
+namespace Tupi.Client;
 
-/// SDD/specs/activity.md. Reports what the user is doing outside Talkeando as
+/// SDD/specs/activity.md. Reports what the user is doing outside Tupi as
 /// `activity.report` frames over the authenticated WebSocket:
 ///   Phase 1 — whatever is playing via the Windows System Media Transport
 ///             Controls (Spotify, a browser tab, VLC, …).

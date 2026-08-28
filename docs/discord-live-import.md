@@ -16,7 +16,7 @@ $secure = Read-Host 'Cole a credencial de sessão do Discord' -AsSecureString
 $ptr = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secure)
 try {
   $env:DISCORD_AUTHORIZATION = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($ptr)
-  docker compose -f infra/docker-compose.production.yml run --rm -e DISCORD_AUTHORIZATION talkeando-server import-discord-live
+  docker compose -f infra/docker-compose.production.yml run --rm -e DISCORD_AUTHORIZATION talkeando-server import-discord-live --replace-imported
 } finally {
   if ($ptr -ne [IntPtr]::Zero) { [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($ptr) }
   Remove-Item Env:DISCORD_AUTHORIZATION -ErrorAction SilentlyContinue

@@ -10,7 +10,7 @@
 //! and safe to run in parallel (the default `cargo test` behavior).
 
 use sqlx::{postgres::PgPoolOptions, Executor, PgPool};
-use talkeando_server::{build_app, config::Config, run_migrations, state::AppState};
+use tupi_server::{build_app, config::Config, run_migrations, state::AppState};
 use uuid::Uuid;
 
 pub struct TestApp {
@@ -35,7 +35,7 @@ impl TestApp {
                  (set TEST_DATABASE_ADMIN_URL, or run infra/docker-compose.yml's postgres service)",
             );
 
-        let db_name = format!("talkeando_test_{}", Uuid::new_v4().simple());
+        let db_name = format!("tupi_test_{}", Uuid::new_v4().simple());
         admin_pool
             .execute(format!("CREATE DATABASE \"{db_name}\"").as_str())
             .await
@@ -49,7 +49,7 @@ impl TestApp {
             .expect("connect to freshly created test database");
         run_migrations(&pool).await.expect("run migrations against test database");
 
-        let attachment_dir = std::env::temp_dir().join(format!("talkeando-test-attachments-{db_name}"));
+        let attachment_dir = std::env::temp_dir().join(format!("tupi-test-attachments-{db_name}"));
         tokio::fs::create_dir_all(&attachment_dir).await.expect("create test attachment dir");
 
         let config = Config {
@@ -111,7 +111,7 @@ impl TestApp {
     /// route — see specs/auth.md "no open self-signup"). Returns
     /// (owner_token, owner_user_id, community_id, general_text_channel_id).
     pub async fn bootstrap(&self) -> Bootstrapped {
-        let password_hash = talkeando_server::auth::hash_password("owner-password-123").unwrap();
+        let password_hash = tupi_server::auth::hash_password("owner-password-123").unwrap();
         let community_id: (Uuid,) = sqlx::query_as("INSERT INTO communities (name) VALUES ('Test') RETURNING id")
             .fetch_one(&self.pool)
             .await

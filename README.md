@@ -1,7 +1,8 @@
-# Talkeando
+# Tupi
 
-Discord-style private voice/text/screen-share app for a ~10-person
-community. Rust backend, C#/WPF+WebView2 native Windows client, React UI.
+Tupi é um app privado para comunidades pequenas: conversa por texto, voz e
+compartilhamento de tela. Backend em Rust, cliente Windows nativo em C#/WPF +
+WebView2 e interface em React.
 See `SDD/` for the full design; `SDD/31-implementation-status.md` for
 exactly what's implemented vs. still pending.
 

@@ -2,7 +2,7 @@ using System.IO;
 using System.Security.Cryptography;
 using System.Text;
 
-namespace Talkeando.Client;
+namespace Tupi.Client;
 
 /// DPAPI-backed token persistence. The browser layer receives session state,
 /// never the bearer token itself.
@@ -10,7 +10,7 @@ public sealed class SessionStore
 {
     private static readonly string DefaultPath = System.IO.Path.Combine(
         Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-        "Talkeando", $"session{Profile.Suffix}.bin");
+        "Tupi", $"session{Profile.Suffix}.bin");
 
     private readonly string _path;
 

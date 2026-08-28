@@ -1,4 +1,4 @@
-//! Wire format for the Talkeando signaling/chat/presence WebSocket protocol.
+//! Wire format for the Tupi signaling/chat/presence WebSocket protocol.
 //! Canonical catalog: SDD/09-websocket-protocol.md. Envelope shape:
 //! `{ "v": 1, "op": "<namespace>.<action>", "data": { ... } }`.
 
@@ -93,7 +93,7 @@ pub struct PresenceSet {
 
 // ---- activity.* ----
 // Ephemeral "rich presence": what a member is playing/listening to outside
-// Talkeando. Client-detected (native SMTC / process scan), never persisted.
+// Tupi. Client-detected (native SMTC / process scan), never persisted.
 // Catalog: SDD/specs/activity.md.
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -267,6 +267,8 @@ pub struct ParticipantDto {
     pub user_id: Uuid,
     pub muted: bool,
     pub deafened: bool,
+    #[serde(default)]
+    pub is_bot: bool,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -296,6 +298,8 @@ pub struct CallPeerLeft {
     pub channel_id: Uuid,
     pub user_id: Uuid,
     pub reason: String,
+    #[serde(default)]
+    pub is_bot: bool,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -317,6 +321,8 @@ pub struct VoiceRosterEntry {
     pub muted: bool,
     pub deafened: bool,
     pub sharing: bool,
+    #[serde(default)]
+    pub is_bot: bool,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -422,6 +428,17 @@ pub struct StreamUnsubscribed {
     pub channel_id: Uuid,
     pub stream_id: Uuid,
     pub subscriber: Uuid,
+}
+
+// ---- music.* ---- Local-DJ control plane. Playback is never proxied by the
+// server; this just selects the client that owns the WebRTC music track.
+#[derive(Debug, Deserialize, Clone)]
+pub struct MusicCommand {
+    pub channel_id: Uuid, // chat channel where the bot replies
+    pub voice_channel_id: Uuid,
+    pub command: String, // play | pause | resume | skip | stop | queue
+    #[serde(default)]
+    pub query: Option<String>,
 }
 
 // ---- device.* ----

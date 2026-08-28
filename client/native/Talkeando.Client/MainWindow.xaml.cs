@@ -5,7 +5,7 @@ using System.Windows;
 using System.Windows.Interop;
 using System.Windows.Media;
 
-namespace Talkeando.Client;
+namespace Tupi.Client;
 
 public partial class MainWindow : System.Windows.Window
 {
@@ -41,8 +41,8 @@ public partial class MainWindow : System.Windows.Window
     {
         InitializeComponent();
         _baseTitle = Profile.Suffix.Length > 0
-            ? $"Talkeando ({Profile.Suffix.TrimStart('-')})"
-            : "Talkeando";
+            ? $"Tupi ({Profile.Suffix.TrimStart('-')})"
+            : "Tupi";
         Title = _baseTitle;
         TitleText.Text = _baseTitle;
         // The UI tells us the active community name so the custom title bar can
@@ -185,7 +185,7 @@ public partial class MainWindow : System.Windows.Window
             DebugLog.Write("InitializeWebViewAsync: starting");
             var userDataFolder = Path.Combine(
                 Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-                "Talkeando", $"WebView2{Profile.Suffix}");
+                "Tupi", $"WebView2{Profile.Suffix}");
             Directory.CreateDirectory(userDataFolder);
             var environment = await CoreWebView2Environment.CreateAsync(userDataFolder: userDataFolder);
             _environment = environment;
@@ -235,14 +235,14 @@ public partial class MainWindow : System.Windows.Window
             // instead of file://, which WebView2 supports natively.
             var uiFolder = Path.Combine(AppContext.BaseDirectory, "ui");
             WebView.CoreWebView2.SetVirtualHostNameToFolderMapping(
-                "talkeando.local", uiFolder, CoreWebView2HostResourceAccessKind.Allow);
+                "tupi.local", uiFolder, CoreWebView2HostResourceAccessKind.Allow);
 
             // Hand the UI its screen-capture shared buffer once the page's
             // module scripts have registered their `sharedbufferreceived`
             // listener (i.e. after the first navigation completes).
             WebView.CoreWebView2.NavigationCompleted += (_, _) => SetUpFrameBuffer();
 
-            WebView.CoreWebView2.Navigate("https://talkeando.local/index.html");
+            WebView.CoreWebView2.Navigate("https://tupi.local/index.html");
             DebugLog.Write("InitializeWebViewAsync: navigated, publishing host.ready");
             _bridge.Publish("host.ready", new { });
         }
@@ -255,9 +255,9 @@ public partial class MainWindow : System.Windows.Window
                 "Não foi possível iniciar o WebView2.\n\n" +
                 "Isso normalmente significa que o WebView2 Runtime não está instalado. " +
                 "Baixe e instale o 'Evergreen Bootstrapper' em https://developer.microsoft.com/microsoft-edge/webview2/ " +
-                "e abra o Talkeando novamente.\n\n" +
+                "e abra o Tupi novamente.\n\n" +
                 $"Detalhe técnico: {exception.Message}",
-                "Talkeando — falha ao iniciar",
+                "Tupi — falha ao iniciar",
                 MessageBoxButton.OK,
                 MessageBoxImage.Error);
             Close();

@@ -1,7 +1,7 @@
-using Talkeando.Client;
+using Tupi.Client;
 using Xunit;
 
-namespace Talkeando.Client.Tests;
+namespace Tupi.Client.Tests;
 
 /// Every test uses its own temp file path — never the real
 /// %LOCALAPPDATA%\Talkeando\session.bin (see SessionStore's constructor
@@ -9,7 +9,7 @@ namespace Talkeando.Client.Tests;
 /// session on the machine running them.
 public sealed class SessionStoreTests : IDisposable
 {
-    private readonly string _path = Path.Combine(Path.GetTempPath(), $"talkeando-test-session-{Guid.NewGuid()}.bin");
+    private readonly string _path = Path.Combine(Path.GetTempPath(), $"tupi-test-session-{Guid.NewGuid()}.bin");
 
     [Fact]
     public void HasToken_is_false_when_nothing_was_ever_saved()

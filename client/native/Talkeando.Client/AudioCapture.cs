@@ -2,7 +2,7 @@ using System;
 using System.Runtime.InteropServices;
 using System.Threading;
 
-namespace Talkeando.Client;
+namespace Tupi.Client;
 
 /// WASAPI process-loopback capture (Windows 10 build 19041+ — matches this
 /// project's target framework).

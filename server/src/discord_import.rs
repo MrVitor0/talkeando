@@ -203,7 +203,7 @@ pub async fn import_har(pool: &PgPool, config: &Config, har_path: &Path) -> Resu
 pub async fn import_live(pool: &PgPool, config: &Config, authorization: &str) -> Result<()> {
     if authorization.trim().is_empty() { bail!("DISCORD_AUTHORIZATION is empty"); }
     let client = reqwest::Client::builder()
-        .user_agent("Mozilla/5.0 (Talkeando personal history migration)")
+        .user_agent("Mozilla/5.0 (Tupi personal history migration)")
         .build()?;
     tokio::fs::create_dir_all(&config.attachment_storage_path).await?;
     let mut imported = 0usize;
@@ -221,7 +221,7 @@ pub async fn import_live(pool: &PgPool, config: &Config, authorization: &str) ->
             if let Some(before) = &before { url.push_str("&before="); url.push_str(before); }
             let response = client.get(&url)
                 .header(AUTHORIZATION, authorization)
-                .header(USER_AGENT, "Mozilla/5.0 (Talkeando personal history migration)")
+                .header(USER_AGENT, "Mozilla/5.0 (Tupi personal history migration)")
                 .send().await?;
             if response.status() == StatusCode::TOO_MANY_REQUESTS {
                 let delay = response.json::<serde_json::Value>().await.ok()
@@ -281,6 +281,31 @@ pub async fn import_live(pool: &PgPool, config: &Config, authorization: &str) ->
     }
     println!("Discord live import complete: {imported} messages inserted, {updated} updated, {attachments} attachments downloaded.");
     Ok(())
+}
+
+/// Removes only the records owned by the Discord importer, never messages
+/// authored in Talkeando. Files are removed after the database transaction so
+/// a failed delete cannot leave history referring to missing media.
+pub async fn replace_with_live(pool: &PgPool, config: &Config, authorization: &str) -> Result<()> {
+    let attachment_paths: Vec<(String,)> = sqlx::query_as(
+        "SELECT a.storage_path FROM attachments a JOIN imported_message_sources s ON s.message_id = a.message_id WHERE s.source = $1",
+    ).bind(DISCORD_SOURCE).fetch_all(pool).await?;
+    let preview_paths: Vec<(String,)> = sqlx::query_as(
+        "SELECT p.image_storage_path FROM message_link_previews p JOIN imported_message_sources s ON s.message_id = p.message_id \
+         WHERE s.source = $1 AND p.image_storage_path IS NOT NULL",
+    ).bind(DISCORD_SOURCE).fetch_all(pool).await?;
+    let deleted = sqlx::query(
+        "DELETE FROM messages WHERE id IN (SELECT message_id FROM imported_message_sources WHERE source = $1)",
+    ).bind(DISCORD_SOURCE).execute(pool).await?.rows_affected();
+    for (path,) in attachment_paths.into_iter().chain(preview_paths) {
+        if let Err(error) = tokio::fs::remove_file(path).await {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                eprintln!("Unable to remove replaced imported media: {error}");
+            }
+        }
+    }
+    println!("Removed {deleted} previously imported Discord messages. Starting clean import.");
+    import_live(pool, config, authorization).await
 }
 
 fn messages_from_har(har: Har) -> Result<HashMap<String, Vec<DiscordMessage>>> {

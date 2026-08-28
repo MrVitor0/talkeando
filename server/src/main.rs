@@ -4,7 +4,7 @@ use clap::{Parser, Subcommand};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::Executor;
 
-use talkeando_server::{auth, build_app, config::Config, discord_import, run_migrations, state::AppState, telemetry};
+use tupi_server::{auth, build_app, config::Config, discord_import, run_migrations, state::AppState, telemetry};
 
 #[derive(Parser)]
 struct Cli {
@@ -33,6 +33,14 @@ enum Command {
         /// HAR file copied from the machine that captured the Discord history.
         #[arg(long)]
         har_path: PathBuf,
+    },
+    /// Imports all approved Discord channels using a temporary credential in
+    /// DISCORD_AUTHORIZATION. The secret is never stored by Tupi.
+    ImportDiscordLive {
+        /// Delete only messages previously imported from Discord before the
+        /// fresh import. Messages authored in Tupi remain untouched.
+        #[arg(long)]
+        replace_imported: bool,
     },
 }
 
@@ -77,6 +85,15 @@ async fn main() -> anyhow::Result<()> {
         Command::ImportDiscordHar { har_path } => {
             discord_import::import_har(&pool, &config, &har_path).await
         }
+        Command::ImportDiscordLive { replace_imported } => {
+            let authorization = std::env::var("DISCORD_AUTHORIZATION")
+                .map_err(|_| anyhow::anyhow!("set DISCORD_AUTHORIZATION for this one command; do not put it in .env"))?;
+            if replace_imported {
+                discord_import::replace_with_live(&pool, &config, &authorization).await
+            } else {
+                discord_import::import_live(&pool, &config, &authorization).await
+            }
+        }
     }
 }
 
@@ -89,7 +106,7 @@ async fn serve(pool: sqlx::PgPool, config: Config) -> anyhow::Result<()> {
     .await?;
     // ACT-FR-031: a previous run may have crashed with playtime rows still
     // open; close them (worth zero seconds — real duration is unknown).
-    match talkeando_server::db::close_dangling_game_sessions(&pool).await {
+    match tupi_server::db::close_dangling_game_sessions(&pool).await {
         Ok(closed) if closed > 0 => tracing::info!(closed, "closed dangling game sessions from a prior run"),
         Ok(_) => {}
         Err(error) => tracing::warn!(%error, "failed to close dangling game sessions"),
@@ -99,7 +116,7 @@ async fn serve(pool: sqlx::PgPool, config: Config) -> anyhow::Result<()> {
 
     let app = build_app(state);
 
-    tracing::info!(%bind_addr, "starting talkeando-server");
+    tracing::info!(%bind_addr, "starting tupi-server");
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
     axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await?;
     Ok(())

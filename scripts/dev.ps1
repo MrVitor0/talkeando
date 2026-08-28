@@ -16,7 +16,7 @@
     5. Build the React UI (client/ui) unless -SkipUiBuild - the native client
        only ever loads the built dist/, never live source.
     6. Build the native client once, then launch two instances with
-       TALKEANDO_PROFILE=alice and =bob, each in its own titled window.
+       TUPI_PROFILE=alice and =bob, each in its own titled window.
 
   Everything talks to the same local backend, so a call / screen share
   between the two windows is a real P2P connection over loopback.
@@ -179,14 +179,14 @@ Info "server/.env BIND_ADDR -> 127.0.0.1:$BindPort"
 Step 'Building server (cargo build)'
 Push-Location $ServerDir
 try {
-    cargo build --bin talkeando-server
+    cargo build --bin tupi-server
     if ($LASTEXITCODE -ne 0) { throw 'cargo build failed.' }
 
     Step 'Running bootstrap-owner (idempotent - fine if the community already exists)'
     # Redirect every stream to a file so a stderr line can never be turned
     # into a terminating error under $ErrorActionPreference = 'Stop'.
     $bootstrapLog = New-TemporaryFile
-    & cargo run --quiet --bin talkeando-server -- bootstrap-owner `
+    & cargo run --quiet --bin tupi-server -- bootstrap-owner `
         --username $Owner.Username --password $Owner.Password --display-name $Owner.Display *> $bootstrapLog.FullName
     $bootstrapExit = $LASTEXITCODE
     $bootstrap = Get-Content $bootstrapLog.FullName -Raw
@@ -202,20 +202,20 @@ $portOwner = 'free'
 if (Test-Port $BindPort) {
     $portOwner = 'foreign'
     try {
-        # An endpoint that should 401 without a token. Only talkeando answers 401.
+        # An endpoint that should 401 without a token. Only Tupi answers 401.
         Invoke-WebRequest -Uri "$ApiBase/community" -Method GET -UseBasicParsing -TimeoutSec 3 | Out-Null
     } catch {
         $response = $_.Exception.Response
-        if ($response -and [int]$response.StatusCode -eq 401) { $portOwner = 'talkeando' }
+        if ($response -and [int]$response.StatusCode -eq 401) { $portOwner = 'tupi' }
     }
 }
-if ($portOwner -eq 'talkeando') {
-    Info "A talkeando-server is already running on :$BindPort - reusing it."
+if ($portOwner -eq 'tupi') {
+    Info "A tupi-server is already running on :$BindPort - reusing it."
 } elseif ($portOwner -eq 'foreign') {
-    throw "Port $BindPort is held by another process that is not talkeando-server. Stop it (or change `$BindPort in scripts\dev.ps1) and retry."
+    throw "Port $BindPort is held by another process that is not tupi-server. Stop it (or change `$BindPort in scripts\dev.ps1) and retry."
 } else {
     Step 'Starting the server in its own window'
-    Start-InWindow 'talkeando-server' $ServerDir 'cargo run --bin talkeando-server'
+    Start-InWindow 'tupi-server' $ServerDir 'cargo run --bin tupi-server'
 }
 
 Step 'Waiting for the server to answer'
@@ -285,13 +285,13 @@ if ($NoClients) {
 }
 
 Step 'Launching two client windows'
-$clientEnv = "`$env:TALKEANDO_API_BASE_URL='$ApiBase'; `$env:TALKEANDO_WS_URL='$WsUrl'; "
-Start-InWindow "talkeando-client:$($Owner.Username)"  $ClientDir "$clientEnv`$env:TALKEANDO_PROFILE='$($Owner.Username)'; dotnet run --no-build --no-restore"
+$clientEnv = "`$env:TUPI_API_BASE_URL='$ApiBase'; `$env:TUPI_WS_URL='$WsUrl'; "
+Start-InWindow "tupi-client:$($Owner.Username)"  $ClientDir "$clientEnv`$env:TUPI_PROFILE='$($Owner.Username)'; dotnet run --no-build --no-restore"
 Start-Sleep -Seconds 2
-Start-InWindow "talkeando-client:$($Member.Username)" $ClientDir "$clientEnv`$env:TALKEANDO_PROFILE='$($Member.Username)'; dotnet run --no-build --no-restore"
+Start-InWindow "tupi-client:$($Member.Username)" $ClientDir "$clientEnv`$env:TUPI_PROFILE='$($Member.Username)'; dotnet run --no-build --no-restore"
 
 Write-Host "`nAll set." -ForegroundColor Green
-Write-Host "  window 'talkeando-client:$($Owner.Username)'  -> log in as $($Owner.Username) / $($Owner.Password)  (community owner)"
-Write-Host "  window 'talkeando-client:$($Member.Username)'    -> log in as $($Member.Username) / $($Member.Password)"
-Write-Host "`nServer runs in the 'talkeando-server' window (Ctrl+C there to stop it)."
+Write-Host "  window 'tupi-client:$($Owner.Username)'  -> log in as $($Owner.Username) / $($Owner.Password)  (community owner)"
+Write-Host "  window 'tupi-client:$($Member.Username)'    -> log in as $($Member.Username) / $($Member.Password)"
+Write-Host "`nServer runs in the 'tupi-server' window (Ctrl+C there to stop it)."
 Write-Host "Postgres stays up in Docker: 'docker compose -f infra/docker-compose.yml stop' to stop it."

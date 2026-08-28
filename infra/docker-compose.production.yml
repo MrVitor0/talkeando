@@ -1,7 +1,7 @@
 name: talkeando
 
 services:
-  talkeando-server:
+  tupi-server:
     build:
       context: ../server
     restart: unless-stopped
@@ -12,15 +12,31 @@ services:
       TURN_REALM: ${TURN_REALM:?set in production env}
       TURN_URIS: ${TURN_URIS:?set in production env}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:?set in production env}
-      ATTACHMENT_STORAGE_PATH: /var/lib/talkeando/attachments
+      ATTACHMENT_STORAGE_PATH: /var/lib/tupi/attachments
     volumes:
-      - attachments_data:/var/lib/talkeando/attachments
+      - attachments_data:/var/lib/tupi/attachments
+
+  music-bot:
+    build:
+      context: ../music-bot
+    restart: unless-stopped
+    depends_on:
+      - tupi-server
+    environment:
+      TUPI_WS_URL: ws://tupi-server:8080/ws
+      # Falls back to TURN_SHARED_SECRET in the bot for existing deployments;
+      # set MUSIC_BOT_TOKEN in .env later to rotate it independently.
+      MUSIC_BOT_TOKEN: ${MUSIC_BOT_TOKEN:-}
+      TURN_SHARED_SECRET: ${TURN_SHARED_SECRET:?set in production env}
+      TURN_URIS: ${TURN_URIS:?set in production env}
+      SPOTIFY_CLIENT_ID: ${SPOTIFY_CLIENT_ID:-}
+      SPOTIFY_CLIENT_SECRET: ${SPOTIFY_CLIENT_SECRET:-}
 
   caddy:
     image: caddy:2.10-alpine
     restart: unless-stopped
     depends_on:
-      - talkeando-server
+      - tupi-server
     environment:
       API_DOMAIN: ${API_DOMAIN:?set in production env}
     ports:

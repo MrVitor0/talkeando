@@ -1,0 +1,7 @@
+{
+  "name": "tupi-music-bot",
+  "private": true,
+  "version": "0.1.0",
+  "engines": { "node": ">=18 <19" },
+  "dependencies": { "wrtc": "0.4.7", "ws": "8.18.0" }
+}

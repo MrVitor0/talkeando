@@ -6,6 +6,7 @@ on:
     paths:
       - 'server/**'
       - 'infra/**'
+      - 'music-bot/**'
       - '.github/workflows/deploy-production.yml'
   workflow_dispatch:
 
@@ -46,6 +47,7 @@ jobs:
             --exclude='server/target' \
             --exclude='infra/.env' \
             server \
+            music-bot \
             infra/Caddyfile \
             infra/docker-compose.production.yml \
           | ssh -i ~/.ssh/talkeando-production "ubuntu@$DEPLOY_HOST" '

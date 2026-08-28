@@ -24,12 +24,12 @@ type Message = {
 // the server's idempotency key (channel_id, author_id, req_id) resolves a
 // duplicate send to the original row instead of inserting a second message.
 const SEND_TIMEOUT_MS = 8000;
-type Participant = { user_id: string; muted: boolean; deafened: boolean };
+type Participant = { user_id: string; muted: boolean; deafened: boolean; is_bot?: boolean };
 type StreamInfo = { stream_id: string; owner: string; kind: string; label?: string | null };
 // Community-wide projection of a voice channel's occupants — kept live for
 // every voice channel, not just the one this client has joined.
-type VoiceRosterEntry = { user_id: string; muted: boolean; deafened: boolean; sharing: boolean };
-// Rich presence: what a member is doing outside Talkeando (see
+type VoiceRosterEntry = { user_id: string; muted: boolean; deafened: boolean; sharing: boolean; is_bot?: boolean };
+// Rich presence: what a member is doing outside Tupi (see
 // SDD/specs/activity.md). Detected by the native client, relayed by the
 // server; here it is read-only display data keyed by user_id.
 type ActivityDto = {
@@ -426,6 +426,8 @@ export function App() {
   const [deafened, setDeafened] = useState(false);
   const [streams, setStreams] = useState<StreamInfo[]>([]);
   const [mySharingStreamId, setMySharingStreamId] = useState<string | null>(null);
+  const [myMusicStreamId, setMyMusicStreamId] = useState<string | null>(null);
+  const musicStreamRef = useRef<string | null>(null);
   // Resolution + frame-rate are chosen in the screen-share wizard now
   // (ScreenPicker), not a standalone dropdown. libwebrtc honours these for real
   // (unlike the old pinned VP8 wrapper's TargetKbps — SDD/27-decisions.md
@@ -559,6 +561,22 @@ export function App() {
         if (removed) setWatching(watch => { const next = { ...watch }; delete next[removed.owner]; return next; });
         return current.filter(stream => stream.stream_id !== event.data.stream_id);
       });
+      if (event.op === "music.command") {
+        const command: string = event.data.command;
+        const voiceChannelId: string = event.data.voice_channel_id;
+        if (command === "play" && event.data.query) {
+          const streamId = crypto.randomUUID(); musicStreamRef.current = streamId; setMyMusicStreamId(streamId);
+          void rtc.playMusic(voiceChannelId, streamId, event.data.query).catch(error => console.error("[music] play failed", error));
+        } else if (command === "pause") rtc.setMusicPaused(true);
+        else if (command === "resume") rtc.setMusicPaused(false);
+        else if (command === "stop" || command === "skip") {
+          const streamId = musicStreamRef.current;
+          if (streamId) { void rtc.stopMusic(voiceChannelId, streamId); musicStreamRef.current = null; setMyMusicStreamId(null); }
+        }
+      }
+      if (event.op === "music.announcement" && event.data.channel_id === activeChannel?.id) {
+        setMessages(current => [...current, { id: crypto.randomUUID(), content: event.data.content, created_at: new Date().toISOString(), author: { display_name: "Tupi Música" } }]);
+      }
       if (event.op === "chat.history") {
         const historyChannelId: string | undefined = event.data.channel_id ?? event.data.messages?.[0]?.channel_id;
         const historyMessages: Message[] = event.data.messages ?? [];
@@ -778,6 +796,12 @@ export function App() {
   function submitMessage(event: FormEvent) {
     event.preventDefault();
     if (!activeChannel || (!content.trim() && attachmentIds.length === 0)) return;
+    const music = content.trim().match(/^\/(play|pause|resume|skip|stop|queue)(?:\s+(.+))?$/i);
+    if (music) {
+      if (!call) return;
+      send("music.command", { channel_id: activeChannel.id, voice_channel_id: call.channelId, command: music[1].toLowerCase(), query: music[2]?.trim() });
+      setContent(""); return;
+    }
     const reqId = crypto.randomUUID();
     const text = content || "[anexo]";
     setMessages(current => [...current, {
@@ -798,7 +822,7 @@ export function App() {
   }
   function pickAttachment() { if (!activeChannel) return; setUploading(true); send("attachment.pick", { channel_id: activeChannel.id }); }
   function joinCall(channel: Channel) { setMuted(false); setDeafened(false); joinedAtRef.current = Date.now(); playSound("joinCall"); void rtc.joinCall(channel.id, false, false); }
-  function leaveCall() { if (!call) return; playSound("leaveCall"); void rtc.leaveCall(); setCall(null); setStreams([]); setMySharingStreamId(null); setWatching({}); setRemoteVideos({}); cancelPeekHide(); peekMetaRef.current = null; peekOwnerRef.current = null; setPeekOwner(null); setPreviewHot(false); }
+  function leaveCall() { if (!call) return; playSound("leaveCall"); void rtc.leaveCall(); musicStreamRef.current = null; setCall(null); setStreams([]); setMySharingStreamId(null); setMyMusicStreamId(null); setWatching({}); setRemoteVideos({}); cancelPeekHide(); peekMetaRef.current = null; peekOwnerRef.current = null; setPeekOwner(null); setPreviewHot(false); }
   function updateAudioState(nextMuted: boolean, nextDeafened: boolean) {
     // Deafen implies mic muted: on the way into deafen, remember the mic
     // state so it can be restored when deafen is turned back off.
@@ -886,7 +910,7 @@ export function App() {
       <main className="auth">
         <section className="auth__card">
           <h1>{register ? "Criar uma conta" : "Que bom te ver de novo!"}</h1>
-          <p>{register ? "Use seu código de convite para entrar." : "Entre no seu espaço privado do Talkeando."}</p>
+          <p>{register ? "Use seu código de convite para entrar." : "Entre no seu espaço privado do Tupi."}</p>
           {error && <p className="auth__error">{error}</p>}
           <form onSubmit={submitAuth}>
             {register && (
@@ -972,7 +996,7 @@ export function App() {
 
   const voiceParticipants: Participant[] = (() => {
     if (!inThisVoice) return [];
-    const list = call?.channelId === activeChannel?.id ? [...call!.participants] : [];
+    const list = call?.channelId === activeChannel?.id ? call!.participants.filter(participant => !participant.is_bot) : [];
     if (currentUserId && !list.some(p => p.user_id === currentUserId)) {
       list.unshift({ user_id: currentUserId, muted, deafened });
     }
@@ -996,7 +1020,7 @@ export function App() {
   function renderVoiceTile(participant: Participant) {
     const isSelf = participant.user_id === currentUserId;
     const name = isSelf ? selfName : memberName(participant.user_id);
-    const stream = streams.find(s => s.owner === participant.user_id);
+    const stream = streams.find(s => s.owner === participant.user_id && s.kind === "screen");
     const watchable = !!stream && !isSelf;
     const video = watching[participant.user_id] ? remoteVideos[participant.user_id] : undefined;
     const isMicMuted = isSelf ? muted : participant.muted;
@@ -1134,7 +1158,7 @@ export function App() {
                 </button>
                 {voiceRoster.length > 0 && (
                   <div className="voice-members">
-                    {voiceRoster.map(entry => {
+                    {voiceRoster.filter(entry => !entry.is_bot).map(entry => {
                       const isSelf = entry.user_id === currentUserId;
                       const name = isSelf ? selfName : memberName(entry.user_id);
                       const micMuted = isSelf && here ? muted : entry.muted;
@@ -1143,8 +1167,8 @@ export function App() {
                       // we're here, otherwise from the community roster (a
                       // spectator subscribe drives the RTC path).
                       const share = here
-                        ? streams.find(s => s.owner === entry.user_id)
-                        : (voiceRoomStreams[channel.id] ?? []).find(s => s.owner === entry.user_id);
+                        ? streams.find(s => s.owner === entry.user_id && s.kind === "screen")
+                        : (voiceRoomStreams[channel.id] ?? []).find(s => s.owner === entry.user_id && s.kind === "screen");
                       const isLive = entry.sharing || !!share;
                       const canPeek = !!share && !isSelf;
                       // The floating peek preview is purely a hover affordance:
@@ -1203,6 +1227,16 @@ export function App() {
                     })}
                   </div>
                 )}
+                {(here ? streams : (voiceRoomStreams[channel.id] ?? [])).filter(stream => stream.kind === "music").map(stream => (
+                  <div className="voice-members voice-members--bots" key={`bot-${stream.stream_id}`}>
+                    <div className="voice-members__label">BOTS</div>
+                    <div className="voice-member voice-member--bot">
+                      <Avatar label="Tupi Música" size={24} className="voice-member__av" />
+                      <span className="voice-member__name">Tupi Música</span>
+                      <span className="voice-member__live-badge">🎵 TOCANDO</span>
+                    </div>
+                  </div>
+                ))}
               </div>
             );
             })}
@@ -1228,6 +1262,9 @@ export function App() {
                 <Icon name="hangout-call" size={18} />
               </button>
             </div>
+            {(myMusicStreamId || streams.some(stream => stream.kind === "music")) && (
+              <div className="voice-panel__music">🎵 Tupi Música <span>{streams.find(stream => stream.kind === "music")?.label ?? "tocando"}</span></div>
+            )}
             <div className="voice-panel__grid">
               <button
                 className={noiseSup ? "vp-btn is-on" : "vp-btn"}

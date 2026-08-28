@@ -13,6 +13,9 @@ pub struct Config {
     pub attachment_storage_path: String,
     pub allowed_origins: Vec<String>,
     pub unattached_attachment_ttl_hours: i64,
+    /// Shared only with the music-bot container. It authenticates a real
+    /// WebSocket participant without creating an end-user session.
+    pub music_bot_token: String,
 }
 
 impl Config {
@@ -27,7 +30,7 @@ impl Config {
                 .unwrap_or(30),
             turn_shared_secret: env::var("TURN_SHARED_SECRET")
                 .unwrap_or_else(|_| "insecure-dev-secret".to_string()),
-            turn_realm: env::var("TURN_REALM").unwrap_or_else(|_| "talkeando.local".to_string()),
+            turn_realm: env::var("TURN_REALM").unwrap_or_else(|_| "tupi.local".to_string()),
             turn_uris: env::var("TURN_URIS")
                 .unwrap_or_else(|_| "turn:localhost:3478".to_string())
                 .split(',')
@@ -53,6 +56,11 @@ impl Config {
                 .ok()
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(24),
+            // Existing installations can deploy the bot without a one-off SSH
+            // secret edit; production may set a dedicated token to override it.
+            music_bot_token: env::var("MUSIC_BOT_TOKEN").ok().filter(|value| !value.is_empty()).unwrap_or_else(|| {
+                env::var("TURN_SHARED_SECRET").unwrap_or_else(|_| "insecure-dev-music-bot-token".to_string())
+            }),
         }
     }
 }

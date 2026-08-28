@@ -295,6 +295,7 @@ pub async fn delete(
                         channel_id,
                         user_id: *departed_user_id,
                         reason: "channel_deleted".to_string(),
+                        is_bot: false,
                     },
                 ),
             ).await;

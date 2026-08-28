@@ -11,6 +11,8 @@ use futures::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use uuid::Uuid;
 
+const MUSIC_BOT_ID: Uuid = Uuid::from_u128(1);
+
 use crate::{
     auth::authenticate_token,
     db,
@@ -45,6 +47,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         Ok(Some(Ok(Message::Text(text)))) => match serde_json::from_str::<InboundEnvelope>(&text) {
             Ok(env) if env.op == "auth.hello" => {
                 match serde_json::from_value::<AuthHello>(env.data) {
+                    Ok(AuthHello { token }) if token == state.config.music_bot_token => Some((music_bot_user(), Uuid::nil())),
                     Ok(AuthHello { token }) => authenticate_token(&state.pool, &token).await.ok(),
                     Err(_) => None,
                 }
@@ -196,6 +199,15 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     let _ = forward_task.await;
 }
 
+fn music_bot_user() -> db::User {
+    db::User {
+        id: MUSIC_BOT_ID, username: "tupi-musica".into(), display_name: "Tupi Música".into(),
+        password_hash: String::new(), avatar_color: Some("#5865f2".into()), avatar_storage_path: None,
+        avatar_content_type: None, profile_tag: Some("BOT".into()), profile_badge_storage_path: None,
+        profile_badge_content_type: None, created_at: chrono::Utc::now(),
+    }
+}
+
 async fn broadcast_presence_update(state: &AppState, user_id: Uuid, status: &str) {
     match db::related_member_ids(&state.pool, user_id).await {
         Ok(user_ids) => state.hub.broadcast_to(
@@ -318,6 +330,7 @@ async fn teardown_call_membership(
                     channel_id,
                     user_id,
                     reason: reason.to_string(),
+                    is_bot: user_id == MUSIC_BOT_ID,
                 },
             ),
         )
@@ -331,8 +344,22 @@ async fn teardown_call_membership(
                     "stream.unpublished",
                     StreamUnpublished { channel_id, stream_id },
                 ),
-            )
-            .await;
+        )
+        .await;
+    }
+
+    // The audio source lives on the DJ's client. If that client goes away,
+    // remove the virtual bot too rather than leaving a misleading presence.
+    let dj_left = {
+        let mut djs = state.hub.music_djs.write().await;
+        if djs.get(&channel_id).copied() == Some(user_id) { djs.remove(&channel_id); true } else { false }
+    };
+    if dj_left && state.hub.calls.read().await.is_participant(channel_id, MUSIC_BOT_ID) {
+        state.hub.calls.write().await.leave(channel_id, MUSIC_BOT_ID);
+        let recipients = state.hub.calls.read().await.participant_ids(channel_id);
+        state.hub.broadcast_to(&recipients, OutboundEnvelope::new("call.peer_left", CallPeerLeft {
+            channel_id, user_id: MUSIC_BOT_ID, reason: "dj_left".into(), is_bot: true,
+        })).await;
     }
 
     broadcast_voice_roster(state, channel_id).await;
@@ -476,6 +503,10 @@ async fn dispatch(state: &AppState, user_id: Uuid, text: &str, joined_calls: &mu
             let data: StreamUnsubscribe = parse_or_reject!(StreamUnsubscribe);
             handle_stream_unsubscribe(state, user_id, data).await;
         }
+        "music.command" => {
+            let data: MusicCommand = parse_or_reject!(MusicCommand);
+            handle_music_command(state, user_id, data).await;
+        }
         "device.list_changed" => {
             let data: DeviceListChanged = parse_or_reject!(DeviceListChanged);
             tracing::debug!(%user_id, summary = ?data.summary, "device list changed");
@@ -489,6 +520,41 @@ async fn dispatch(state: &AppState, user_id: Uuid, text: &str, joined_calls: &mu
                 )
                 .await;
         }
+    }
+}
+
+async fn handle_music_command(state: &AppState, user_id: Uuid, data: MusicCommand) {
+    let participants = state.hub.calls.read().await.participant_ids(data.voice_channel_id);
+    if !participants.contains(&user_id) {
+        state.hub.send_to(user_id, OutboundEnvelope::error("forbidden", "entre no canal de voz antes de controlar o bot", None)).await;
+        return;
+    }
+    if data.command == "play" && data.query.as_deref().unwrap_or("").trim().is_empty() {
+        state.hub.send_to(user_id, OutboundEnvelope::error("validation_error", "use /play <link ou nome>", None)).await;
+        return;
+    }
+    if !state.hub.is_online(MUSIC_BOT_ID).await {
+        state.hub.send_to(user_id, OutboundEnvelope::error("service_unavailable", "o Tupi Música está iniciando; tente novamente em instantes", None)).await;
+        return;
+    }
+    state.hub.send_to(MUSIC_BOT_ID, OutboundEnvelope::new("music.command", serde_json::json!({
+        "channel_id": data.channel_id, "voice_channel_id": data.voice_channel_id,
+        "command": data.command, "query": data.query, "requested_by": user_id
+    }))).await;
+    let note = match data.command.as_str() {
+        "play" => format!("🎵 **Tupi Música** vai tocar: {}", data.query.as_deref().unwrap_or("")),
+        "pause" => "⏸️ **Tupi Música** pausou a reprodução.".to_string(),
+        "resume" => "▶️ **Tupi Música** retomou a reprodução.".to_string(),
+        "skip" => "⏭️ **Tupi Música** pulou a faixa.".to_string(),
+        "stop" => "⏹️ **Tupi Música** encerrou a fila.".to_string(),
+        "queue" => "📜 **Tupi Música**: a fila é controlada pelo DJ nesta versão.".to_string(),
+        _ => { state.hub.send_to(user_id, OutboundEnvelope::error("validation_error", "comando de música desconhecido", None)).await; return; }
+    };
+    // This is a deliberately ephemeral bot reply: no fake database user or
+    // forged author id, and all connected community members converge at once.
+    match db::channel_community(&state.pool, data.channel_id).await {
+        Ok(Some(community_id)) => broadcast_to_community(state, community_id, OutboundEnvelope::new("music.announcement", serde_json::json!({ "channel_id": data.channel_id, "content": note }))).await,
+        _ => state.hub.send_to(user_id, OutboundEnvelope::error("not_found", "canal de texto não encontrado", None)).await,
     }
 }
 
@@ -725,12 +791,17 @@ async fn handle_call_join(
     data: CallJoin,
     joined_calls: &mut HashSet<Uuid>,
 ) {
+    let is_bot = user_id == MUSIC_BOT_ID;
     let channel = match db::channel_if_member(&state.pool, data.channel_id, user_id).await {
         Ok(Some(channel)) if channel.kind == "voice" => channel,
         Ok(Some(_)) => {
             state.hub.send_to(user_id, OutboundEnvelope::error("validation_error", "calls can only be joined in voice channels", None)).await;
             return;
         }
+        _ if is_bot => match db::channel_by_id(&state.pool, data.channel_id).await {
+            Ok(Some(channel)) if channel.kind == "voice" => channel,
+            _ => { state.hub.send_to(user_id, OutboundEnvelope::error("not_found", "voice channel not found", None)).await; return; }
+        },
         _ => {
         state
             .hub
@@ -743,7 +814,7 @@ async fn handle_call_join(
         }
     };
 
-    let call_is_full = {
+    let call_is_full = !is_bot && {
         let calls = state.hub.calls.read().await;
         !calls.is_participant(data.channel_id, user_id) && calls.is_full(data.channel_id)
     };
@@ -763,7 +834,7 @@ async fn handle_call_join(
 
     let snapshot = {
         let mut calls = state.hub.calls.write().await;
-        calls.join(data.channel_id, user_id, data.muted, data.deafened)
+        calls.join(data.channel_id, user_id, data.muted, data.deafened, is_bot)
     };
     let snapshot = match snapshot {
         Ok(snapshot) => snapshot,
@@ -814,6 +885,7 @@ async fn handle_call_join(
                         user_id,
                         muted: data.muted,
                         deafened: data.deafened,
+                        is_bot,
                     },
                 },
             ),
@@ -990,13 +1062,14 @@ async fn relay_rtc(
 }
 
 async fn handle_stream_publish(state: &AppState, user_id: Uuid, data: StreamPublish) {
-    if data.kind != "screen" {
+    if data.kind != "screen" && data.kind != "music" {
         state
             .hub
-            .send_to(user_id, OutboundEnvelope::error("validation_error", "only screen streams are available in v1", None))
+            .send_to(user_id, OutboundEnvelope::error("validation_error", "only screen and music streams are available", None))
             .await;
         return;
     }
+    let is_music = data.kind == "music";
     let result = {
         let mut calls = state.hub.calls.write().await;
         calls.publish(
@@ -1028,13 +1101,24 @@ async fn handle_stream_publish(state: &AppState, user_id: Uuid, data: StreamPubl
                     channel_id: data.channel_id,
                     stream_id: data.stream_id,
                     owner: user_id,
-                    kind: data.kind,
-                    label: data.label,
+                    kind: data.kind.clone(),
+                    label: data.label.clone(),
                     has_audio: data.has_audio,
                 },
             ),
         )
         .await;
+
+    // Music is an always-on audio broadcast, unlike a screen preview. Every
+    // current peer is subscribed immediately; the local DJ opens the direct
+    // WebRTC audio transceiver after receiving this request.
+    if is_music {
+        for subscriber in participants.into_iter().filter(|id| *id != user_id) {
+            state.hub.send_to(subscriber, OutboundEnvelope::new("music.available", serde_json::json!({
+                "channel_id": data.channel_id, "stream_id": data.stream_id, "owner": user_id, "label": data.label
+            }))).await;
+        }
+    }
 
     broadcast_voice_roster(state, data.channel_id).await;
 }
