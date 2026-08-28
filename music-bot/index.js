@@ -114,16 +114,14 @@ const COOKIES_SRC = process.env.YT_DLP_COOKIES || "/cookies/yt.txt";
 const COOKIES_WORK = "/tmp/yt-cookies.txt";
 function cookiesFile() {
   try {
-    if (fs.existsSync(COOKIES_WORK) && fs.statSync(COOKIES_WORK).size > 0) return COOKIES_WORK;
-    if (fs.existsSync(COOKIES_SRC) && fs.statSync(COOKIES_SRC).size > 0) {
-      let content = fs.readFileSync(COOKIES_SRC, "utf8");
-      if (!content.startsWith("# Netscape HTTP Cookie File")) {
-        content = "# Netscape HTTP Cookie File\n" + content;
-      }
-      fs.writeFileSync(COOKIES_WORK, content, "utf8");
-      return COOKIES_WORK;
+    let src = fs.existsSync(COOKIES_SRC) && fs.statSync(COOKIES_SRC).size > 0 ? COOKIES_SRC : COOKIES_WORK;
+    if (!fs.existsSync(src) || fs.statSync(src).size === 0) return null;
+    let content = fs.readFileSync(src, "utf8");
+    if (!content.startsWith("# Netscape HTTP Cookie File")) {
+      content = "# Netscape HTTP Cookie File\n" + content;
     }
-    return null;
+    fs.writeFileSync(COOKIES_WORK, content, "utf8");
+    return COOKIES_WORK;
   } catch { return null; }
 }
 
@@ -135,9 +133,10 @@ async function startPlayback(query) {
   const ytArgs = [
     "--no-progress", "--no-warnings",
     "--geo-bypass",
+    "--extractor-args", "youtube:player_skip=visionos",
     "--js-runtimes", "deno",
     "--remote-components", "ejs:github",
-    "-f", "bestaudio/best",
+    "-f", "251/140/bestaudio/best",
     "-o", "-",
   ];
   if (cookies) ytArgs.push("--cookies", cookies);
