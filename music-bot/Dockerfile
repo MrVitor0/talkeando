@@ -6,9 +6,15 @@ FROM node:20-bookworm-slim
 # into the OS package set.
 RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg python3-venv ca-certificates curl unzip \
     && python3 -m venv /opt/yt-dlp \
-    && /opt/yt-dlp/bin/pip install --no-cache-dir -U yt-dlp \
+    && /opt/yt-dlp/bin/pip install --no-cache-dir -U yt-dlp bgutil-ytdlp-pot-provider \
     && ln -s /opt/yt-dlp/bin/yt-dlp /usr/local/bin/yt-dlp \
     && rm -rf /var/lib/apt/lists/*
+# yt-dlp plugin for the bgutil-ytdlp-pot-provider sidecar (see docker-compose:
+# service `bgutil-provider`). Supplies a real Proof-of-Origin token so
+# YouTube's bot check passes from this VPS's datacenter IP, which is what
+# kept invalidating even freshly-exported account cookies within hours
+# ("Sign in to confirm you're not a bot" / LOGIN_REQUIRED despite valid
+# cookies). Needs yt-dlp >= 2025.05.22; the `-U` above always installs newer.
 # Deno is yt-dlp's JS runtime for solving YouTube's signature / `n` challenges
 # (index.js passes `--js-runtimes deno --remote-components ejs:github`).
 RUN curl -fsSL https://github.com/denoland/deno/releases/latest/download/deno-x86_64-unknown-linux-gnu.zip -o /tmp/deno.zip \

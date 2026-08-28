@@ -246,6 +246,14 @@ const CLIENT_SETS = [
   "web_safari,mweb",
 ];
 const AUDIO_FORMAT = process.env.YT_AUDIO_FORMAT || "bestaudio[acodec=opus]/bestaudio/best";
+// bgutil-ytdlp-pot-provider sidecar (docker-compose service `bgutil-provider`,
+// pip package installed in the Dockerfile). It hands yt-dlp a real
+// Proof-of-Origin token, which is what actually satisfies YouTube's bot check
+// from this VPS's datacenter IP — account cookies alone were being
+// invalidated within hours regardless of freshness ("Sign in to confirm
+// you're not a bot" / LOGIN_REQUIRED even right after a clean export). Unset
+// to fall back to cookie-only auth (will likely get blocked again).
+const POT_PROVIDER_URL = process.env.YT_POT_PROVIDER_URL || "";
 
 function ytArgs({ clients, playlist = false }) {
   const args = [
@@ -262,6 +270,7 @@ function ytArgs({ clients, playlist = false }) {
     "--remote-components", "ejs:github",
     "--extractor-args", `youtube:player_client=${clients}`,
   ];
+  if (POT_PROVIDER_URL) args.push("--extractor-args", `youtubepot-bgutilhttp:base_url=${POT_PROVIDER_URL}`);
   if (!playlist) args.push("--no-playlist");
   const cookies = cookiesFile();
   if (cookies) args.push("--cookies", cookies);
@@ -633,4 +642,14 @@ process.on("unhandledRejection", reason => log(`unhandledRejection: ${reason && 
 process.on("uncaughtException", error => log(`uncaughtException: ${error && error.stack ? error.stack : error}`));
 
 void runYtDlp(["--version"], { timeoutMs: 10000 }).then(({ out }) => log(`yt-dlp ${out.trim() || "version unknown"}`));
+// Confirm the PO Token provider is actually reachable at boot rather than
+// discovering it silently fell back to cookie-only auth the next time
+// YouTube starts rejecting everything again.
+if (POT_PROVIDER_URL) {
+  runYtDlp(["-v", ...ytArgs({ clients: CLIENT_SETS[0] }), "--skip-download", "--simulate", "https://www.youtube.com/watch?v=jNQXAC9IVRw"], { timeoutMs: 20000 })
+    .then(({ err }) => {
+      const active = /PO Token Providers:\s*bgutil/i.test(err);
+      log(active ? "PO Token provider is active" : `PO Token provider NOT detected in yt-dlp output — check ${POT_PROVIDER_URL} is reachable`);
+    });
+}
 connect();

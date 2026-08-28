@@ -17,12 +17,23 @@ services:
     volumes:
       - attachments_data:/var/lib/tupi/attachments
 
+  # Generates a real Proof-of-Origin token for yt-dlp so YouTube's bot check
+  # passes from this VPS's datacenter IP. Without it, YouTube keeps
+  # invalidating even freshly-exported account cookies within hours
+  # ("Sign in to confirm you're not a bot" despite valid cookies) — cookies
+  # alone stopped being enough. No host port needed; music-bot reaches it by
+  # service name over the compose network.
+  bgutil-provider:
+    image: brainicism/bgutil-ytdlp-pot-provider:latest
+    restart: unless-stopped
+
   music-bot:
     build:
       context: ../music-bot
     restart: unless-stopped
     depends_on:
       - tupi-server
+      - bgutil-provider
     environment:
       TUPI_WS_URL: ws://tupi-server:8080/ws
       # Falls back to TURN_SHARED_SECRET in the bot for existing deployments;
@@ -32,6 +43,7 @@ services:
       TURN_URIS: ${TURN_URIS:?set in production env}
       SPOTIFY_CLIENT_ID: ${SPOTIFY_CLIENT_ID:-}
       SPOTIFY_CLIENT_SECRET: ${SPOTIFY_CLIENT_SECRET:-}
+      YT_POT_PROVIDER_URL: http://bgutil-provider:4416
     volumes:
       # Drop a Netscape cookies.txt exported from a logged-in YouTube session
       # at ./cookies/yt.txt on the host — required, YouTube blocks this IP
