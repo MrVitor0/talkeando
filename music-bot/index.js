@@ -152,6 +152,22 @@ function getStreamUrl(source, cookies) {
   });
 }
 
+function getCookieHeader(filePath) {
+  try {
+    if (!filePath || !fs.existsSync(filePath)) return "";
+    const lines = fs.readFileSync(filePath, "utf8").split("\n");
+    const cookies = [];
+    for (const line of lines) {
+      if (!line.trim() || line.startsWith("#")) continue;
+      const parts = line.split("\t");
+      if (parts.length >= 7) {
+        cookies.push(`${parts[5]}=${parts[6].trim()}`);
+      }
+    }
+    return cookies.join("; ");
+  } catch { return ""; }
+}
+
 async function startPlayback(query) {
   stopPlayback();
   const sources = await resolveSources(query);
@@ -160,14 +176,23 @@ async function startPlayback(query) {
   const streamUrl = await getStreamUrl(sources[0], cookies);
   log(`stream URL resolved: ${streamUrl.substring(0, 60)}...`);
 
-  const ffmpeg = spawn("ffmpeg", [
+  const cookieHeader = getCookieHeader(cookies);
+  const ffmpegArgs = [
     "-hide_banner", "-loglevel", "error",
+    "-user_agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+  ];
+  if (cookieHeader) {
+    ffmpegArgs.push("-headers", `Cookie: ${cookieHeader}\r\n`);
+  }
+  ffmpegArgs.push(
     "-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5",
     "-re",
     "-i", streamUrl,
     "-f", "s16le", "-ar", "48000", "-ac", "2",
     "pipe:1"
-  ], { stdio: ["ignore", "pipe", "pipe"] });
+  );
+
+  const ffmpeg = spawn("ffmpeg", ffmpegArgs, { stdio: ["ignore", "pipe", "pipe"] });
 
   ffmpeg.stderr.on("data", d => process.stderr.write(`[ffmpeg] ${d}`));
   const audio = new wrtc.nonstandard.RTCAudioSource(); const track = audio.createTrack();
