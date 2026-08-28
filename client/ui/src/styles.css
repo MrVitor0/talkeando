@@ -3145,3 +3145,42 @@ a:hover {
   font-size: 12px;
   color: var(--text-faint);
 }
+
+/* ---- colour-picker row in the context menu ---- */
+.ctx-menu__color {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--interactive-normal);
+}
+.ctx-menu__color > span {
+  flex: 1;
+}
+.ctx-menu__color input[type="color"] {
+  width: 28px;
+  height: 22px;
+  padding: 0;
+  border: 1px solid rgba(255, 255, 255, 0.14);
+  border-radius: 4px;
+  background: none;
+  cursor: pointer;
+}
+.ctx-menu__color input[type="color"]::-webkit-color-swatch-wrapper { padding: 2px; }
+.ctx-menu__color input[type="color"]::-webkit-color-swatch { border: none; border-radius: 2px; }
+.ctx-menu__color-reset {
+  width: 20px;
+  height: 20px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 4px;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.ctx-menu__color-reset:hover {
+  background: var(--bg-hover);
+  color: var(--interactive-hover);
+}

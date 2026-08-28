@@ -23,6 +23,43 @@ pub struct RenameRequest {
     pub display_name: String,
 }
 
+#[derive(Deserialize)]
+pub struct NameColorRequest {
+    /// Hex `#rgb` / `#rrggbb`, or `null` to clear back to the default.
+    pub name_color: Option<String>,
+}
+
+/// PROFILE-FR: set a member's display-name colour (your own or anyone else's,
+/// same "qualquer membro" scoping as rename). `null` resets to the default.
+pub async fn set_name_color(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(target_id): Path<Uuid>,
+    Json(req): Json<NameColorRequest>,
+) -> AppResult<Json<PublicUser>> {
+    let color = match req.name_color.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(value) if is_hex_color(value) => Some(value.to_ascii_lowercase()),
+        Some(_) => return Err(AppError::Validation("name_color must be a #rgb or #rrggbb hex value".into())),
+        None => None,
+    };
+    if target_id != auth.user.id && !shares_community(&state, auth.user.id, target_id).await? {
+        return Err(AppError::Forbidden);
+    }
+    let user = sqlx::query_as::<_, User>("UPDATE users SET name_color = $1 WHERE id = $2 RETURNING *")
+        .bind(color)
+        .bind(target_id)
+        .fetch_optional(&state.pool)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    broadcast_member_updated(&state, &user).await;
+    Ok(Json(user.into()))
+}
+
+fn is_hex_color(value: &str) -> bool {
+    let Some(hex) = value.strip_prefix('#') else { return false };
+    (hex.len() == 3 || hex.len() == 6) && hex.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
 /// PROFILE-FR: rename yourself. Any authenticated user may change their own
 /// `display_name`; the new row is fanned out to everyone who shares a
 /// community with them so rosters/message authors update live.
@@ -157,6 +194,7 @@ async fn broadcast_member_updated(state: &AppState, user: &User) {
                             avatar_url: public.avatar_url,
                             avatar_color: public.avatar_color,
                             profile_tag: public.profile_tag,
+                            name_color: public.name_color,
                         },
                     ),
                 )

@@ -138,6 +138,14 @@ public sealed class IpcBridge : IDisposable
                     await _network.RenameChannelAsync(d.GetProperty("channel_id").GetGuid(), RequiredString(root, "name"));
                     break;
                 }
+                case "member.set_color":
+                {
+                    var d = root.GetProperty("data");
+                    var color = d.TryGetProperty("name_color", out var c) && c.ValueKind == JsonValueKind.String
+                        ? c.GetString() : null;
+                    await _network.SetNameColorAsync(d.GetProperty("user_id").GetGuid(), color);
+                    break;
+                }
                 case "profile.avatar.pick":
                 {
                     var avatarPicker = new Microsoft.Win32.OpenFileDialog

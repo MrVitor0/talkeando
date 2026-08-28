@@ -244,7 +244,7 @@ fn music_bot_user() -> db::User {
         id: MUSIC_BOT_ID, username: "tupi-musica".into(), display_name: "Tupi Música".into(),
         password_hash: String::new(), avatar_color: Some("#5865f2".into()), avatar_storage_path: None,
         avatar_content_type: None, profile_tag: Some("BOT".into()), profile_badge_storage_path: None,
-        profile_badge_content_type: None, created_at: chrono::Utc::now(),
+        profile_badge_content_type: None, name_color: Some("#5865f2".into()), created_at: chrono::Utc::now(),
     }
 }
 

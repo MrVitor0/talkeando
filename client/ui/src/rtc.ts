@@ -88,10 +88,13 @@ let localDeafened = false;
 // that avoided a renegotiation storm on every subscribe/unsubscribe.
 let localScreenTrack: MediaStreamTrack | null = null;
 let localScreenStream: MediaStream | null = null;
-// Remembered so "change quality" can re-issue the native capture in place
-// (same source, same audio) without tearing down the WebRTC track.
+// Remembered so "change quality" / "change source" can re-issue the native
+// capture in place (keeping the other settings) without tearing down the
+// WebRTC track.
 let localScreenSourceId: string | null = null;
 let localScreenAudioOn = false;
+let localScreenHeight = 720;
+let localScreenFps = 30;
 const screenSubscribers = new Set<string>();
 // Per-peer transceivers for our outgoing screen tracks (one video, and one
 // audio when the source carries process-loopback audio). Created ONCE per peer
@@ -830,6 +833,8 @@ export async function publishScreen(channelId: string, streamId: string, sourceI
   localScreenTrack = localScreenStream?.getVideoTracks()[0] ?? null;
   localScreenSourceId = sourceId;
   localScreenAudioOn = withAudio;
+  localScreenHeight = targetHeight;
+  localScreenFps = targetFps;
   const hasAudio = (localScreenStream?.getAudioTracks().length ?? 0) > 0;
   console.log(`[rtc] publishScreen: ${sourceId} video=${localScreenTrack?.readyState} audio=${hasAudio} subs=[${Array.from(screenSubscribers).join(",")}]`);
   // Anyone who already subscribed (before we had a track) now gets it.
@@ -843,7 +848,19 @@ export async function publishScreen(channelId: string, streamId: string, sourceI
 /// with no renegotiation and no re-subscribe.
 export function reconfigureScreen(targetHeight: number, targetFps: number) {
   if (!localScreenSourceId) return;
+  localScreenHeight = targetHeight;
+  localScreenFps = targetFps;
   reconfigureNativeScreen(localScreenSourceId, targetHeight, targetFps, localScreenAudioOn);
+}
+
+/// Point a live screen share at a different monitor / window, keeping the
+/// current resolution + frame-rate. Same in-place mechanism as
+/// `reconfigureScreen` — viewers keep watching the same stream, its picture
+/// just switches.
+export function switchScreenSource(sourceId: string) {
+  if (!localScreenSourceId) return;
+  localScreenSourceId = sourceId;
+  reconfigureNativeScreen(sourceId, localScreenHeight, localScreenFps, localScreenAudioOn);
 }
 
 export async function unpublishScreen(channelId: string, streamId: string) {

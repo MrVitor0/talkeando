@@ -9,7 +9,7 @@ import logoUrl from "../icons/logo.webp";
 
 type Channel = { id: string; name: string; kind: "text" | "voice"; topic?: string | null };
 type ChannelCategory = { id: string; name: string; position: number; channels: Channel[] };
-type Member = { id: string; display_name: string; username: string; role: string; avatar_url?: string | null; profile_tag?: string | null; profile_badge_url?: string | null };
+type Member = { id: string; display_name: string; username: string; role: string; avatar_url?: string | null; profile_tag?: string | null; profile_badge_url?: string | null; name_color?: string | null };
 type Attachment = { id: string; filename: string; content_type: string; size_bytes: number; url?: string | null };
 // Rich embed imported from Discord (bot polls, "now playing", changelog cards).
 // Image URLs are already rewritten to our own `/api/message-embeds/...` route
@@ -472,7 +472,14 @@ type MenuSlider = {
   format?: (value: number) => string;
   onChange: (value: number) => void;
 };
-type MenuItem = MenuAction | MenuSlider;
+// A native colour picker embedded in the menu; `value` null = default colour.
+type MenuColor = {
+  kind: "color";
+  label: string;
+  value: string | null;
+  onChange: (hex: string | null) => void;
+};
+type MenuItem = MenuAction | MenuSlider | MenuColor;
 type MenuState = { x: number; y: number; items: MenuItem[] };
 
 function ContextMenu({ x, y, items, onClose }: MenuState & { onClose: () => void }) {
@@ -514,7 +521,9 @@ function ContextMenu({ x, y, items, onClose }: MenuState & { onClose: () => void
     <div ref={ref} className="ctx-menu" style={{ left: pos.left, top: pos.top }} onClick={event => event.stopPropagation()}>
       {items.map((item, index) =>
         "kind" in item
-          ? <MenuSliderRow key={index} item={item} />
+          ? (item.kind === "slider"
+            ? <MenuSliderRow key={index} item={item} />
+            : <MenuColorRow key={index} item={item} />)
           : (
             <button
               key={index}
@@ -549,6 +558,30 @@ function MenuSliderRow({ item }: { item: MenuSlider }) {
         onChange={event => apply(Number(event.target.value))}
         onDoubleClick={() => { if (item.resetTo !== undefined) apply(item.resetTo); }}
       />
+    </div>
+  );
+}
+
+function MenuColorRow({ item }: { item: MenuColor }) {
+  const [value, setValue] = useState(item.value ?? "#5865f2");
+  return (
+    <div className="ctx-menu__color">
+      <span>{item.label}</span>
+      <input
+        type="color"
+        value={value}
+        onChange={event => { setValue(event.target.value); item.onChange(event.target.value); }}
+      />
+      {item.value && (
+        <button
+          type="button"
+          className="ctx-menu__color-reset"
+          title="Redefinir para o padrão"
+          onClick={() => item.onChange(null)}
+        >
+          ✕
+        </button>
+      )}
     </div>
   );
 }
@@ -651,7 +684,7 @@ export function App() {
   const [members, setMembers] = useState<Member[]>([]);
   const [communityName, setCommunityName] = useState("Estação Finita");
   const [currentUserId, setCurrentUserId] = useState<string | null>(null);
-  const [currentUser, setCurrentUser] = useState<{ id: string; display_name: string; username?: string; avatar_url?: string | null } | null>(null);
+  const [currentUser, setCurrentUser] = useState<{ id: string; display_name: string; username?: string; avatar_url?: string | null; name_color?: string | null } | null>(null);
   const [presence, setPresence] = useState<Record<string, "online" | "busy" | "offline">>({});
   const [activities, setActivities] = useState<Record<string, ActivityDto[]>>({});
   // API root (e.g. http://localhost:8080/api), from the native bootstrap —
@@ -711,6 +744,9 @@ export function App() {
   const [shareMenuOpen, setShareMenuOpen] = useState(false);
   const [shareQualityOpen, setShareQualityOpen] = useState(false);
   const [shareQuality, setShareQuality] = useState<{ height: number; fps: number }>({ height: 720, fps: 30 });
+  // The picker doubles as the "change which screen" dialog for a live share —
+  // in that mode it skips the quality step.
+  const [pickerSourceOnly, setPickerSourceOnly] = useState(false);
   const [watching, setWatching] = useState<Record<string, boolean>>({});
   const [peekOwner, setPeekOwner] = useState<string | null>(null);
   // Voice channel currently under a member-drag, for the drop-target highlight.
@@ -791,12 +827,12 @@ export function App() {
       // avatar_url to a data: URI). Patch the roster, and our own identity if
       // it was us.
       if (event.op === "member.updated") {
-        const updated = event.data as { user_id: string; display_name: string; avatar_url?: string | null; profile_tag?: string | null };
+        const updated = event.data as { user_id: string; display_name: string; avatar_url?: string | null; profile_tag?: string | null; name_color?: string | null };
         setMembers(current => current.map(member => member.id === updated.user_id
-          ? { ...member, display_name: updated.display_name ?? member.display_name, avatar_url: updated.avatar_url ?? null, profile_tag: updated.profile_tag ?? member.profile_tag }
+          ? { ...member, display_name: updated.display_name ?? member.display_name, avatar_url: updated.avatar_url ?? null, profile_tag: updated.profile_tag ?? member.profile_tag, name_color: updated.name_color ?? null }
           : member));
         if (updated.user_id === selfIdRef.current) {
-          setCurrentUser(current => current ? { ...current, display_name: updated.display_name ?? current.display_name, avatar_url: updated.avatar_url ?? null } : current);
+          setCurrentUser(current => current ? { ...current, display_name: updated.display_name ?? current.display_name, avatar_url: updated.avatar_url ?? null, name_color: updated.name_color ?? null } : current);
         }
       }
       // A channel was renamed (name-only edit — see routes/channels.rs rename).
@@ -1266,16 +1302,25 @@ export function App() {
     setMuted(nextMuted); setDeafened(nextDeafened);
     if (call) rtc.setLocalAudioState(nextMuted, nextDeafened);
   }
-  function startSharing() {
+  function openPicker(sourceOnly: boolean) {
     if (!call) return;
+    setPickerSourceOnly(sourceOnly);
     setSources([]);
     setSourcesLoading(true);
     setPickerOpen(true);
     send("screen.sources.list");
   }
+  function startSharing() { openPicker(false); }
+  function changeShareSource() { closeShareMenu(); openPicker(true); }
   async function shareSource(sourceId: string, options: ShareOptions) {
     setPickerOpen(false);
     if (!call) return;
+    // "Change which screen" on a live share: swap the source in place, keeping
+    // the same stream so viewers don't have to re-subscribe.
+    if (pickerSourceOnly && mySharingStreamId) {
+      rtc.switchScreenSource(sourceId);
+      return;
+    }
     const streamId = crypto.randomUUID();
     try {
       await rtc.publishScreen(call.channelId, streamId, sourceId, options.height, options.fps, options.withAudio);
@@ -1310,8 +1355,11 @@ export function App() {
           </div>
         ) : (
           <>
+            <button onClick={changeShareSource}>
+              <Icon name="share-screen" size={16} /> Alterar tela
+            </button>
             <button onClick={() => setShareQualityOpen(true)}>
-              <Icon name="share-screen" size={16} /> Alterar qualidade
+              <Icon name="config" size={16} /> Alterar qualidade
             </button>
             <button className="is-danger" onClick={stopSharing}>
               <Icon name="hangout-call" size={16} /> Parar de compartilhar
@@ -1522,6 +1570,12 @@ export function App() {
           : { label: "Não perturbe (ocupado)", onClick: () => setStatus("busy") },
         { label: "Alterar meu nome", onClick: renameSelf },
         { label: "Alterar foto de perfil", onClick: () => send("profile.avatar.pick") },
+        {
+          kind: "color",
+          label: "Cor do meu nome",
+          value: currentUser?.name_color ?? null,
+          onChange: hex => send("member.set_color", { user_id: currentUserId, name_color: hex }),
+        },
       ];
     }
     const member = members.find(entry => entry.id === userId);
@@ -1544,6 +1598,14 @@ export function App() {
       });
     }
     if (member) items.push({ label: "Renomear usuário", onClick: () => renameOtherMember(member) });
+    if (member) {
+      items.push({
+        kind: "color",
+        label: "Cor do nome",
+        value: member.name_color ?? null,
+        onChange: hex => send("member.set_color", { user_id: userId, name_color: hex }),
+      });
+    }
     // Which voice channel (if any) is the target sitting in right now?
     const voiceChannelId = Object.entries(voiceRooms).find(
       ([, entries]) => entries.some(entry => entry.user_id === userId),
@@ -1872,7 +1934,13 @@ export function App() {
                           onContextMenu={event => openMenu(event, memberMenuItems(entry.user_id))}
                         >
                           <Avatar label={name} size={24} className="voice-member__av" imageUrl={isBot ? "/tupi-mascot.png" : members.find(member => member.id === entry.user_id)?.avatar_url} />
-                          <span className="voice-member__name">{name}</span>
+                          <span
+                            className="voice-member__name"
+                            style={(() => {
+                              const color = members.find(member => member.id === entry.user_id)?.name_color;
+                              return color ? { color } : undefined;
+                            })()}
+                          >{name}</span>
                           {micMuted && <Icon name="mic-muted" size={15} className="voice-member__flag" />}
                           {audioOff && <Icon name="headphone-muted" size={15} className="voice-member__flag" />}
                           {hasCamera && <Icon name="camera" size={15} className="voice-member__flag voice-member__flag--cam" title="Câmera ligada" />}
@@ -2159,8 +2227,10 @@ export function App() {
                   new Date(message.created_at).getTime() - new Date(previous.created_at).getTime() > 5 * 60 * 1000;
                 const displayName = message.author?.display_name ?? memberName(authorId);
                 const isOwn = authorId != null && authorId === currentUserId;
-                const isOwner = members.find(m => m.id === authorId)?.role === "owner";
-                const nameColor = isOwner ? "#f0b232" : `hsl(${hueFromString(displayName)} 62% 72%)`;
+                const authorMember = members.find(m => m.id === authorId);
+                const isOwner = authorMember?.role === "owner";
+                const nameColor = authorMember?.name_color
+                  || (isOwner ? "#f0b232" : `hsl(${hueFromString(displayName)} 62% 72%)`);
                 const time = new Date(message.created_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
                 return (
                   <article
@@ -2329,6 +2399,8 @@ export function App() {
           channelName={channels.find(c => c.id === call?.channelId)?.name ?? "Canal de voz"}
           onPick={shareSource}
           onCancel={() => setPickerOpen(false)}
+          sourceOnly={pickerSourceOnly}
+          defaultOptions={{ withAudio: true, height: shareQuality.height, fps: shareQuality.fps }}
         />
       )}
     </main>
@@ -2362,7 +2434,7 @@ function MemberList({
       onContextMenu={event => onMemberContextMenu(event, member)}
     >
       <Avatar label={member.display_name} size={32} className="member__avatar" imageUrl={member.avatar_url} />
-      <span className="member__name">{member.display_name}{member.profile_tag && <small className="member__tag">{member.profile_badge_url && <img src={member.profile_badge_url} alt="" />}{member.profile_tag}</small>}</span>
+      <span className="member__name" style={member.name_color ? { color: member.name_color } : undefined}>{member.display_name}{member.profile_tag && <small className="member__tag">{member.profile_badge_url && <img src={member.profile_badge_url} alt="" />}{member.profile_tag}</small>}</span>
       {member.role === "owner" && <CrownIcon className="member__crown" />}
     </div>
   );

@@ -133,19 +133,25 @@ export function ScreenPicker({
   channelName,
   onPick,
   onCancel,
+  // "sourceOnly" = the "change which screen" flow for a share that's already
+  // live: pick a source and it applies at once, skipping the quality step.
+  sourceOnly = false,
+  defaultOptions,
 }: {
   sources: CaptureSource[];
   loading: boolean;
   channelName: string;
   onPick: (sourceId: string, options: ShareOptions) => void;
   onCancel: () => void;
+  sourceOnly?: boolean;
+  defaultOptions?: { withAudio: boolean; height: number; fps: number };
 }) {
   const [step, setStep] = useState<"source" | "config">("source");
   const [selected, setSelected] = useState<string | null>(null);
-  const [audioOn, setAudioOn] = useState(true);
+  const [audioOn, setAudioOn] = useState(defaultOptions?.withAudio ?? true);
   const [notify, setNotify] = useState(false);
-  const [height, setHeight] = useState<number>(720);
-  const [fps, setFps] = useState<number>(30);
+  const [height, setHeight] = useState<number>(defaultOptions?.height ?? 720);
+  const [fps, setFps] = useState<number>(defaultOptions?.fps ?? 30);
   const [sourceTab, setSourceTab] = useState<"window" | "screen">("window");
   const [showAllSources, setShowAllSources] = useState(false);
 
@@ -156,6 +162,10 @@ export function ScreenPicker({
   const selectedSource = sources.find(source => source.id === selected) ?? null;
 
   function choose(sourceId: string) {
+    if (sourceOnly) {
+      onPick(sourceId, { withAudio: audioOn, height, fps, notify });
+      return;
+    }
     setSelected(sourceId);
     setStep("config");
   }
@@ -189,8 +199,10 @@ export function ScreenPicker({
             <div className="sp-modal__head sp-source__intro">
               <ShareHero />
               <div className="sp-source__intro-copy">
-              <h2>Compartilhar sua tela</h2>
-                <p>Escolha o que você quer transmitir para a chamada.</p>
+              <h2>{sourceOnly ? "Trocar de tela" : "Compartilhar sua tela"}</h2>
+                <p>{sourceOnly
+                  ? "Escolha a tela ou janela e a transmissão troca na hora."
+                  : "Escolha o que você quer transmitir para a chamada."}</p>
               </div>
               <button className="sp-x" onClick={onCancel} aria-label="Fechar">✕</button>
             </div>

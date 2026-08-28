@@ -30,6 +30,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/me", get(auth::me).patch(profile::update_me))
         .route("/api/me/avatar", post(profile::upload_avatar))
         .route("/api/users/:id", patch(profile::rename_user))
+        .route("/api/users/:id/name-color", patch(profile::set_name_color))
         .route("/api/community", get(communities::current))
         .route("/api/communities", get(communities::list))
         .route("/api/channels", get(channels::list))

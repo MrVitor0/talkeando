@@ -190,6 +190,20 @@ public sealed class NetworkClient
         using var _ = await ReadJsonAsync(response);
     }
 
+    /// PROFILE-FR: set a member's display-name colour (`null` clears it).
+    /// Server broadcasts `member.updated`.
+    public async Task SetNameColorAsync(Guid userId, string? nameColor)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Patch, $"users/{userId}/name-color")
+        {
+            Content = new StringContent(
+                JsonSerializer.Serialize(new { name_color = nameColor }), Encoding.UTF8, "application/json"),
+        };
+        AddAuthorization(request);
+        using var response = await _http.SendAsync(request);
+        using var _ = await ReadJsonAsync(response);
+    }
+
     /// CHAN-FR (rename): change just a channel's name. Server broadcasts
     /// `channel.updated`.
     public async Task RenameChannelAsync(Guid channelId, string name)

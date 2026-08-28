@@ -108,6 +108,7 @@ struct HistoryRow {
     avatar_url: Option<String>,
     profile_tag: Option<String>,
     profile_badge_url: Option<String>,
+    name_color: Option<String>,
 }
 
 fn default_limit() -> i64 {
@@ -138,7 +139,7 @@ pub async fn history(
                 "SELECT m.id, m.channel_id, m.author_id, m.content, m.created_at, m.edited_at, \
                         u.username, u.display_name, u.avatar_color, \
                         CASE WHEN u.avatar_storage_path IS NULL THEN NULL ELSE '/api/users/' || u.id::text || '/avatar' END AS avatar_url, u.profile_tag, \
-                        CASE WHEN u.profile_badge_storage_path IS NULL THEN NULL ELSE '/api/users/' || u.id::text || '/profile-badge' END AS profile_badge_url \
+                        CASE WHEN u.profile_badge_storage_path IS NULL THEN NULL ELSE '/api/users/' || u.id::text || '/profile-badge' END AS profile_badge_url, u.name_color \
                  FROM messages m JOIN users u ON u.id = m.author_id \
                  WHERE m.channel_id = $1 AND m.deleted_at IS NULL \
                  AND (m.created_at, m.id) < (SELECT created_at, id FROM messages WHERE id = $2 AND channel_id = $1) \
@@ -155,7 +156,7 @@ pub async fn history(
                 "SELECT m.id, m.channel_id, m.author_id, m.content, m.created_at, m.edited_at, \
                         u.username, u.display_name, u.avatar_color, \
                         CASE WHEN u.avatar_storage_path IS NULL THEN NULL ELSE '/api/users/' || u.id::text || '/avatar' END AS avatar_url, u.profile_tag, \
-                        CASE WHEN u.profile_badge_storage_path IS NULL THEN NULL ELSE '/api/users/' || u.id::text || '/profile-badge' END AS profile_badge_url \
+                        CASE WHEN u.profile_badge_storage_path IS NULL THEN NULL ELSE '/api/users/' || u.id::text || '/profile-badge' END AS profile_badge_url, u.name_color \
                  FROM messages m JOIN users u ON u.id = m.author_id \
                  WHERE m.channel_id = $1 AND m.deleted_at IS NULL \
                  ORDER BY m.created_at DESC, m.id DESC LIMIT $2",
@@ -237,6 +238,7 @@ pub async fn history(
             avatar_url: row.avatar_url,
             profile_tag: row.profile_tag,
             profile_badge_url: row.profile_badge_url,
+            name_color: row.name_color,
         },
         content: row.content,
         created_at: row.created_at,

@@ -165,6 +165,7 @@ pub struct MemberUpdated {
     pub avatar_url: Option<String>,
     pub avatar_color: Option<String>,
     pub profile_tag: Option<String>,
+    pub name_color: Option<String>,
 }
 
 #[derive(Debug, Serialize)]

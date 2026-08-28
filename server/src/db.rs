@@ -31,6 +31,7 @@ pub struct PublicUser {
     pub avatar_url: Option<String>,
     pub profile_tag: Option<String>,
     pub profile_badge_url: Option<String>,
+    pub name_color: Option<String>,
 }
 
 impl From<User> for PublicUser {
@@ -43,6 +44,7 @@ impl From<User> for PublicUser {
             avatar_url: u.avatar_storage_path.map(|_| format!("/api/users/{}/avatar", u.id)),
             profile_tag: u.profile_tag,
             profile_badge_url: u.profile_badge_storage_path.map(|_| format!("/api/users/{}/profile-badge", u.id)),
+            name_color: u.name_color,
         }
     }
 }
