@@ -39,6 +39,15 @@ const peerAudioMuted = new Map<string, boolean>();
 const pendingTurnRequests = new Map<string, (creds: TurnCredentials) => void>();
 const remoteVideoListeners = new Set<RemoteStreamListener>();
 
+// Realtime call-connection quality (signal-bars in the voice panel). Sampled
+// from RTCPeerConnection.getStats() across the whole mesh — worst RTT + worst
+// outbound packet loss over every peer — and mapped to good/medium/poor.
+export type ConnQuality = "good" | "medium" | "poor";
+type ConnQualityListener = (quality: ConnQuality) => void;
+const connQualityListeners = new Set<ConnQualityListener>();
+let connQualityTimer: ReturnType<typeof setInterval> | null = null;
+let lastConnQuality: ConnQuality = "good";
+
 let selfUserId: string | null = null;
 let currentChannelId: string | null = null;
 // True only when we are a full call participant (joinCall). A client can also
@@ -563,10 +572,14 @@ export async function joinCall(channelId: string, muted: boolean, deafened: bool
     rawMic = null;
   }
   send("call.join", { channel_id: channelId, req_id: crypto.randomUUID(), muted, deafened });
+  startConnQualitySampling();
+  startSpeakingSampling();
 }
 
 export async function leaveCall() {
   if (!currentChannelId) return;
+  stopConnQualitySampling();
+  stopSpeakingSampling();
   send("call.leave", { channel_id: currentChannelId, req_id: crypto.randomUUID() });
   for (const peerUserId of Array.from(peers.keys())) closePeer(peerUserId);
   stopNativeScreen();
@@ -699,6 +712,159 @@ export function stopWatchingStream(channelId: string, streamId: string, ownerUse
 export function onRemoteStream(listener: RemoteStreamListener) {
   remoteVideoListeners.add(listener);
   return () => { remoteVideoListeners.delete(listener); };
+}
+
+/// Subscribe to realtime call-connection quality. Fires the current value
+/// immediately, then on every change while in a call. Sampling only runs
+/// between joinCall() and leaveCall().
+export function onConnectionQuality(listener: ConnQualityListener) {
+  connQualityListeners.add(listener);
+  listener(lastConnQuality);
+  return () => { connQualityListeners.delete(listener); };
+}
+
+function emitConnQuality(quality: ConnQuality) {
+  if (quality === lastConnQuality) return;
+  lastConnQuality = quality;
+  connQualityListeners.forEach(listener => listener(quality));
+}
+
+async function sampleConnQuality() {
+  const pcs = Array.from(peers.values());
+  if (pcs.length === 0) { emitConnQuality("good"); return; }
+  let worstRtt = 0;
+  let worstLoss = 0;
+  let anyDown = false;
+  for (const pc of pcs) {
+    if (pc.connectionState === "failed" || pc.connectionState === "disconnected") anyDown = true;
+    try {
+      const stats = await pc.getStats();
+      stats.forEach(report => {
+        const r = report as unknown as Record<string, unknown>;
+        if (r.type === "candidate-pair" && r.nominated === true && r.state === "succeeded"
+          && typeof r.currentRoundTripTime === "number") {
+          worstRtt = Math.max(worstRtt, r.currentRoundTripTime);
+        }
+        if (r.type === "remote-inbound-rtp" && typeof r.fractionLost === "number") {
+          worstLoss = Math.max(worstLoss, r.fractionLost);
+        }
+      });
+    } catch { /* stats momentarily unavailable for this peer */ }
+  }
+  if (anyDown || worstRtt >= 0.4 || worstLoss >= 0.1) emitConnQuality("poor");
+  else if (worstRtt >= 0.15 || worstLoss >= 0.04) emitConnQuality("medium");
+  else emitConnQuality("good");
+}
+
+function startConnQualitySampling() {
+  if (connQualityTimer) return;
+  connQualityTimer = setInterval(() => { void sampleConnQuality(); }, 2000);
+  void sampleConnQuality();
+}
+
+function stopConnQualitySampling() {
+  if (connQualityTimer) { clearInterval(connQualityTimer); connQualityTimer = null; }
+  emitConnQuality("good");
+}
+
+// --- Speaking indicator ----------------------------------------------------
+// Green ring around whoever is currently making sound. Polls each remote
+// peer's decoded audio level (RTCRtpReceiver.getSynchronizationSources, the
+// RFC 6464 level Chromium fills in for free) plus the local mic (a WebAudio
+// analyser on the denoised outgoing stream) ~10×/s, and emits the set of
+// user ids talking right now. A short release window keeps the ring from
+// strobing between syllables.
+type SpeakingListener = (speaking: Set<string>) => void;
+const speakingListeners = new Set<SpeakingListener>();
+let speakingUsers = new Set<string>();
+const speakingSince = new Map<string, number>();
+let speakingTimer: ReturnType<typeof setInterval> | null = null;
+let speakingAudioCtx: AudioContext | null = null;
+let localLevelAnalyser: AnalyserNode | null = null;
+let localLevelBuf: Uint8Array<ArrayBuffer> | null = null;
+// Linear audio level (~ -34 dBov) — above residual noise the APM + RNNoise
+// leave behind, below normal speech.
+const REMOTE_SPEAKING_LEVEL = 0.02;
+const LOCAL_SPEAKING_RMS = 0.02;
+const SPEAKING_RELEASE_MS = 400;
+
+/// Subscribe to the set of user ids currently speaking. Fires immediately
+/// with the current set, then on every change while in a call.
+export function onSpeaking(listener: SpeakingListener) {
+  speakingListeners.add(listener);
+  listener(new Set(speakingUsers));
+  return () => { speakingListeners.delete(listener); };
+}
+
+function emitSpeaking(next: Set<string>) {
+  if (next.size === speakingUsers.size && [...next].every(id => speakingUsers.has(id))) return;
+  speakingUsers = next;
+  speakingListeners.forEach(listener => listener(new Set(next)));
+}
+
+function localMicLevel(): number {
+  if (!localLevelAnalyser || !localLevelBuf) return 0;
+  localLevelAnalyser.getByteTimeDomainData(localLevelBuf);
+  let sum = 0;
+  for (let i = 0; i < localLevelBuf.length; i++) {
+    const v = (localLevelBuf[i] - 128) / 128;
+    sum += v * v;
+  }
+  return Math.sqrt(sum / localLevelBuf.length);
+}
+
+function sampleSpeaking() {
+  const now = performance.now();
+
+  for (const [peerUserId, pc] of peers) {
+    let level = 0;
+    for (const receiver of pc.getReceivers()) {
+      if (receiver.track?.kind !== "audio") continue;
+      const sources = receiver.getSynchronizationSources?.() ?? [];
+      for (const source of sources) {
+        if (typeof source.audioLevel === "number") level = Math.max(level, source.audioLevel);
+      }
+    }
+    if (level >= REMOTE_SPEAKING_LEVEL) speakingSince.set(peerUserId, now);
+  }
+
+  if (selfUserId && !localMuted && !localDeafened && localMicLevel() >= LOCAL_SPEAKING_RMS) {
+    speakingSince.set(selfUserId, now);
+  }
+
+  const next = new Set<string>();
+  for (const [userId, since] of speakingSince) {
+    if (now - since <= SPEAKING_RELEASE_MS) next.add(userId);
+    else speakingSince.delete(userId);
+  }
+  emitSpeaking(next);
+}
+
+function startSpeakingSampling() {
+  if (!speakingTimer) speakingTimer = setInterval(sampleSpeaking, 100);
+  if (localStream && !localLevelAnalyser) {
+    try {
+      speakingAudioCtx ??= new AudioContext();
+      if (speakingAudioCtx.state === "suspended") void speakingAudioCtx.resume().catch(() => { /* needs a gesture */ });
+      const source = speakingAudioCtx.createMediaStreamSource(localStream);
+      localLevelAnalyser = speakingAudioCtx.createAnalyser();
+      localLevelAnalyser.fftSize = 512;
+      localLevelAnalyser.smoothingTimeConstant = 0.1;
+      localLevelBuf = new Uint8Array(new ArrayBuffer(localLevelAnalyser.fftSize));
+      source.connect(localLevelAnalyser);
+    } catch (error) {
+      console.error("[rtc] speaking analyser setup failed", error);
+    }
+  }
+}
+
+function stopSpeakingSampling() {
+  if (speakingTimer) { clearInterval(speakingTimer); speakingTimer = null; }
+  localLevelAnalyser = null;
+  localLevelBuf = null;
+  if (speakingAudioCtx) { void speakingAudioCtx.close().catch(() => { /* already closed */ }); speakingAudioCtx = null; }
+  speakingSince.clear();
+  emitSpeaking(new Set());
 }
 
 export function getLocalScreenStream(): MediaStream | null {

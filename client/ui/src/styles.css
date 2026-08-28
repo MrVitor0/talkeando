@@ -444,6 +444,7 @@ a:hover {
   height: 24px;
   border-radius: 50%;
   font-size: 10px;
+  transition: box-shadow 0.12s ease;
 }
 .voice-member__name {
   flex: 1;
@@ -452,7 +453,7 @@ a:hover {
   white-space: nowrap;
 }
 .voice-member.is-speaking .voice-member__av {
-  box-shadow: 0 0 0 2px var(--green);
+  box-shadow: 0 0 0 2px var(--green), 0 0 6px 0 var(--green);
 }
 .voice-member__flag {
   flex: none;
@@ -547,9 +548,11 @@ a:hover {
   padding: 4px 4px 8px;
 }
 .voice-panel__signal {
-  width: 22px;
-  height: 22px;
-  color: var(--green);
+  width: 18px;
+  height: 18px;
+  flex: none;
+  /* colour of the *unfilled* bars (filled ones carry an explicit fill) */
+  color: var(--interactive-normal);
 }
 .voice-panel__info {
   flex: 1;
@@ -2653,4 +2656,162 @@ a:hover {
 .userbar__avatar.is-busy::after,
 .member.is-busy .member__avatar::after {
   background: var(--red);
+}
+
+/* ==========================================================================
+   Boot splash / loading screen — shown until auth.session.restore answers
+   ========================================================================== */
+.splash {
+  position: relative;
+  isolation: isolate;
+  overflow: hidden;
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 26px;
+  padding: 40px;
+  background:
+    radial-gradient(ellipse at 11% 35%, rgba(117, 81, 248, 0.5), transparent 18%),
+    radial-gradient(ellipse at 84% 46%, rgba(91, 157, 255, 0.36), transparent 25%),
+    radial-gradient(ellipse at 54% 110%, rgba(108, 59, 231, 0.3), transparent 30%),
+    linear-gradient(118deg, #180047 0%, #241276 45%, #1b83e9 100%);
+  animation: splash-in 0.35s ease both;
+}
+@keyframes splash-in { from { opacity: 0; } to { opacity: 1; } }
+
+.splash__stage {
+  position: relative;
+  width: 220px;
+  height: 220px;
+  display: grid;
+  place-items: center;
+  perspective: 900px;
+}
+.splash__glow {
+  position: absolute;
+  inset: 10%;
+  border-radius: 50%;
+  background: radial-gradient(circle, rgba(140, 120, 255, 0.55), transparent 68%);
+  filter: blur(16px);
+  animation: splash-pulse 2.4s ease-in-out infinite;
+}
+@keyframes splash-pulse {
+  0%, 100% { opacity: 0.5; transform: scale(0.9); }
+  50% { opacity: 1; transform: scale(1.08); }
+}
+.splash__ring {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  background: conic-gradient(from 0deg, transparent 0 60%, rgba(180, 160, 255, 0.9) 78%, #a8c7ff 90%, transparent 100%);
+  -webkit-mask: radial-gradient(farthest-side, transparent calc(100% - 6px), #000 calc(100% - 5px));
+          mask: radial-gradient(farthest-side, transparent calc(100% - 6px), #000 calc(100% - 5px));
+  animation: splash-spin 2.6s linear infinite;
+}
+.splash__ring--2 {
+  inset: 18px;
+  opacity: 0.55;
+  background: conic-gradient(from 90deg, transparent 0 68%, rgba(120, 200, 255, 0.9) 84%, transparent 100%);
+  animation: splash-spin 3.8s linear infinite reverse;
+}
+@keyframes splash-spin { to { transform: rotate(360deg); } }
+
+.splash__logo {
+  position: relative;
+  width: 128px;
+  height: 128px;
+  border-radius: 28px;
+  overflow: hidden;
+  transform-style: preserve-3d;
+  box-shadow: 0 18px 50px rgba(0, 0, 0, 0.45), inset 0 0 0 1px rgba(255, 255, 255, 0.06);
+  animation: splash-tilt 4.6s ease-in-out infinite;
+}
+.splash__logo img { width: 100%; height: 100%; object-fit: cover; display: block; }
+@keyframes splash-tilt {
+  0%, 100% { transform: rotateY(-16deg) rotateX(6deg); }
+  50% { transform: rotateY(16deg) rotateX(-4deg); }
+}
+
+.splash__orbit {
+  position: absolute;
+  inset: 4px;
+  animation: splash-spin 3.2s linear infinite;
+}
+.splash__orbit--b { animation-duration: 5s; animation-direction: reverse; }
+.splash__sat {
+  position: absolute;
+  top: -5px;
+  left: 50%;
+  width: 10px;
+  height: 10px;
+  margin-left: -5px;
+  border-radius: 50%;
+  background: #cdbcff;
+  box-shadow: 0 0 14px 3px rgba(160, 130, 255, 0.8);
+}
+.splash__orbit--b .splash__sat { background: #a8d4ff; box-shadow: 0 0 14px 3px rgba(120, 190, 255, 0.8); }
+
+.splash__title {
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: #e6e1ff;
+  text-shadow: 0 2px 12px rgba(60, 30, 140, 0.6);
+}
+.splash__bar {
+  width: 240px;
+  height: 4px;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.12);
+  overflow: hidden;
+}
+.splash__bar span {
+  display: block;
+  width: 38%;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, transparent, #a99bff, #7dd3ff, transparent);
+  animation: splash-slide 1.3s ease-in-out infinite;
+}
+@keyframes splash-slide {
+  0% { transform: translateX(-120%); }
+  100% { transform: translateX(360%); }
+}
+
+.splash__tips {
+  position: relative;
+  width: min(460px, 82vw);
+  height: 44px;
+}
+.splash__tip {
+  position: absolute;
+  inset: 0;
+  margin: 0;
+  text-align: center;
+  font-size: 13px;
+  line-height: 1.5;
+  color: rgba(224, 216, 255, 0.72);
+  opacity: 0;
+  transform: translateY(6px);
+  transition: opacity 0.5s ease, transform 0.5s ease;
+}
+.splash__tip.is-active { opacity: 1; transform: none; }
+.splash__tip b {
+  display: inline-block;
+  margin-right: 6px;
+  padding: 1px 6px;
+  border-radius: 4px;
+  background: rgba(160, 140, 255, 0.22);
+  color: #cdbcff;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  vertical-align: 1px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .splash__ring, .splash__ring--2, .splash__orbit, .splash__glow,
+  .splash__logo, .splash__bar span { animation: none; }
 }

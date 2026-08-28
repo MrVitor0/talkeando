@@ -199,6 +199,7 @@ function VideoTile({
   micMuted,
   peerMuted,
   focused,
+  speaking = false,
   onToggleMute,
   onToggleFocus,
   isSelf = false,
@@ -208,6 +209,7 @@ function VideoTile({
   micMuted: boolean;
   peerMuted: boolean;
   focused: boolean;
+  speaking?: boolean;
   onToggleMute: () => void;
   onToggleFocus: () => void;
   isSelf?: boolean;
@@ -246,7 +248,7 @@ function VideoTile({
   }
 
   return (
-    <div ref={wrapRef} className={focused ? "vtile is-video is-focused" : "vtile is-video"} onDoubleClick={toggleFullscreen}>
+    <div ref={wrapRef} className={"vtile is-video" + (focused ? " is-focused" : "") + (speaking ? " is-speaking" : "")} onDoubleClick={toggleFullscreen}>
       <video ref={videoRef} autoPlay playsInline muted={isSelf || peerMuted} className="vtile__video" />
       {!ready && <StreamLoading label={`Carregando a tela de ${name}`} />}
       {isSelf && (
@@ -407,8 +409,96 @@ function ContextMenu({ x, y, items, onClose }: MenuState & { onClose: () => void
   );
 }
 
+/* ------------------------------------------------------------------ */
+/* realtime call-connection quality — cellular-style signal bars       */
+/* ------------------------------------------------------------------ */
+
+function SignalBars({ quality }: { quality: rtc.ConnQuality }) {
+  const level = quality === "good" ? 3 : quality === "medium" ? 2 : 1;
+  const color =
+    quality === "good" ? "var(--green)" : quality === "medium" ? "var(--yellow)" : "var(--red)";
+  const label =
+    quality === "good" ? "Conexão boa" : quality === "medium" ? "Conexão lenta" : "Conexão muito lenta";
+  const bars = [
+    { x: 1, y: 9, height: 4 },
+    { x: 6, y: 5.5, height: 7.5 },
+    { x: 11, y: 2, height: 11 },
+  ];
+  return (
+    <svg
+      className={`voice-panel__signal is-${quality}`}
+      width={18}
+      height={18}
+      viewBox="0 0 16 16"
+      role="img"
+      aria-label={label}
+    >
+      <title>{label}</title>
+      {bars.map((bar, index) => (
+        <rect
+          key={index}
+          x={bar.x}
+          y={bar.y}
+          width={3}
+          height={bar.height}
+          rx={1}
+          fill={index < level ? color : "currentColor"}
+          opacity={index < level ? 1 : 0.25}
+        />
+      ))}
+    </svg>
+  );
+}
+
+/* ------------------------------------------------------------------ */
+/* animated boot splash — shown until the session-restore answer lands */
+/* ------------------------------------------------------------------ */
+
+const SPLASH_TIPS = [
+  "Clique com o botão direito num canal para renomeá-lo.",
+  "Fique como Ocupado pelo menu do seu perfil para silenciar as notificações.",
+  "Passe o mouse sobre quem está compartilhando a tela para espiar sem entrar na call.",
+  "As barrinhas ao lado de “Voz conectada” mostram a qualidade da conexão em tempo real.",
+  "Clique no nome de uma categoria para recolher os canais dela.",
+  "A supressão de ruído (RNNoise) fica no painel de voz, no botão “crisp”.",
+];
+
+function SplashScreen() {
+  const [tip, setTip] = useState(() => Math.floor(Math.random() * SPLASH_TIPS.length));
+  useEffect(() => {
+    const id = window.setInterval(() => setTip(current => (current + 1) % SPLASH_TIPS.length), 3800);
+    return () => window.clearInterval(id);
+  }, []);
+  return (
+    <main className="splash">
+      <div className="auth__nebula" aria-hidden="true" />
+      <div className="splash__stage" aria-hidden="true">
+        <div className="splash__glow" />
+        <div className="splash__ring" />
+        <div className="splash__ring splash__ring--2" />
+        <div className="splash__orbit"><span className="splash__sat" /></div>
+        <div className="splash__orbit splash__orbit--b"><span className="splash__sat" /></div>
+        <div className="splash__logo"><img src={logoUrl} alt="" /></div>
+      </div>
+      <div className="splash__title">Carregando o Tupi…</div>
+      <div className="splash__bar" aria-hidden="true"><span /></div>
+      <div className="splash__tips">
+        {SPLASH_TIPS.map((text, index) => (
+          <p key={index} className={index === tip ? "splash__tip is-active" : "splash__tip"}>
+            <b>DICA</b> {text}
+          </p>
+        ))}
+      </div>
+    </main>
+  );
+}
+
 export function App() {
   const [authenticated, setAuthenticated] = useState(false);
+  // False until the native host answers `auth.session.restore` (with either an
+  // `app.bootstrap` or an `auth.state_changed`). Gates the animated splash so
+  // the login form no longer flashes for already-logged-in users.
+  const [authResolved, setAuthResolved] = useState(false);
   const [register, setRegister] = useState(false);
   const [error, setError] = useState("");
   const [connectionState, setConnectionState] = useState<"connected" | "reconnecting" | "disconnected">("disconnected");
@@ -445,6 +535,10 @@ export function App() {
     try { return JSON.parse(localStorage.getItem("tk.collapsedCats") || "{}"); } catch { return {}; }
   });
   const [call, setCall] = useState<{ channelId: string; participants: Participant[] } | null>(null);
+  const [connQuality, setConnQuality] = useState<rtc.ConnQuality>("good");
+  // User ids currently making sound — drives the green speaking ring in the
+  // voice roster and on the stage tiles.
+  const [speakingUsers, setSpeakingUsers] = useState<Set<string>>(() => new Set());
   const [voiceRooms, setVoiceRooms] = useState<Record<string, VoiceRosterEntry[]>>({});
   // Live streams per voice channel — lets a member preview a share in a
   // channel they haven't joined (spectator hover).
@@ -512,8 +606,9 @@ export function App() {
 
   useEffect(() => {
     const unsubscribe = subscribe(event => {
-      if (event.op === "auth.state_changed") setAuthenticated(event.data.state === "authenticated");
+      if (event.op === "auth.state_changed") { setAuthenticated(event.data.state === "authenticated"); setAuthResolved(true); }
       if (event.op === "app.bootstrap") {
+        setAuthResolved(true);
         setAuthenticated(true); setChannels(event.data.channels ?? []); setCategories(event.data.categories ?? []); setMembers(event.data.members ?? []);
         if (typeof event.data.apiBaseUrl === "string") setApiBaseUrl(event.data.apiBaseUrl);
         if (event.data.community?.name) setCommunityName(event.data.community.name);
@@ -676,6 +771,15 @@ export function App() {
   // switch re-publishes app.bootstrap and churns the RTC/WS setup.
   useEffect(() => { send("auth.session.restore"); }, []);
 
+  // Safety net: if the native host never answers session.restore (dead bridge,
+  // offline), stop showing the splash after a few seconds and fall through to
+  // the login form instead of hanging forever.
+  useEffect(() => {
+    if (authResolved) return;
+    const timer = window.setTimeout(() => setAuthResolved(true), 8000);
+    return () => window.clearTimeout(timer);
+  }, [authResolved]);
+
   // Land on "átrio-principal" by default (fall back to the first text channel)
   // once channels arrive and nothing is open yet.
   useEffect(() => {
@@ -756,6 +860,9 @@ export function App() {
       return { ...current, [peerUserId]: stream };
     });
   }), []);
+
+  useEffect(() => rtc.onConnectionQuality(setConnQuality), []);
+  useEffect(() => rtc.onSpeaking(setSpeakingUsers), []);
 
   useEffect(() => { setSoundsMuted(deafened); }, [deafened]);
   useEffect(() => {
@@ -874,7 +981,15 @@ export function App() {
     else if (!nextDeafened && deafened) { nextMuted = preDeafenMutedRef.current; }
     // A headphone action can also mute/restore the microphone. Play one sound
     // for the action the user actually clicked, rather than both at once.
-    if (deafenChanged) playSound(nextDeafened ? "headphoneMuted" : "headphoneUnmuted");
+    if (deafenChanged) {
+      if (!nextDeafened) {
+        setSoundsMuted(false);
+      }
+      playSound(nextDeafened ? "headphoneMuted" : "headphoneUnmuted");
+      if (nextDeafened) {
+        setSoundsMuted(true);
+      }
+    }
     else if (muteChanged) playSound(nextMuted ? "micMuted" : "micUnmuted");
     setMuted(nextMuted); setDeafened(nextDeafened);
     if (call) rtc.setLocalAudioState(nextMuted, nextDeafened);
@@ -949,6 +1064,13 @@ export function App() {
   }
   function editMessage(message: Message) { const next = window.prompt("Editar mensagem", message.content); if (next === null || !next.trim() || next === message.content) return; send("chat.message.edit", { message_id: message.id, content: next, req_id: crypto.randomUUID() }); }
   function deleteMessage(message: Message) { if (!window.confirm("Excluir esta mensagem?")) return; send("chat.message.delete", { message_id: message.id, req_id: crypto.randomUUID() }); }
+
+  /* ---------------------------------------------------------------- */
+  /* boot splash — until we know whether the user is signed in        */
+  /* ---------------------------------------------------------------- */
+  if (!authResolved) {
+    return <SplashScreen />;
+  }
 
   /* ---------------------------------------------------------------- */
   /* auth screen                                                      */
@@ -1093,6 +1215,8 @@ export function App() {
       : (watching[participant.user_id] ? remoteVideos[participant.user_id] : undefined);
     const isMicMuted = isSelf ? muted : participant.muted;
 
+    const speaking = speakingUsers.has(participant.user_id);
+
     if (video) {
       return (
         <VideoTile
@@ -1102,6 +1226,7 @@ export function App() {
           micMuted={isMicMuted}
           peerMuted={!!mutedPeers[participant.user_id]}
           focused={focusedUser === participant.user_id}
+          speaking={speaking}
           onToggleMute={() => togglePeerMute(participant.user_id)}
           onToggleFocus={() => toggleFocus(participant.user_id)}
           isSelf={isSelf}
@@ -1110,7 +1235,7 @@ export function App() {
     }
 
     return (
-      <div className="vtile" key={participant.user_id}>
+      <div className={speaking ? "vtile is-speaking" : "vtile"} key={participant.user_id}>
         <Avatar label={name} size={88} className="vtile__avatar" imageUrl={isSelf ? currentUser?.avatar_url : members.find(member => member.id === participant.user_id)?.avatar_url} />
         <div className="vtile__name">
           {isMicMuted && <Icon name="mic-muted" size={14} />}
@@ -1266,7 +1391,11 @@ export function App() {
                       };
                       return (
                         <div
-                          className={isLive ? "voice-member is-live" : "voice-member"}
+                          className={
+                            "voice-member"
+                            + (isLive ? " is-live" : "")
+                            + (speakingUsers.has(entry.user_id) ? " is-speaking" : "")
+                          }
                           key={entry.user_id}
                           ref={node => { if (node) voiceRowRefs.current[entry.user_id] = node; }}
                           onMouseEnter={() => canPeek && peekEnter(channel.id, entry.user_id, share!.stream_id, here)}
@@ -1325,7 +1454,7 @@ export function App() {
         {call && (
           <div className="voice-panel">
             <div className="voice-panel__row">
-              <Icon name="wifi-connect" size={22} className="voice-panel__signal" />
+              <SignalBars quality={connQuality} />
               <div className="voice-panel__info">
                 <div className="voice-panel__state">Voz conectada</div>
                 <div className="voice-panel__chan">
