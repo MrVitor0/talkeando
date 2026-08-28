@@ -32,6 +32,14 @@ services:
       TURN_URIS: ${TURN_URIS:?set in production env}
       SPOTIFY_CLIENT_ID: ${SPOTIFY_CLIENT_ID:-}
       SPOTIFY_CLIENT_SECRET: ${SPOTIFY_CLIENT_SECRET:-}
+    volumes:
+      # Drop a Netscape cookies.txt exported from a logged-in YouTube session
+      # at ./cookies/yt.txt on the host — required, YouTube blocks this IP
+      # without it. `mkdir -p infra/cookies` so the mount source always exists.
+      - ./cookies:/cookies:ro
+      # Persist yt-dlp's cache (the fetched EJS challenge-solver script and
+      # player JS) so a redeploy doesn't re-download it on the first /play.
+      - ytdlp_cache:/home/node/.cache/yt-dlp
 
   caddy:
     image: caddy:2.10-alpine
@@ -71,3 +79,4 @@ volumes:
   attachments_data:
   caddy_data:
   caddy_config:
+  ytdlp_cache:

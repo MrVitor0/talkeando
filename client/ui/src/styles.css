@@ -393,11 +393,16 @@ a:hover {
 .chan.is-connected {
   color: var(--interactive-active);
 }
-/* Dragging a member row over a voice channel (owner-only "move member"). */
+/* Dragging a member row over a voice channel (owner-only "move member").
+   The whole `.voice-chan` block (name + occupants) is the drop zone. */
 .chan.is-drop-target {
   background: var(--bg-active);
   color: var(--interactive-active);
+}
+.voice-chan.is-voice-drop {
+  border-radius: 6px;
   box-shadow: inset 0 0 0 1.5px var(--green);
+  background: rgba(35, 165, 90, 0.08);
 }
 .voice-member.is-draggable {
   cursor: grab;
@@ -663,6 +668,9 @@ a:hover {
   border-radius: 50%;
   font-size: 12px;
   flex: none;
+}
+.avatar.userbar__avatar {
+  overflow: visible;
 }
 .userbar__avatar::after {
   content: "";
@@ -1242,13 +1250,19 @@ a:hover {
   font-size: 12px;
   flex: none;
 }
+/* `.avatar` (declared later) sets `overflow: hidden` to crop its <img>; win
+   against it by specificity so the presence dot isn't clipped with it. The
+   <img> still rounds itself via `border-radius: inherit`. */
+.avatar.member__avatar {
+  overflow: visible;
+}
 .member__avatar::after {
   content: "";
   position: absolute;
-  right: -2px;
-  bottom: -2px;
-  width: 12px;
-  height: 12px;
+  right: -3px;
+  bottom: -3px;
+  width: 14px;
+  height: 14px;
   border-radius: 50%;
   border: 3px solid var(--bg-members);
   background: var(--green);
@@ -2980,9 +2994,6 @@ a:hover {
 .msg-embed__thumb:hover { opacity: 0.92; }
 
 /* ---- Tupi Música bot row in the member roster ---- */
-.member--bot {
-  flex-wrap: wrap;
-}
 .member--bot .member__avatar::after {
   background: var(--brand); /* bot dot, not the green "online" */
 }
@@ -2990,15 +3001,32 @@ a:hover {
   background: var(--brand);
   color: #fff;
 }
-.member--bot .member__status {
-  flex-basis: 100%;
-  margin-left: 44px; /* 32px avatar + 12px gap → aligns under the name */
+.member__lines {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 2px;
+  min-width: 0;
+  flex: 1;
+  line-height: 1.2;
+}
+.member__lines .member__name {
+  flex: none;
+}
+.member__status {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  margin: 0;
   font-size: 12px;
   font-weight: 500;
   color: var(--green);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+.member__status-icon {
+  flex: none;
 }
 
 /* Tupi Música "TOCANDO" badge — purple (brand), vs the red "AO VIVO" */

@@ -222,6 +222,10 @@ pub async fn history(
             url: format!("/api/attachments/{}", attachment.id),
         });
     }
+    // The keyset query above fetches the *latest* `limit` rows newest-first;
+    // flip to chronological so the client renders oldest→newest, matching how
+    // live `chat.message.created` events are appended to the bottom.
+    rows.reverse();
     let messages = rows.into_iter().map(|row| HistoryMessage {
         id: row.id,
         channel_id: row.channel_id,

@@ -581,6 +581,17 @@ async fn handle_music_command(state: &AppState, user_id: Uuid, data: MusicComman
         state.hub.send_to(user_id, OutboundEnvelope::error("service_unavailable", "o Tupi Música está iniciando; tente novamente em instantes", None)).await;
         return;
     }
+    // Remember who summoned the bot into this voice channel: teardown_call_
+    // membership uses it to yank the bot when that DJ leaves, so a finished
+    // session can't strand "Tupi Música" in an empty room.
+    {
+        let mut djs = state.hub.music_djs.write().await;
+        match data.command.as_str() {
+            "play" => { djs.insert(data.voice_channel_id, user_id); }
+            "stop" => { djs.remove(&data.voice_channel_id); }
+            _ => {}
+        }
+    }
     state.hub.send_to(MUSIC_BOT_ID, OutboundEnvelope::new("music.command", serde_json::json!({
         "channel_id": data.channel_id, "voice_channel_id": data.voice_channel_id,
         "command": data.command, "query": data.query, "requested_by": user_id
@@ -1072,8 +1083,11 @@ async fn handle_voice_move_member(state: &AppState, actor_id: Uuid, data: VoiceM
         return;
     }
 
-    // Target must belong to the destination channel's community.
-    if !matches!(db::channel_if_member(&state.pool, dest.id, data.user_id).await, Ok(Some(_))) {
+    // Target must belong to the destination channel's community — except the
+    // music bot, which is a virtual participant with no membership row.
+    if data.user_id != MUSIC_BOT_ID
+        && !matches!(db::channel_if_member(&state.pool, dest.id, data.user_id).await, Ok(Some(_)))
+    {
         state.hub.send_to(actor_id, OutboundEnvelope::error("validation_error", "that member is not in this community", None)).await;
         return;
     }

@@ -26,3 +26,6 @@ scripts/discord-import/*.json
 *.swp
 Thumbs.db
 .DS_Store
+
+# YouTube cookies for the music bot (auth material — never commit)
+infra/cookies/

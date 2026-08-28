@@ -2,6 +2,7 @@
 // PCM into node-webrtc's RTCAudioSource, then one PeerConnection per caller
 // carries Opus directly across the existing mesh.
 const WebSocket = require("ws");
+const fs = require("fs");
 // `wrtc` (node-webrtc) has been unmaintained since 2020 and has no working
 // prebuilt binaries for Node >= 16 — on node:18 it crashes the process the
 // first time an RTCPeerConnection / RTCAudioSource is created, which showed
@@ -17,19 +18,36 @@ const WS_URL = process.env.TUPI_WS_URL || "ws://tupi-server:8080/ws";
 const token = process.env.MUSIC_BOT_TOKEN || process.env.TURN_SHARED_SECRET;
 if (!token) throw new Error("MUSIC_BOT_TOKEN is required");
 let ws, voiceChannel = null, current = null, paused = false;
+// The server-side id of the `music` stream we currently have published, so we
+// can retract it the moment playback ends instead of leaving a phantom
+// "TOCANDO" in everyone's sidebar.
+let publishedStreamId = null;
+// When the bot went quiet (song finished, or /pause). The watchdog uses this
+// to leave the channel after IDLE_TIMEOUT_MS so it never sits there forever.
+let idleSince = 0;
+const IDLE_TIMEOUT_MS = 5 * 60 * 1000;
 const peers = new Map();
 
+const log = (...args) => console.log(new Date().toISOString(), "[music-bot]", ...args);
 function send(op, data) { ws?.readyState === WebSocket.OPEN && ws.send(JSON.stringify({ v: 1, op, data })); }
-function turnServers() {
+function iceServers() {
   const expiry = Math.floor(Date.now() / 1000) + 3600;
   const username = `${expiry}:${BOT_ID}`;
   const credential = crypto.createHmac("sha1", process.env.TURN_SHARED_SECRET || "").update(username).digest("base64");
-  return [{ urls: (process.env.TURN_URIS || "").split(",").filter(Boolean), username, credential }];
+  const turnUris = (process.env.TURN_URIS || "").split(",").map(s => s.trim()).filter(Boolean);
+  const servers = [{ urls: "stun:stun.l.google.com:19302" }];
+  if (turnUris.length) servers.push({ urls: turnUris, username, credential });
+  return servers;
 }
 async function peer(userId) {
   if (peers.has(userId)) return peers.get(userId);
-  const pc = new wrtc.RTCPeerConnection({ iceServers: turnServers() }); peers.set(userId, pc);
+  const pc = new wrtc.RTCPeerConnection({ iceServers: iceServers() }); peers.set(userId, pc);
   pc.onicecandidate = ({ candidate }) => candidate && send("rtc.ice", { channel_id: voiceChannel, to: userId, candidate: candidate.toJSON() });
+  pc.oniceconnectionstatechange = () => log(`peer ${userId}: iceConnectionState=${pc.iceConnectionState}`);
+  pc.onconnectionstatechange = () => {
+    log(`peer ${userId}: connectionState=${pc.connectionState}`);
+    if (pc.connectionState === "failed") log(`peer ${userId}: ICE FAILED — check TURN reachability from the container`);
+  };
   if (current?.track) pc.addTrack(current.track);
   return pc;
 }
@@ -46,6 +64,24 @@ async function addTrackToPeers() {
 function stopPlayback() {
   if (current?.yt) current.yt.kill("SIGKILL"); if (current?.ffmpeg) current.ffmpeg.kill("SIGKILL");
   if (current?.track) current.track.stop(); current = null; paused = false;
+}
+// Retract the published `music` stream (clears the "TOCANDO" badge) without
+// leaving the voice channel — used when a track finishes so a quick next
+// /play doesn't have to rejoin.
+function unpublishCurrent() {
+  if (publishedStreamId && voiceChannel) send("stream.unpublish", { channel_id: voiceChannel, stream_id: publishedStreamId });
+  publishedStreamId = null;
+}
+// Full teardown: stop audio, retract the stream, drop every peer and leave
+// the call. `call.leave` alone also retracts the stream server-side, but
+// unpublishing first keeps the sidebar in sync a beat earlier.
+function leaveVoice() {
+  stopPlayback();
+  unpublishCurrent();
+  if (voiceChannel) send("call.leave", { channel_id: voiceChannel });
+  for (const pc of peers.values()) pc.close(); peers.clear();
+  voiceChannel = null;
+  idleSince = 0;
 }
 async function resolveSources(query) {
   const match = query.match(/^https:\/\/open\.spotify\.com\/(track|playlist)\/([A-Za-z0-9]+)/);
@@ -69,21 +105,72 @@ async function resolveSources(query) {
   if (!sources.length) throw new Error("playlist Spotify vazia ou indisponível");
   return sources;
 }
+// YouTube blocks datacenter IPs outright ("Sign in to confirm you're not a
+// bot") — no player_client bypasses it any more, only real cookies. Drop a
+// Netscape cookies.txt at YT_DLP_COOKIES (default /cookies/yt.txt, mounted
+// read-only by docker-compose) and the bot uses it automatically. yt-dlp
+// rewrites the cookie jar on exit, so it works from a /tmp copy (the mount
+// is read-only).
+const COOKIES_SRC = process.env.YT_DLP_COOKIES || "/cookies/yt.txt";
+const COOKIES_WORK = "/tmp/yt-cookies.txt";
+function cookiesFile() {
+  try {
+    if (fs.statSync(COOKIES_SRC).size === 0) return null;
+    fs.copyFileSync(COOKIES_SRC, COOKIES_WORK);
+    return COOKIES_WORK;
+  } catch { return null; }
+}
+
 async function startPlayback(query) {
   stopPlayback();
   const sources = await resolveSources(query);
-  const yt = spawn("yt-dlp", ["--no-progress", "-f", "bestaudio", "-o", "-", ...sources], { stdio: ["ignore", "pipe", "pipe"] });
+  const cookies = cookiesFile();
+  log(`startPlayback: ${JSON.stringify(sources)} (cookies: ${cookies ? "yes" : "NONE — YouTube will block this"})`);
+  const ytArgs = [
+    "--no-progress", "--no-warnings",
+    // Modern YouTube needs a JS runtime + the EJS challenge-solver script to
+    // descramble the `n` throttling param and signatures. Deno is baked into
+    // the image; `--remote-components` opts in to fetching the solver.
+    "--js-runtimes", "deno",
+    "--remote-components", "ejs:github",
+    "-f", "bestaudio/best", "-o", "-",
+  ];
+  if (cookies) ytArgs.push("--cookies", cookies);
+  ytArgs.push(...sources);
+  const yt = spawn("yt-dlp", ytArgs, { stdio: ["ignore", "pipe", "pipe"] });
   const ffmpeg = spawn("ffmpeg", ["-hide_banner", "-loglevel", "error", "-i", "pipe:0", "-f", "s16le", "-ar", "48000", "-ac", "2", "pipe:1"], { stdio: ["pipe", "pipe", "pipe"] });
   yt.stdout.pipe(ffmpeg.stdin);
+  // Surface both toolchains' errors — without this a blocked download or a
+  // broken stream just produces silence with no explanation.
+  yt.stderr.on("data", d => process.stderr.write(`[yt-dlp] ${d}`));
+  ffmpeg.stderr.on("data", d => process.stderr.write(`[ffmpeg] ${d}`));
+  yt.on("close", code => log(`yt-dlp exited (code ${code})`));
   const audio = new wrtc.nonstandard.RTCAudioSource(); const track = audio.createTrack();
-  current = { yt, ffmpeg, track, audio };
+  current = { yt, ffmpeg, track, audio, label: query };
+  idleSince = 0;
+  let bytesOut = 0;
   ffmpeg.stdout.on("data", chunk => {
+    if (bytesOut === 0) log(`first PCM chunk from ffmpeg (${chunk.length} bytes) — audio pipeline is producing sound`);
+    bytesOut += chunk.length;
     if (paused || !current) return;
     const frames = Math.floor(chunk.length / 4); if (!frames) return;
-    const samples = new Int16Array(chunk.buffer, chunk.byteOffset, frames * 2);
+    // Copy into a fresh, offset-0 buffer so the Int16 view is always aligned
+    // and the pooled stream buffer can't be recycled under us.
+    const owned = Buffer.allocUnsafe(frames * 4);
+    chunk.copy(owned, 0, 0, frames * 4);
+    const samples = new Int16Array(owned.buffer, owned.byteOffset, frames * 2);
     audio.onData({ samples, sampleRate: 48000, bitsPerSample: 16, channelCount: 2, numberOfFrames: frames });
   });
-  ffmpeg.on("close", () => { if (current?.ffmpeg === ffmpeg) stopPlayback(); });
+  // Track (or playlist) finished: drop the stream so "TOCANDO" clears, and
+  // start the idle countdown — the watchdog leaves the channel if nothing
+  // else is queued up.
+  ffmpeg.on("close", () => {
+    if (current?.ffmpeg !== ffmpeg) return;
+    log(`playback ended (${bytesOut} bytes of PCM total)${bytesOut === 0 ? " — NOTHING was decoded; see [yt-dlp] output above" : ""}`);
+    stopPlayback();
+    unpublishCurrent();
+    idleSince = Date.now();
+  });
   return addTrackToPeers();
 }
 async function join(channelId) {
@@ -102,11 +189,64 @@ async function onEvent(op, data) {
   else if (op === "rtc.answer") { const pc = peers.get(data.from); if (pc) await pc.setRemoteDescription({ type: "answer", sdp: data.sdp }); }
   else if (op === "rtc.ice") { const pc = await peer(data.from); await pc.addIceCandidate(data.candidate); }
   else if (op === "music.command") {
-    if (data.command === "play") { await join(data.voice_channel_id); await startPlayback(data.query); send("stream.publish", { channel_id: data.voice_channel_id, stream_id: crypto.randomUUID(), kind: "music", label: data.query, has_audio: true }); }
-    if (data.command === "pause") paused = true;
-    if (data.command === "resume") paused = false;
-    if (data.command === "stop") { stopPlayback(); if (voiceChannel) send("call.leave", { channel_id: voiceChannel }); voiceChannel = null; }
+    log(`music.command: ${data.command} ${JSON.stringify(data.query ?? "")}`);
+    if (data.command === "play") {
+      try {
+        await join(data.voice_channel_id);
+        await startPlayback(data.query);
+        publishedStreamId = crypto.randomUUID();
+        send("stream.publish", { channel_id: data.voice_channel_id, stream_id: publishedStreamId, kind: "music", label: data.query, has_audio: true });
+      } catch (error) {
+        log(`play failed: ${error && error.message ? error.message : error}`);
+        unpublishCurrent();
+      }
+    }
+    if (data.command === "pause") { paused = true; idleSince = Date.now(); }
+    if (data.command === "resume") { paused = false; idleSince = 0; }
+    if (data.command === "stop") leaveVoice();
+  }
+  // An owner dragged the bot to another voice channel — follow it, carrying
+  // the current track over to the new room.
+  else if (op === "voice.moved" && data.channel_id && data.channel_id !== voiceChannel) {
+    const stillPlaying = !!current;
+    const label = current?.label ?? "música";
+    await join(data.channel_id);
+    if (stillPlaying) {
+      publishedStreamId = crypto.randomUUID();
+      send("stream.publish", { channel_id: data.channel_id, stream_id: publishedStreamId, kind: "music", label, has_audio: true });
+    } else {
+      publishedStreamId = null;
+      idleSince = idleSince || Date.now();
+    }
   }
 }
-function connect() { ws = new WebSocket(WS_URL); ws.on("open", () => send("auth.hello", { token })); ws.on("message", raw => { try { const e = JSON.parse(raw); void onEvent(e.op, e.data || {}); } catch (error) { console.error(error); } }); ws.on("close", () => setTimeout(connect, 2000)); ws.on("error", error => console.error(error.message)); }
+
+// Watchdog: never let the bot sit in a channel doing nothing. Leaves once it
+// has been paused / silent for IDLE_TIMEOUT_MS.
+setInterval(() => {
+  if (!voiceChannel) return;
+  if (current && !paused) { idleSince = 0; return; }
+  if (!idleSince) idleSince = Date.now();
+  if (Date.now() - idleSince >= IDLE_TIMEOUT_MS) {
+    console.log("music-bot: idle timeout reached, leaving voice channel");
+    leaveVoice();
+  }
+}, 30 * 1000);
+function connect() {
+  log(`connecting to ${WS_URL}`);
+  ws = new WebSocket(WS_URL);
+  ws.on("open", () => { log("ws open — sending auth.hello"); send("auth.hello", { token }); });
+  ws.on("message", raw => {
+    try {
+      const e = JSON.parse(raw);
+      if (e.op === "auth.ok") log("authenticated as the music bot");
+      if (e.op === "auth.rejected") log(`AUTH REJECTED: ${JSON.stringify(e.data)} — check MUSIC_BOT_TOKEN matches the server`);
+      if (e.op === "error") log(`server error: ${JSON.stringify(e.data)}`);
+      void onEvent(e.op, e.data || {});
+    } catch (error) { console.error(error); }
+  });
+  ws.on("close", () => { log("ws closed — reconnecting in 2s"); setTimeout(connect, 2000); });
+  ws.on("error", error => log(`ws error: ${error.message}`));
+}
+process.on("unhandledRejection", reason => log(`unhandledRejection: ${reason && reason.stack ? reason.stack : reason}`));
 connect();

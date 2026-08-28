@@ -39,6 +39,33 @@ jobs:
           chmod 600 ~/.ssh/talkeando-production
           ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
 
+      # YouTube blocks this datacenter IP outright — the music bot only works
+      # with cookies from a (throwaway) logged-in account. Store the Netscape
+      # cookies.txt as base64 in the YT_DLP_COOKIES_B64 secret; it is written
+      # to the host at the path the compose `./cookies:/cookies:ro` mount
+      # expects. Refresh it any time by updating the secret and re-running the
+      # workflow (workflow_dispatch). Absent secret => step is a no-op.
+      - name: Deploy music-bot YouTube cookies
+        env:
+          DEPLOY_HOST: ${{ secrets.LIGHTSAIL_HOST }}
+          YT_DLP_COOKIES_B64: ${{ secrets.YT_DLP_COOKIES_B64 }}
+        run: |
+          if [ -z "${YT_DLP_COOKIES_B64:-}" ]; then
+            echo "YT_DLP_COOKIES_B64 not set — skipping (music bot will fail on YouTube)."
+            exit 0
+          fi
+          printf '%s' "$YT_DLP_COOKIES_B64" | base64 --decode \
+          | ssh -i ~/.ssh/talkeando-production "ubuntu@$DEPLOY_HOST" '
+              set -eu
+              mkdir -p /opt/talkeando/infra/cookies
+              umask 077
+              cat > /opt/talkeando/infra/cookies/yt.txt.new
+              head -c 8192 /opt/talkeando/infra/cookies/yt.txt.new | grep -qiE "cookie|youtube\.com" \
+                || { echo "decoded content does not look like a cookies.txt — aborting"; rm -f /opt/talkeando/infra/cookies/yt.txt.new; exit 1; }
+              mv /opt/talkeando/infra/cookies/yt.txt.new /opt/talkeando/infra/cookies/yt.txt
+              echo "cookies deployed: $(wc -l < /opt/talkeando/infra/cookies/yt.txt) lines"
+            '
+
       - name: Upload and apply release
         env:
           DEPLOY_HOST: ${{ secrets.LIGHTSAIL_HOST }}

@@ -819,8 +819,11 @@ export function App() {
       // The owner dragged us (or we dragged ourselves) into another voice
       // channel — join it, reusing the normal join path.
       if (event.op === "voice.moved") {
-        const dest = channels.find(channel => channel.id === event.data.channel_id);
-        if (dest) { setActiveChannel(dest); joinCall(dest); }
+        const destId: string = event.data.channel_id;
+        const dest = channels.find(channel => channel.id === destId)
+          ?? { id: destId, name: "", kind: "voice" as const };
+        setActiveChannel(dest);
+        joinCall(dest);
       }
       if (event.op === "voice.rooms") {
         const rooms: Array<{ channel_id: string; participants: VoiceRosterEntry[]; streams?: StreamInfo[] }> = event.data.rooms ?? [];
@@ -985,25 +988,67 @@ export function App() {
   // text channel / finishing a history load, and keep following new messages
   // as long as the reader is already near the bottom (scrolling up to read
   // history is respected).
+  // `atBottomRef` = "the view is glued to the newest message". It starts true
+  // and only a *deliberate* upward scroll by the reader detaches it; layout
+  // shifts from late-loading media (images, embeds, avatars, fonts) must never
+  // detach it, or opening a channel would land mid-history. A short guard
+  // window after every programmatic pin makes the `scroll` listener ignore the
+  // scroll events our own pinning produces.
   const atBottomRef = useRef(true);
-  useEffect(() => {
+  const pinGuardUntilRef = useRef(0);
+  const pinToBottom = () => {
     const el = messagesScrollRef.current;
     if (!el) return;
-    const onScroll = () => {
-      atBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 120;
-    };
-    el.addEventListener("scroll", onScroll, { passive: true });
-    return () => el.removeEventListener("scroll", onScroll);
-  }, [activeChannel?.id, activeChannel?.kind]);
-  useEffect(() => {
-    const el = messagesScrollRef.current;
-    if (!el) return;
+    pinGuardUntilRef.current = performance.now() + 200;
     el.scrollTop = el.scrollHeight;
-    atBottomRef.current = true;
-  }, [activeChannel?.id, activeChannel?.kind, historyLoading]);
+  };
   useEffect(() => {
     const el = messagesScrollRef.current;
-    if (el && atBottomRef.current) el.scrollTop = el.scrollHeight;
+    if (!el) return;
+    const gap = () => el.scrollHeight - el.scrollTop - el.clientHeight;
+    const onScroll = () => {
+      if (performance.now() < pinGuardUntilRef.current) return; // our own pin
+      atBottomRef.current = gap() < 120;
+    };
+    // A real "I want to read history" gesture wins immediately, even while
+    // media is still settling (bypasses the pin guard).
+    const onWheel = (e: WheelEvent) => {
+      if (e.deltaY < 0) { pinGuardUntilRef.current = 0; atBottomRef.current = false; }
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (["PageUp", "ArrowUp", "Home"].includes(e.key)) { pinGuardUntilRef.current = 0; atBottomRef.current = false; }
+    };
+    const onTouch = () => { pinGuardUntilRef.current = 0; atBottomRef.current = gap() < 120; };
+    el.addEventListener("scroll", onScroll, { passive: true });
+    el.addEventListener("wheel", onWheel, { passive: true });
+    el.addEventListener("keydown", onKey);
+    el.addEventListener("touchmove", onTouch, { passive: true });
+    // Re-pin on any content-height change while still glued to the bottom —
+    // this is what keeps the newest message in view as images/embeds resolve.
+    const inner = el.firstElementChild;
+    const observer = inner ? new ResizeObserver(() => { if (atBottomRef.current) pinToBottom(); }) : null;
+    if (inner && observer) observer.observe(inner);
+    return () => {
+      el.removeEventListener("scroll", onScroll);
+      el.removeEventListener("wheel", onWheel);
+      el.removeEventListener("keydown", onKey);
+      el.removeEventListener("touchmove", onTouch);
+      observer?.disconnect();
+    };
+  }, [activeChannel?.id, activeChannel?.kind]);
+  // Opening a text channel / finishing a history load: force to the bottom and
+  // keep re-pinning briefly while async media settles into its real height.
+  useEffect(() => {
+    if (historyLoading) return;
+    atBottomRef.current = true;
+    pinToBottom();
+    const raf = requestAnimationFrame(pinToBottom);
+    const timers = [80, 250, 600, 1200].map(ms => window.setTimeout(pinToBottom, ms));
+    return () => { cancelAnimationFrame(raf); timers.forEach(clearTimeout); };
+  }, [activeChannel?.id, activeChannel?.kind, historyLoading]);
+  // New / edited message: follow only if still glued to the bottom.
+  useEffect(() => {
+    if (atBottomRef.current) pinToBottom();
   }, [messages]);
 
   // After joining a channel via a preview's "Assistir", auto-promote to a full
@@ -1427,12 +1472,15 @@ export function App() {
       ];
     }
     const member = members.find(entry => entry.id === userId);
+    const callmate = call?.participants.find(participant => participant.user_id === userId);
     const items: MenuItem[] = [];
-    // In a call together → let me tune this person's volume, just for me.
-    if (call && call.participants.some(participant => participant.user_id === userId && !participant.is_bot)) {
+    // In a call together → tune this person's (or the music bot's) volume,
+    // just for me. The bot's audio is a normal peer track, so the same
+    // rtc.setPeerVolume path works.
+    if (callmate) {
       items.push({
         kind: "slider",
-        label: "Volume do usuário",
+        label: callmate.is_bot ? "Volume da música" : "Volume do usuário",
         value: Math.round((peerVolumes[userId] ?? 1) * 100),
         min: 0,
         max: 200,
@@ -1660,7 +1708,31 @@ export function App() {
                 ]
               : roster;
             return (
-              <div key={channel.id}>
+              // The whole channel block (name + occupant list) is the drop
+              // zone for "move member" — dropping onto just the thin name
+              // button used to miss whenever the channel had occupants shown.
+              <div
+                key={channel.id}
+                className={canMoveMembers && dragOverVoice === channel.id ? "voice-chan is-voice-drop" : "voice-chan"}
+                onDragOver={canMoveMembers ? (event => {
+                  if (!event.dataTransfer.types.includes("application/x-tk-member")) return;
+                  event.preventDefault();
+                  event.dataTransfer.dropEffect = "move";
+                  if (dragOverVoice !== channel.id) setDragOverVoice(channel.id);
+                }) : undefined}
+                onDragLeave={canMoveMembers ? (event => {
+                  // Ignore leave events fired while crossing onto a child row.
+                  if (event.currentTarget.contains(event.relatedTarget as Node | null)) return;
+                  setDragOverVoice(current => current === channel.id ? null : current);
+                }) : undefined}
+                onDrop={canMoveMembers ? (event => {
+                  event.preventDefault();
+                  setDragOverVoice(null);
+                  const userId = event.dataTransfer.getData("application/x-tk-member");
+                  const from = event.dataTransfer.getData("application/x-tk-member-src");
+                  if (userId && from !== channel.id) send("voice.move_member", { user_id: userId, channel_id: channel.id });
+                }) : undefined}
+              >
                 <button
                   className={
                     "chan" +
@@ -1670,20 +1742,6 @@ export function App() {
                   }
                   onClick={() => chooseVoiceChannel(channel)}
                   onContextMenu={event => openMenu(event, channelMenuItems(channel))}
-                  onDragOver={canMoveMembers ? (event => {
-                    if (!event.dataTransfer.types.includes("application/x-tk-member")) return;
-                    event.preventDefault();
-                    event.dataTransfer.dropEffect = "move";
-                    setDragOverVoice(channel.id);
-                  }) : undefined}
-                  onDragLeave={canMoveMembers ? (() => setDragOverVoice(current => current === channel.id ? null : current)) : undefined}
-                  onDrop={canMoveMembers ? (event => {
-                    event.preventDefault();
-                    setDragOverVoice(null);
-                    const userId = event.dataTransfer.getData("application/x-tk-member");
-                    const from = event.dataTransfer.getData("application/x-tk-member-src");
-                    if (userId && from !== channel.id) send("voice.move_member", { user_id: userId, channel_id: channel.id });
-                  }) : undefined}
                 >
                   <Icon name="voice-chat" size={18} className="chan__icon" />
                   <span className="chan__name">{channel.name}</span>
@@ -1733,12 +1791,12 @@ export function App() {
                             + (isBot ? " voice-member--bot" : "")
                             + (isLive ? " is-live" : "")
                             + (!isBot && speakingUsers.has(entry.user_id) ? " is-speaking" : "")
-                            + (canMoveMembers && !isBot ? " is-draggable" : "")
+                            + (canMoveMembers ? " is-draggable" : "")
                           }
                           key={entry.user_id}
                           ref={node => { if (node) voiceRowRefs.current[entry.user_id] = node; }}
-                          draggable={(canMoveMembers && !isBot) || undefined}
-                          onDragStart={canMoveMembers && !isBot ? (event => {
+                          draggable={canMoveMembers || undefined}
+                          onDragStart={canMoveMembers ? (event => {
                             event.dataTransfer.setData("application/x-tk-member", entry.user_id);
                             event.dataTransfer.setData("application/x-tk-member-src", channel.id);
                             event.dataTransfer.effectAllowed = "move";
@@ -1748,7 +1806,7 @@ export function App() {
                           onMouseLeave={() => canPeek && peekLeave(entry.user_id)}
                           onContextMenu={event => openMenu(event, memberMenuItems(entry.user_id))}
                         >
-                          <Avatar label={name} size={24} className="voice-member__av" imageUrl={members.find(member => member.id === entry.user_id)?.avatar_url} />
+                          <Avatar label={name} size={24} className="voice-member__av" imageUrl={isBot ? "/tupi-mascot.png" : members.find(member => member.id === entry.user_id)?.avatar_url} />
                           <span className="voice-member__name">{name}</span>
                           {micMuted && <Icon name="mic-muted" size={15} className="voice-member__flag" />}
                           {audioOff && <Icon name="headphone-muted" size={15} className="voice-member__flag" />}
@@ -2074,10 +2132,7 @@ export function App() {
                               src={attachment.url ?? ""}
                               alt={attachment.filename}
                               loading="lazy"
-                              onLoad={() => {
-                                const el = messagesScrollRef.current;
-                                if (el && atBottomRef.current) el.scrollTop = el.scrollHeight;
-                              }}
+                              onLoad={() => { if (atBottomRef.current) pinToBottom(); }}
                             />
                           </button>
                         ) : (
@@ -2244,9 +2299,16 @@ function MemberList({
     <>
       <div className="members__group">Online — {online.length + 1}</div>
       <div className="member member--bot">
-        <Avatar label="Tupi Música" size={32} className="member__avatar" />
-        <span className="member__name">Tupi Música<small className="member__tag">BOT</small></span>
-        {botNowPlaying && <span className="member__status">🎵 {botNowPlaying}</span>}
+        <Avatar label="Tupi Música" size={32} className="member__avatar" imageUrl="/tupi-mascot.png" />
+        <div className="member__lines">
+          <span className="member__name">Tupi Música<small className="member__tag">BOT</small></span>
+          {botNowPlaying && (
+            <span className="member__status">
+              <Icon name="sound-effects" size={13} className="member__status-icon" />
+              {botNowPlaying}
+            </span>
+          )}
+        </div>
       </div>
       {online.map(member => row(member, false))}
       {offline.length > 0 && <div className="members__group">Offline — {offline.length}</div>}
