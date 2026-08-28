@@ -71,7 +71,7 @@ jobs:
       - name: Build Installer (Inno Setup)
         shell: pwsh
         run: |
-          iscc /DAppVersion="0.1.${{ github.run_number }}" /DPublishDir="${{ github.workspace }}\release\Tupi-win-x64" client/native/installer/Tupi.iss
+          iscc /DAppVersion="${{ inputs.version_label }}" /DPublishDir="${{ github.workspace }}\release\Tupi-win-x64" client/native/installer/Tupi.iss
 
       - uses: actions/upload-artifact@v4
         with:

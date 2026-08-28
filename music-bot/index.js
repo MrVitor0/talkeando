@@ -173,11 +173,10 @@ async function startPlayback(query) {
 
     pcmBuffer = Buffer.concat([pcmBuffer, chunk]);
     while (pcmBuffer.length >= FRAME_SIZE_BYTES) {
-      const owned = Buffer.allocUnsafe(FRAME_SIZE_BYTES);
-      pcmBuffer.copy(owned, 0, 0, FRAME_SIZE_BYTES);
-      pcmBuffer = pcmBuffer.slice(FRAME_SIZE_BYTES);
+      const samples = new Int16Array(SAMPLES_PER_CHUNK);
+      Buffer.from(samples.buffer).set(pcmBuffer.subarray(0, FRAME_SIZE_BYTES));
+      pcmBuffer = pcmBuffer.subarray(FRAME_SIZE_BYTES);
 
-      const samples = new Int16Array(owned.buffer, owned.byteOffset, SAMPLES_PER_CHUNK);
       audio.onData({
         samples,
         sampleRate: 48000,
