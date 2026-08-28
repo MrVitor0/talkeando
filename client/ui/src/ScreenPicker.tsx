@@ -74,9 +74,13 @@ export function ScreenPicker({
   const [height, setHeight] = useState<number>(720);
   const [fps, setFps] = useState<number>(30);
   const [presetOpen, setPresetOpen] = useState(false);
+  const [sourceTab, setSourceTab] = useState<"window" | "screen">("window");
+  const [showAllSources, setShowAllSources] = useState(false);
 
   const screens = sources.filter(source => source.kind === "screen");
   const windows = sources.filter(source => source.kind === "window");
+  const tabSources = sourceTab === "window" ? windows : screens;
+  const visibleSources = showAllSources ? tabSources : tabSources.slice(0, 4);
   const selectedSource = sources.find(source => source.id === selected) ?? null;
 
   const presetLabel = useMemo(() => {
@@ -115,26 +119,38 @@ export function ScreenPicker({
     <div className="sp-overlay" onClick={onCancel}>
       <div className="sp-modal" onClick={event => event.stopPropagation()}>
         {step === "source" ? (
-          <>
-            <div className="sp-modal__head">
+          <div className="sp-source">
+            <div className="sp-modal__head sp-source__intro">
+              <ShareHero />
+              <div className="sp-source__intro-copy">
               <h2>Compartilhar sua tela</h2>
+                <p>Escolha o que você quer transmitir para a chamada.</p>
+              </div>
               <button className="sp-x" onClick={onCancel} aria-label="Fechar">✕</button>
             </div>
 
-            <div className="sp-body">
+            <div className="sp-body sp-source__body">
               {loading && <p className="empty">Procurando telas e janelas…</p>}
               {!loading && sources.length === 0 && <p className="empty">Nada encontrado para compartilhar.</p>}
 
-              {screens.length > 0 && (
+              {sources.length > 0 && (
                 <>
-                  <div className="sp-section">Telas</div>
-                  <div className="sp-grid">{screens.map(card)}</div>
-                </>
-              )}
-              {windows.length > 0 && (
-                <>
-                  <div className="sp-section">Janelas</div>
-                  <div className="sp-grid">{windows.map(card)}</div>
+                  <div className="sp-tabs" role="tablist" aria-label="Tipo de compartilhamento">
+                    <button className={sourceTab === "window" ? "is-active" : ""} role="tab" aria-selected={sourceTab === "window"} onClick={() => { setSourceTab("window"); setShowAllSources(false); }}>
+                      Aplicativos <small>{windows.length}</small>
+                    </button>
+                    <button className={sourceTab === "screen" ? "is-active" : ""} role="tab" aria-selected={sourceTab === "screen"} onClick={() => { setSourceTab("screen"); setShowAllSources(false); }}>
+                      Telas <small>{screens.length}</small>
+                    </button>
+                  </div>
+                  {tabSources.length > 0
+                    ? <div className="sp-grid sp-grid--source">{visibleSources.map(card)}</div>
+                    : <p className="sp-source__empty">Nenhuma opção disponível nesta categoria.</p>}
+                  {tabSources.length > 4 && (
+                    <button className="sp-show-more" onClick={() => setShowAllSources(value => !value)}>
+                      {showAllSources ? "Mostrar menos" : `Ver mais ${tabSources.length - 4} opções`}
+                    </button>
+                  )}
                 </>
               )}
             </div>
@@ -147,7 +163,7 @@ export function ScreenPicker({
                 </button>
               </div>
             </div>
-          </>
+          </div>
         ) : (
           <div className="sp-wizard">
             <ShareHero />

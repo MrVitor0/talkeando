@@ -908,27 +908,44 @@ export function App() {
   if (!authenticated) {
     return (
       <main className="auth">
-        <section className="auth__card">
-          <h1>{register ? "Criar uma conta" : "Que bom te ver de novo!"}</h1>
-          <p>{register ? "Use seu código de convite para entrar." : "Entre no seu espaço privado do Tupi."}</p>
-          {error && <p className="auth__error">{error}</p>}
-          <form onSubmit={submitAuth}>
-            {register && (
-              <>
-                <label className="auth__field"><span>Código do convite</span><input name="invite_code" required /></label>
-                <label className="auth__field"><span>Como quer ser chamado</span><input name="display_name" required /></label>
-              </>
-            )}
-            <label className="auth__field"><span>Usuário</span><input name="username" required /></label>
-            <label className="auth__field"><span>Senha</span><input name="password" type="password" minLength={8} required /></label>
-            <button className="auth__submit">{register ? "Criar conta" : "Entrar"}</button>
-          </form>
-          <div className="auth__link">
-            {register ? "Já tem uma conta? " : "Tem um convite? "}
-            <button onClick={() => { setRegister(value => !value); setError(""); }}>
-              {register ? "Fazer login" : "Registrar-se"}
-            </button>
+        <div className="auth__nebula" aria-hidden="true" />
+        <span className="auth__star auth__star--one" aria-hidden="true" />
+        <span className="auth__star auth__star--two" aria-hidden="true" />
+        <span className="auth__star auth__star--three" aria-hidden="true" />
+        <header className="auth__brand">
+          <img src="/tupi-mascot.png" alt="" />
+          <span>Tupi</span>
+        </header>
+        <section className={register ? "auth__card auth__card--register" : "auth__card auth__card--login"}>
+          <div className="auth__form-panel">
+            <h1>{register ? "Criar uma conta" : "Boas-vindas de volta!"}</h1>
+            <p className="auth__subtitle">{register ? "Use seu código de convite para entrar na comunidade." : "Que bom ter você de volta ao Tupi."}</p>
+            {error && <p className="auth__error">{error}</p>}
+            <form onSubmit={submitAuth}>
+              {register && (
+                <>
+                  <label className="auth__field"><span>Código do convite <b>*</b></span><input name="invite_code" autoComplete="off" required /></label>
+                  <label className="auth__field"><span>Como quer ser chamado <b>*</b></span><input name="display_name" autoComplete="name" required /></label>
+                </>
+              )}
+              <label className="auth__field"><span>Usuário <b>*</b></span><input name="username" autoComplete="username" autoFocus required /></label>
+              <label className="auth__field"><span>Senha <b>*</b></span><input name="password" type="password" autoComplete={register ? "new-password" : "current-password"} minLength={8} required /></label>
+              <button className="auth__submit">{register ? "Criar conta" : "Entrar"}</button>
+            </form>
+            <div className="auth__link">
+              {register ? "Já tem uma conta? " : "Tem um convite? "}
+              <button type="button" onClick={() => { setRegister(value => !value); setError(""); }}>
+                {register ? "Entrar" : "Criar uma conta"}
+              </button>
+            </div>
           </div>
+          {!register && (
+            <aside className="auth__aside">
+              <div className="auth__mascot-wrap"><img src="/tupi-mascot.png" alt="Mascote do Tupi" /></div>
+              <h2>Seu espaço, sua comunidade</h2>
+              <p>Converse, entre em chamadas e compartilhe momentos com quem importa.</p>
+            </aside>
+          )}
         </section>
       </main>
     );
