@@ -5,6 +5,7 @@ import { playSound, setSoundsMuted } from "./sounds";
 import { Icon, IconName } from "./Icon";
 import { HashIcon, SearchIcon, PencilIcon, TrashIcon, CrownIcon, FullscreenIcon, ContractIcon, PipIcon, DotsIcon, TheaterIcon } from "./Glyphs";
 import { ScreenPicker, CaptureSource, ShareOptions } from "./ScreenPicker";
+import logoUrl from "../icons/logo.webp";
 
 type Channel = { id: string; name: string; kind: "text" | "voice"; topic?: string | null };
 type ChannelCategory = { id: string; name: string; position: number; channels: Channel[] };
@@ -1143,14 +1144,19 @@ export function App() {
       <nav className="guilds">
         <div className="guilds__pill is-plain" title="Início"><Icon name="discord-icon" size={26} /></div>
         <div className="guilds__sep" />
-        <div className="guilds__pill is-active" title={communityName}>{initials(communityName)}</div>
+        <div className="guilds__pill is-active" title={communityName} style={{ overflow: "hidden", padding: 0 }}>
+          <img src={logoUrl} alt={communityName} style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+        </div>
         <div className="guilds__pill is-plain guilds__add" title="Adicionar um servidor">+</div>
       </nav>
 
       {/* ---- channel sidebar ---- */}
       <aside className="channels">
         <button className="channels__header">
-          <span>{communityName}</span>
+          <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+            <img src={logoUrl} alt="" style={{ width: "18px", height: "18px", borderRadius: "4px", objectFit: "cover" }} />
+            <span>{communityName}</span>
+          </div>
           <Icon name="config" size={16} />
         </button>
 
