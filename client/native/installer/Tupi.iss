@@ -25,6 +25,8 @@ PrivilegesRequired=lowest
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
+CloseApplications=yes
+RestartApplications=yes
 UninstallDisplayIcon={app}\Tupi.exe
 
 [Files]
