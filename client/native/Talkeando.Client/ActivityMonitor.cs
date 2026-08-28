@@ -71,7 +71,13 @@ public sealed class ActivityMonitor : IDisposable
     /// ACT-FR-008: toggled by the UI via the `activity.config` IPC op. When
     /// turned off the monitor emits one empty report and never sends a
     /// non-empty one again until turned back on.
-    public void SetEnabled(bool enabled) => _ = SetEnabledAsync(enabled);
+    public void SetEnabled(bool enabled)
+    {
+        // Process/Steam/SMTC discovery can be expensive on its first pass.
+        // IPC arrives on WPF's dispatcher thread, so explicitly move the whole
+        // operation to the thread pool and never stall rendering/input.
+        _ = Task.Run(() => SetEnabledAsync(enabled));
+    }
 
     private async Task SetEnabledAsync(bool enabled)
     {

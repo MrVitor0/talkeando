@@ -66,13 +66,11 @@ public sealed class IpcBridge : IDisposable
 
     public async void HandleWebMessage(object? sender, CoreWebView2WebMessageReceivedEventArgs args)
     {
-        DebugLog.Write($"received: {args.WebMessageAsJson}");
         try
         {
             using var document = JsonDocument.Parse(args.WebMessageAsJson);
             var root = document.RootElement;
             var op = root.GetProperty("op").GetString();
-            DebugLog.Write($"dispatching op={op}");
             switch (op)
             {
                 case "auth.session.restore":
@@ -198,6 +196,14 @@ public sealed class IpcBridge : IDisposable
                     };
                     if (avatarPicker.ShowDialog() == true)
                         await _network.UploadAvatarAsync(avatarPicker.FileName);
+                    break;
+                }
+                case "hotkey.configure":
+                {
+                    var data = root.GetProperty("data");
+                    var enabled = data.TryGetProperty("enabled", out var enabledValue) && enabledValue.GetBoolean();
+                    var code = data.TryGetProperty("code", out var codeValue) ? codeValue.GetString() : null;
+                    _hotkey.Configure(code, enabled);
                     break;
                 }
                 // Everything below is a pure relay to the authenticated
@@ -457,7 +463,6 @@ public sealed class IpcBridge : IDisposable
 
     public void Publish(string op, object data)
     {
-        DebugLog.Write($"publishing to UI: op={op} hasSubscriber={EventReady is not null}");
         EventReady?.Invoke(this, JsonSerializer.Serialize(new { v = 1, op, data }));
     }
 

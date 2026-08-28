@@ -33,6 +33,8 @@ public sealed class GlobalHotkeyHook : IDisposable
     private IntPtr _keyboardHook = IntPtr.Zero;
     private IntPtr _mouseHook = IntPtr.Zero;
     private readonly HashSet<int> _pressedKeys = new();
+    private string? _configuredCode;
+    private bool _configurationReceived;
     private bool _disposed;
 
     public GlobalHotkeyHook()
@@ -65,6 +67,8 @@ public sealed class GlobalHotkeyHook : IDisposable
             {
                 var vkCode = Marshal.ReadInt32(lParam);
                 var code = MapVkToDomCode(vkCode);
+                if (!IsConfigured(code))
+                    return CallNextHookEx(_keyboardHook, nCode, wParam, lParam);
                 var isTransition = isDown ? _pressedKeys.Add(vkCode) : _pressedKeys.Remove(vkCode);
                 if (isTransition && !string.IsNullOrEmpty(code))
                 {
@@ -92,18 +96,36 @@ public sealed class GlobalHotkeyHook : IDisposable
                 var mouseData = Marshal.ReadInt32(lParam, 8); // mouseData is at offset 8 in MSLLHOOKSTRUCT
                 var xButton = (mouseData >> 16) & 0xFFFF;
                 var code = xButton == 1 ? "Mouse4" : (xButton == 2 ? "Mouse5" : null);
-                if (code != null)
+                if (code != null && IsConfigured(code))
                 {
                     KeyEvent?.Invoke(code, msg == WM_XBUTTONDOWN);
                 }
             }
             else if (msg == WM_MBUTTONDOWN || msg == WM_MBUTTONUP)
             {
-                KeyEvent?.Invoke("Mouse3", msg == WM_MBUTTONDOWN);
+                if (IsConfigured("Mouse3"))
+                    KeyEvent?.Invoke("Mouse3", msg == WM_MBUTTONDOWN);
             }
         }
         return CallNextHookEx(_mouseHook, nCode, wParam, lParam);
     }
+
+    public void Configure(string? code, bool enabled)
+    {
+        _configurationReceived = true;
+        _configuredCode = enabled && !string.IsNullOrWhiteSpace(code) ? code.Trim() : null;
+        _pressedKeys.Clear();
+    }
+
+    private bool IsConfigured(string? code) =>
+        code is not null
+        // Backward compatibility: older bundled UIs filter the shortcut on
+        // their side and do not send hotkey.configure. Until a current UI
+        // configures its key, forward transitions instead of disabling every
+        // shortcut. Once configured, the native hook emits only that key.
+        && (!_configurationReceived
+            || (_configuredCode is not null
+                && string.Equals(code, _configuredCode, StringComparison.OrdinalIgnoreCase)));
 
     public static string MapVkToDomCode(int vk)
     {

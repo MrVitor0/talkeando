@@ -772,18 +772,11 @@ export function isNoiseSuppressionOn() {
 
 function applyLocalAudioState() {
   const shouldSend = !localMuted && !localDeafened;
+  // Mute has one media responsibility: enable/disable the published microphone
+  // track. The raw capture stays alive so RNNoise never has to restart, and
+  // screen-share/music audio senders are unrelated and remain untouched.
   if (localStream) {
     for (const track of localStream.getAudioTracks()) track.enabled = shouldSend;
-  }
-  if (rawMic) {
-    for (const track of rawMic.getAudioTracks()) track.enabled = shouldSend;
-  }
-  for (const pc of peers.values()) {
-    for (const sender of pc.getSenders()) {
-      if (sender.track?.kind === "audio") {
-        sender.track.enabled = shouldSend;
-      }
-    }
   }
   if (shouldSend) {
     ensureSpeakingAudioCtx();
@@ -1202,10 +1195,6 @@ function stopSpeakingSampling() {
 
 export function getLocalScreenStream(): MediaStream | null {
   return localScreenStream;
-}
-
-export function initializeNoiseSuppression() {
-  noiseSuppression.initialize();
 }
 
 // --- Device Management --------------------------------------------------

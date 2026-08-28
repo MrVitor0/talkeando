@@ -1,3 +1,4 @@
+using System.Collections.Concurrent;
 using System.IO;
 using System.Net.Http;
 using System.Net.Http.Headers;
@@ -5,6 +6,7 @@ using System.Net.WebSockets;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Nodes;
+using System.Windows.Media.Imaging;
 
 namespace Tupi.Client;
 
@@ -18,8 +20,10 @@ public sealed record TurnCredentials(string Username, string Credential, IReadOn
 /// actions, but never receives or persists the bearer token.
 public sealed class NetworkClient
 {
+    private const int ProfileImageMaxPixels = 256;
     private readonly SessionStore _sessions;
     private readonly HttpClient _http;
+    private readonly ConcurrentDictionary<string, string> _profileImageCache = new(StringComparer.Ordinal);
     private readonly SemaphoreSlim _webSocketGate = new(1, 1);
     private ClientWebSocket? _webSocket;
     private Action<string, JsonElement>? _onWebSocketEvent;
@@ -104,9 +108,15 @@ public sealed class NetworkClient
 
     public async Task<JsonElement> BootstrapAsync()
     {
-        using var me = await GetAsync("auth/me");
-        using var community = await GetAsync("community");
-        using var channelData = await GetAsync("channels");
+        // These resources are independent. Fetching them serially made the
+        // first authenticated paint pay three network round trips in sequence.
+        var meTask = GetAsync("auth/me");
+        var communityTask = GetAsync("community");
+        var channelsTask = GetAsync("channels");
+        await Task.WhenAll(meTask, communityTask, channelsTask);
+        using var me = await meTask;
+        using var community = await communityTask;
+        using var channelData = await channelsTask;
         var channels = new List<JsonElement>();
         if (channelData.RootElement.TryGetProperty("categories", out var categories))
             foreach (var category in categories.EnumerateArray())
@@ -282,7 +292,7 @@ public sealed class NetworkClient
     /// drops the whole event.
     public async Task<string?> TryGetMediaDataUriAsync(string path)
     {
-        try { return await GetMediaDataUriAsync(path); }
+        try { return await GetMediaDataUriAsync(path, createProfileThumbnail: true); }
         catch { return null; }
     }
 
@@ -464,25 +474,36 @@ public sealed class NetworkClient
         var root = JsonNode.Parse(payload.GetRawText());
         if (root is null) return payload;
         var urls = new HashSet<string>(StringComparer.Ordinal);
-        CollectMediaUrls(root, urls);
-        var replacements = new Dictionary<string, string>(StringComparer.Ordinal);
-        foreach (var url in urls)
+        var profileImageUrls = new HashSet<string>(StringComparer.Ordinal);
+        CollectMediaUrls(root, urls, profileImageUrls);
+        var mediaTasks = urls.Select(async url =>
         {
-            try { replacements[url] = await GetMediaDataUriAsync(url); }
-            catch { /* a missing thumbnail must not make chat history fail */ }
-        }
+            try { return (url, dataUri: await GetMediaDataUriAsync(url, profileImageUrls.Contains(url))); }
+            catch { return (url, dataUri: (string?)null); }
+        });
+        var media = await Task.WhenAll(mediaTasks);
+        var replacements = media
+            .Where(item => item.dataUri is not null)
+            .ToDictionary(item => item.url, item => item.dataUri!, StringComparer.Ordinal);
         ReplaceMediaUrls(root, replacements);
         return JsonSerializer.SerializeToElement(root);
     }
 
-    private static void CollectMediaUrls(JsonNode node, ISet<string> urls)
+    private static void CollectMediaUrls(JsonNode node, ISet<string> urls, ISet<string> profileImageUrls)
     {
         if (node is JsonObject obj)
         {
             foreach (var property in obj)
             {
-                if ((property.Key == "avatar_url" || property.Key == "image_url" || property.Key == "profile_badge_url") && property.Value is JsonValue value && value.TryGetValue<string>(out var url) && url.StartsWith("/api/", StringComparison.Ordinal)) urls.Add(url);
-                if (property.Value is not null) CollectMediaUrls(property.Value, urls);
+                if ((property.Key == "avatar_url" || property.Key == "image_url" || property.Key == "profile_badge_url")
+                    && property.Value is JsonValue value
+                    && value.TryGetValue<string>(out var url)
+                    && url.StartsWith("/api/", StringComparison.Ordinal))
+                {
+                    urls.Add(url);
+                    profileImageUrls.Add(url);
+                }
+                if (property.Value is not null) CollectMediaUrls(property.Value, urls, profileImageUrls);
             }
             // An image attachment: { url: "/api/attachments/..", content_type: "image/..", .. }.
             // Inline it too so the chat can render a thumbnail without the token.
@@ -492,9 +513,12 @@ public sealed class NetworkClient
                 && contentType.StartsWith("image/", StringComparison.Ordinal))
             {
                 urls.Add(attachmentUrl);
+                // An attachment must retain its original resolution even if
+                // the same URL also appeared in a profile-shaped property.
+                profileImageUrls.Remove(attachmentUrl);
             }
         }
-        else if (node is JsonArray array) foreach (var item in array) if (item is not null) CollectMediaUrls(item, urls);
+        else if (node is JsonArray array) foreach (var item in array) if (item is not null) CollectMediaUrls(item, urls, profileImageUrls);
     }
 
     private static void ReplaceMediaUrls(JsonNode node, IReadOnlyDictionary<string, string> replacements)
@@ -510,8 +534,11 @@ public sealed class NetworkClient
         else if (node is JsonArray array) foreach (var item in array) if (item is not null) ReplaceMediaUrls(item, replacements);
     }
 
-    private async Task<string> GetMediaDataUriAsync(string path)
+    private async Task<string> GetMediaDataUriAsync(string path, bool createProfileThumbnail = false)
     {
+        if (createProfileThumbnail && _profileImageCache.TryGetValue(path, out var cached))
+            return cached;
+
         using var request = new HttpRequestMessage(HttpMethod.Get, new Uri(_http.BaseAddress!, path));
         AddAuthorization(request);
         using var response = await _http.SendAsync(request);
@@ -519,7 +546,44 @@ public sealed class NetworkClient
         var bytes = await response.Content.ReadAsByteArrayAsync();
         if (bytes.Length == 0 || bytes.Length > 8 * 1024 * 1024) throw new InvalidOperationException("Mídia grande demais para visualização.");
         var type = response.Content.Headers.ContentType?.MediaType ?? "application/octet-stream";
-        return $"data:{type};base64,{Convert.ToBase64String(bytes)}";
+        if (createProfileThumbnail && type.StartsWith("image/", StringComparison.OrdinalIgnoreCase))
+        {
+            var thumbnail = await Task.Run(() => CreateProfileThumbnail(bytes));
+            if (thumbnail is not null)
+            {
+                bytes = thumbnail;
+                type = "image/png";
+            }
+        }
+
+        var dataUri = $"data:{type};base64,{Convert.ToBase64String(bytes)}";
+        if (createProfileThumbnail) _profileImageCache[path] = dataUri;
+        return dataUri;
+    }
+
+    private static byte[]? CreateProfileThumbnail(byte[] source)
+    {
+        using var input = new MemoryStream(source, writable: false);
+        var decoder = BitmapDecoder.Create(input, BitmapCreateOptions.PreservePixelFormat, BitmapCacheOption.OnLoad);
+        var frame = decoder.Frames[0];
+        if (frame.PixelWidth <= ProfileImageMaxPixels && frame.PixelHeight <= ProfileImageMaxPixels)
+            return null;
+
+        input.Position = 0;
+        var image = new BitmapImage();
+        image.BeginInit();
+        image.CacheOption = BitmapCacheOption.OnLoad;
+        image.StreamSource = input;
+        if (frame.PixelWidth >= frame.PixelHeight) image.DecodePixelWidth = ProfileImageMaxPixels;
+        else image.DecodePixelHeight = ProfileImageMaxPixels;
+        image.EndInit();
+        image.Freeze();
+
+        var encoder = new PngBitmapEncoder();
+        encoder.Frames.Add(BitmapFrame.Create(image));
+        using var output = new MemoryStream();
+        encoder.Save(output);
+        return output.ToArray();
     }
 
     private async Task<JsonDocument> PostAsync(string path, JsonElement data, bool includeAuth)

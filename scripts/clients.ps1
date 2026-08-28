@@ -4,7 +4,7 @@
 # Use scripts\dev.ps1 instead for the full LOCAL stack.
 #
 #   -Profiles alice,bob   which profiles to open (default: alice, bob)
-#   -SkipBuild            skip "dotnet build" (no C# changes since last run)
+#   -SkipBuild            reuse both UI and native build outputs
 param(
     [string[]] $Profiles = @('alice', 'bob'),
     [switch]   $SkipBuild
@@ -13,6 +13,7 @@ param(
 $ErrorActionPreference = 'Continue'
 
 $RepoRoot  = Split-Path -Parent $PSScriptRoot
+$UiDir     = Join-Path $RepoRoot 'client\ui'
 $ClientDir = Join-Path $RepoRoot 'client\native\Talkeando.Client'
 $Settings  = Join-Path $ClientDir 'tupi.settings.json'
 
@@ -34,6 +35,21 @@ if (Test-Path $Settings) {
 Info 'TUPI_API_BASE_URL / TUPI_WS_URL are NOT set by this script'
 
 if (-not $SkipBuild) {
+    if (-not (Get-Command npm -ErrorAction SilentlyContinue)) {
+        throw "Required tool 'npm' not found on PATH."
+    }
+
+    # The native project embeds client/ui/dist. Building only C# can otherwise
+    # launch a new host against stale JavaScript with an incompatible IPC API.
+    Step 'Building the React UI'
+    Push-Location $UiDir
+    try {
+        if (-not (Test-Path (Join-Path $UiDir 'node_modules'))) { & npm install }
+        & npm run build
+        if ($LASTEXITCODE -ne 0) { throw 'npm run build failed.' }
+    }
+    finally { Pop-Location }
+
     Step 'Building the native client'
     & dotnet build $ClientDir -v quiet --nologo
     if ($LASTEXITCODE -ne 0) { throw 'dotnet build failed.' }

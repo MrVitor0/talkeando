@@ -40,6 +40,7 @@ interface SettingsModalProps {
   } | null;
   onLogout?: () => void;
   onInputModeChange?: (mode: InputMode) => void;
+  onShortcutChange?: (code: string) => void;
   onShortcutRecordingChange?: (recording: boolean) => void;
   currentBanner?: string;
   onBannerChange?: (bannerId: string) => void;
@@ -52,6 +53,7 @@ export function SettingsModal({
   currentUser,
   onLogout,
   onInputModeChange,
+  onShortcutChange,
   onShortcutRecordingChange,
   currentBanner = "sakura",
   onBannerChange,
@@ -91,6 +93,8 @@ export function SettingsModal({
     try { return localStorage.getItem("tk.pttKeyLabel") || "V"; } catch { return "V"; }
   });
   const [recordingKey, setRecordingKey] = useState(false);
+  const onShortcutChangeRef = useRef(onShortcutChange);
+  onShortcutChangeRef.current = onShortcutChange;
   const onShortcutRecordingChangeRef = useRef(onShortcutRecordingChange);
   onShortcutRecordingChangeRef.current = onShortcutRecordingChange;
 
@@ -161,6 +165,7 @@ export function SettingsModal({
         localStorage.setItem("tk.pttKey", code);
         localStorage.setItem("tk.pttKeyLabel", label);
       } catch {}
+      onShortcutChangeRef.current?.(code);
       setRecordingKey(false);
     };
 

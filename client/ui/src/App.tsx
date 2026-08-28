@@ -8,7 +8,7 @@ import { ScreenPicker, QualityControls, CaptureSource, ShareOptions } from "./Sc
 import { SettingsModal, ProfileUpdateData } from "./SettingsModal";
 import { UserProfileModal, UserProfileData, AnchorRect } from "./UserProfileModal";
 import { BANNER_PRESETS, getBannerPreset } from "./banners";
-import { type VoiceInputMode, VoiceShortcutController } from "./voiceShortcut";
+import { matchesVoiceShortcut, type VoiceInputMode } from "./voiceShortcut";
 import logoUrl from "../icons/logo.webp";
 
 type Channel = { id: string; name: string; kind: "text" | "voice"; topic?: string | null };
@@ -1369,10 +1369,10 @@ export function App() {
       }
       if (event.op === "hotkey.event") {
         const { code, is_down } = event.data as { code: string; is_down: boolean };
-        // A key release must always pass through so PTT can never get stuck.
-        // Key presses are ignored only while the focused WebView is editing text.
-        if (!is_down || (!shortcutRecordingRef.current && !isEditableElementFocused())) {
-          voiceShortcutRef.current?.handle(code, is_down, readVoiceShortcutConfig());
+        // The native hook is authoritative and remains global even when a form
+        // control has focus. Shortcut capture is the sole key-down exception.
+        if (!is_down || !shortcutRecordingRef.current) {
+          handleVoiceShortcut(code, is_down);
         }
       }
       if (event.op === "error") {
@@ -1394,38 +1394,14 @@ export function App() {
   // switch re-publishes app.bootstrap and churns the RTC/WS setup.
   useEffect(() => { send("auth.session.restore"); }, []);
 
-  // Global user interaction handler to resume/pre-warm all AudioContexts
-  useEffect(() => {
-    const resumeAudio = () => {
-      rtc.ensureRemoteAudioCtx();
-      rtc.ensureSpeakingAudioCtx();
-      rtc.initializeNoiseSuppression();
-    };
-    window.addEventListener("click", resumeAudio);
-    return () => {
-      window.removeEventListener("click", resumeAudio);
-    };
-  }, []);
-
-  // Global Push-to-Talk (PTT) / Toggle listener. Both the native hook and the
-  // WebView fallback feed this controller; it owns de-duplication and edges.
+  // Both native and WebView events feed this single pressed flag. It removes
+  // duplicated events and native key-repeat without another state machine.
   const mutedRef = useRef(muted);
   mutedRef.current = muted;
   const deafenedRef = useRef(deafened);
   deafenedRef.current = deafened;
-  const voiceShortcutRef = useRef<VoiceShortcutController | null>(null);
+  const shortcutPressedRef = useRef(false);
   const shortcutRecordingRef = useRef(false);
-  if (!voiceShortcutRef.current) {
-    voiceShortcutRef.current = new VoiceShortcutController({
-      onPushToTalkChange: pressed => updateAudioState(!pressed, deafenedRef.current, true),
-      onToggle: () => {
-        const currentPreference = deafenedRef.current
-          ? preDeafenMutedRef.current
-          : mutedRef.current;
-        updateAudioState(!currentPreference, deafenedRef.current);
-      },
-    });
-  }
 
   function readVoiceShortcutConfig(): { mode: VoiceInputMode; key: string } {
     try {
@@ -1435,6 +1411,23 @@ export function App() {
       };
     } catch {
       return { mode: "voice_activity", key: "KeyV" };
+    }
+  }
+
+  function configureNativeVoiceShortcut(mode: VoiceInputMode, key: string): void {
+    send("hotkey.configure", { enabled: mode !== "voice_activity", code: key });
+  }
+
+  function handleVoiceShortcut(code: string, isDown: boolean): void {
+    const config = readVoiceShortcutConfig();
+    if (!matchesVoiceShortcut(code, config.key)) return;
+    if (shortcutPressedRef.current === isDown) return;
+    shortcutPressedRef.current = isDown;
+
+    if (config.mode === "push_to_talk") {
+      updateAudioState(!isDown, deafenedRef.current, true);
+    } else if (config.mode === "toggle" && isDown) {
+      updateAudioState(!mutedRef.current, deafenedRef.current);
     }
   }
 
@@ -1451,13 +1444,16 @@ export function App() {
   }
 
   useEffect(() => {
+    const config = readVoiceShortcutConfig();
+    configureNativeVoiceShortcut(config.mode, config.key);
+
     const handleKeyDown = (e: KeyboardEvent) => {
       if (shortcutRecordingRef.current || isEditableElementFocused()) return;
-      voiceShortcutRef.current?.handle(e.code, true, readVoiceShortcutConfig());
+      handleVoiceShortcut(e.code, true);
     };
 
     const handleKeyUp = (e: KeyboardEvent) => {
-      voiceShortcutRef.current?.handle(e.code, false, readVoiceShortcutConfig());
+      handleVoiceShortcut(e.code, false);
     };
 
     window.addEventListener("keydown", handleKeyDown);
@@ -1893,7 +1889,7 @@ export function App() {
   function joinCall(channel: Channel) {
     const mode = readVoiceShortcutConfig().mode;
     const initialMuted = mode === "push_to_talk";
-    voiceShortcutRef.current?.reset();
+    shortcutPressedRef.current = false;
     mutedRef.current = initialMuted;
     deafenedRef.current = false;
     setMuted(initialMuted);
@@ -1926,7 +1922,7 @@ export function App() {
   }
   function leaveCall() {
     if (call) { playSound("leaveCall"); void rtc.leaveCall(); }
-    voiceShortcutRef.current?.reset();
+    shortcutPressedRef.current = false;
     voiceConnTimers.current.forEach(id => window.clearTimeout(id));
     voiceConnTimers.current = [];
     setVoiceConnState("disconnected");
@@ -2501,16 +2497,20 @@ export function App() {
             send("auth.session.clear");
           }}
           onInputModeChange={mode => {
-            voiceShortcutRef.current?.reset();
+            shortcutPressedRef.current = false;
+            configureNativeVoiceShortcut(mode, readVoiceShortcutConfig().key);
             if (mode === "push_to_talk") {
               updateAudioState(true, deafenedRef.current, true);
             } else if (mode === "voice_activity") {
               updateAudioState(false, deafenedRef.current, true);
             }
           }}
+          onShortcutChange={key => {
+            configureNativeVoiceShortcut(readVoiceShortcutConfig().mode, key);
+          }}
           onShortcutRecordingChange={recording => {
             shortcutRecordingRef.current = recording;
-            if (recording) voiceShortcutRef.current?.reset();
+            if (recording) shortcutPressedRef.current = false;
           }}
         />
       )}
