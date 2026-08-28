@@ -20,9 +20,10 @@ interface SettingsModalProps {
   onClose: () => void;
   currentUser?: { id: string; display_name: string; username?: string; avatar_url?: string | null } | null;
   onLogout?: () => void;
+  onInputModeChange?: (mode: InputMode) => void;
 }
 
-export function SettingsModal({ onClose, currentUser, onLogout }: SettingsModalProps) {
+export function SettingsModal({ onClose, currentUser, onLogout, onInputModeChange }: SettingsModalProps) {
   const [activeTab, setActiveTab] = useState<"voice" | "account" | "appearance">("voice");
   
   // Devices
@@ -214,6 +215,7 @@ export function SettingsModal({ onClose, currentUser, onLogout }: SettingsModalP
   const handleInputModeChange = (mode: InputMode) => {
     setInputMode(mode);
     try { localStorage.setItem("tk.inputMode", mode); } catch {}
+    onInputModeChange?.(mode);
   };
 
   const handleAudioInputChange = (deviceId: string) => {

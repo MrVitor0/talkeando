@@ -1046,9 +1046,13 @@ export function App() {
   }, []);
 
   // Global Push-to-Talk (PTT) / Toggle Keyboard Listener
-  useEffect(() => {
-    let isPttActive = false;
+  const mutedRef = useRef(muted);
+  mutedRef.current = muted;
+  const deafenedRef = useRef(deafened);
+  deafenedRef.current = deafened;
+  const isPttActiveRef = useRef(false);
 
+  useEffect(() => {
     const isInputFocused = () => {
       const tag = document.activeElement?.tagName?.toLowerCase();
       return tag === "input" || tag === "textarea" || (document.activeElement as HTMLElement)?.isContentEditable;
@@ -1058,13 +1062,15 @@ export function App() {
       if (isInputFocused() || e.repeat) return;
       const mode = (localStorage.getItem("tk.inputMode") as string) || "voice_activity";
       const key = localStorage.getItem("tk.pttKey") || "KeyV";
-      if (mode === "push_to_talk" && e.code === key) {
-        if (!isPttActive) {
-          isPttActive = true;
-          updateAudioState(false, deafened, true);
+      const isMatch = e.code === key || e.key.toUpperCase() === key.toUpperCase() || (key === "Space" && e.code === "Space");
+
+      if (mode === "push_to_talk" && isMatch) {
+        if (!isPttActiveRef.current) {
+          isPttActiveRef.current = true;
+          updateAudioState(false, deafenedRef.current, true);
         }
-      } else if (mode === "toggle" && e.code === key) {
-        updateAudioState(!muted, deafened, true);
+      } else if (mode === "toggle" && isMatch) {
+        updateAudioState(!mutedRef.current, deafenedRef.current, true);
       }
     };
 
@@ -1072,21 +1078,31 @@ export function App() {
       if (isInputFocused()) return;
       const mode = (localStorage.getItem("tk.inputMode") as string) || "voice_activity";
       const key = localStorage.getItem("tk.pttKey") || "KeyV";
-      if (mode === "push_to_talk" && e.code === key) {
-        if (isPttActive) {
-          isPttActive = false;
-          updateAudioState(true, deafened, true);
-        }
+      const isMatch = e.code === key || e.key.toUpperCase() === key.toUpperCase() || (key === "Space" && e.code === "Space");
+
+      if (mode === "push_to_talk" && isMatch) {
+        isPttActiveRef.current = false;
+        updateAudioState(true, deafenedRef.current, true);
+      }
+    };
+
+    const handleBlur = () => {
+      const mode = (localStorage.getItem("tk.inputMode") as string) || "voice_activity";
+      if (mode === "push_to_talk" && isPttActiveRef.current) {
+        isPttActiveRef.current = false;
+        updateAudioState(true, deafenedRef.current, true);
       }
     };
 
     window.addEventListener("keydown", handleKeyDown);
     window.addEventListener("keyup", handleKeyUp);
+    window.addEventListener("blur", handleBlur);
     return () => {
       window.removeEventListener("keydown", handleKeyDown);
       window.removeEventListener("keyup", handleKeyUp);
+      window.removeEventListener("blur", handleBlur);
     };
-  }, [muted, deafened]);
+  }, []);
 
   // Safety net: if the native host never answers session.restore (dead bridge,
   // offline), stop showing the splash after a few seconds and fall through to
@@ -1363,7 +1379,15 @@ export function App() {
     setMessages(current => current.filter(entry => entry.reqId !== message.reqId));
   }
   function pickAttachment() { if (!activeChannel) return; setUploading(true); send("attachment.pick", { channel_id: activeChannel.id }); }
-  function joinCall(channel: Channel) { setMuted(false); setDeafened(false); joinedAtRef.current = Date.now(); playSound("joinCall"); void rtc.joinCall(channel.id, false, false); }
+  function joinCall(channel: Channel) {
+    const mode = (localStorage.getItem("tk.inputMode") as string) || "voice_activity";
+    const initialMuted = mode === "push_to_talk";
+    setMuted(initialMuted);
+    setDeafened(false);
+    joinedAtRef.current = Date.now();
+    playSound("joinCall");
+    void rtc.joinCall(channel.id, initialMuted, false);
+  }
   function leaveCall() {
     if (call) { playSound("leaveCall"); void rtc.leaveCall(); }
     musicStreamRef.current = null;
@@ -1883,6 +1907,11 @@ export function App() {
           onLogout={() => {
             setSettingsOpen(false);
             send("auth.session.clear");
+          }}
+          onInputModeChange={mode => {
+            if (mode === "push_to_talk") {
+              updateAudioState(true, deafened, true);
+            }
           }}
         />
       )}
