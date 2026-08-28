@@ -197,8 +197,10 @@ public partial class MainWindow : System.Windows.Window
             await initialization; // observe/propagate a real failure if that's what happened instead of a timeout
 
             DebugLog.Write("InitializeWebViewAsync: CoreWebView2 ready, wiring WebMessageReceived");
+            _bridge.BrowserProcessId = WebView.CoreWebView2.BrowserProcessId;
             WebView.CoreWebView2.WebMessageReceived += _bridge.HandleWebMessage;
             _bridge.EventReady += (_, json) => Dispatcher.InvokeAsync(() => WebView.CoreWebView2.PostWebMessageAsJson(json));
+            _bridge.CheckUpdatesOnStartup();
 
             // Suppress Chromium's built-in right-click menu everywhere — the UI
             // draws its own context menus (rename channel / member / avatar).

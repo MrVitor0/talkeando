@@ -23,8 +23,8 @@ const MUSIC_BOT_ID: Uuid = Uuid::from_u128(1);
 /// keepalive eventually reaped it (hours). The .NET/browser client answers
 /// WebSocket Pings at the transport layer, so a live-but-idle client keeps
 /// itself marked online for free.
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
-const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(30);
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(60);
 
 use crate::{
     auth::authenticate_token,
@@ -61,7 +61,15 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
             Ok(env) if env.op == "auth.hello" => {
                 match serde_json::from_value::<AuthHello>(env.data) {
                     Ok(AuthHello { token }) if token == state.config.music_bot_token => Some((music_bot_user(), Uuid::nil())),
-                    Ok(AuthHello { token }) => authenticate_token(&state.pool, &token).await.ok(),
+                    Ok(AuthHello { token }) => match authenticate_token(&state.pool, &token).await {
+                        Ok((u, s)) => Some((u, s)),
+                        Err(error) => {
+                            if !matches!(error, crate::error::AppError::Unauthorized) {
+                                tracing::error!(%error, "database error during ws handshake");
+                            }
+                            None
+                        }
+                    },
                     Err(_) => None,
                 }
             }

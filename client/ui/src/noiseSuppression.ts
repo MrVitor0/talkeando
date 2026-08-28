@@ -17,6 +17,15 @@ let node: RnnoiseWorkletNode | null = null;
 let destination: MediaStreamAudioDestinationNode | null = null;
 let enabled = true;
 
+export function initialize() {
+  if (!ctx) {
+    ctx = new AudioContext({ sampleRate: 48000 });
+  }
+  if (ctx.state === "suspended") {
+    void ctx.resume().catch(() => { /* needs a gesture */ });
+  }
+}
+
 /// Route `micStream` through RNNoise and return the cleaned stream to publish
 /// to peers. Falls back to the raw stream if the worklet can't load, so a
 /// failure here never costs you the mic.
@@ -24,7 +33,8 @@ export async function processMic(micStream: MediaStream, initiallyEnabled: boole
   enabled = initiallyEnabled;
   try {
     // RNNoise assumes 48 kHz.
-    ctx = new AudioContext({ sampleRate: 48000 });
+    initialize();
+    if (!ctx) throw new Error("AudioContext creation failed");
     if (ctx.state === "suspended") await ctx.resume();
     await ctx.audioWorklet.addModule(rnnoiseWorkletUrl);
     const wasmBinary = await loadRnnoise({ url: rnnoiseWasmUrl, simdUrl: rnnoiseSimdWasmUrl });

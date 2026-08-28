@@ -787,6 +787,16 @@ export function App() {
     try { return localStorage.getItem("tk.noiseSuppression") !== "off"; } catch { return true; }
   });
   const [showSharingToast, setShowSharingToast] = useState(false);
+  const [updateInfo, setUpdateInfo] = useState<{
+    current_version: string;
+    latest_version: string;
+    release_notes: string;
+    download_url: string;
+    file_size_bytes?: number;
+  } | null>(null);
+  const [updateProgress, setUpdateProgress] = useState<number | null>(null);
+  const [updateReady, setUpdateReady] = useState(false);
+  const [updateDismissed, setUpdateDismissed] = useState(false);
   // `historyLoading` now means only "show the skeleton" — it is true just on
   // the *first* visit to a text channel this session. Re-entering a channel
   // we already hydrated restores its messages from `historyCacheRef`
@@ -827,10 +837,28 @@ export function App() {
       // avatar_url to a data: URI). Patch the roster, and our own identity if
       // it was us.
       if (event.op === "member.updated") {
-        const updated = event.data as { user_id: string; display_name: string; avatar_url?: string | null; profile_tag?: string | null; name_color?: string | null };
-        setMembers(current => current.map(member => member.id === updated.user_id
-          ? { ...member, display_name: updated.display_name ?? member.display_name, avatar_url: updated.avatar_url ?? null, profile_tag: updated.profile_tag ?? member.profile_tag, name_color: updated.name_color ?? null }
-          : member));
+        const updated = event.data as { user_id: string; username?: string; role?: string; display_name: string; avatar_url?: string | null; profile_tag?: string | null; name_color?: string | null };
+        setMembers(current => {
+          const exists = current.some(member => member.id === updated.user_id);
+          if (exists) {
+            return current.map(member => member.id === updated.user_id
+              ? { ...member, display_name: updated.display_name ?? member.display_name, avatar_url: updated.avatar_url ?? null, profile_tag: updated.profile_tag ?? member.profile_tag, name_color: updated.name_color ?? null }
+              : member);
+          } else {
+            return [
+              ...current,
+              {
+                id: updated.user_id,
+                username: updated.username ?? "",
+                role: updated.role ?? "member",
+                display_name: updated.display_name,
+                avatar_url: updated.avatar_url ?? null,
+                profile_tag: updated.profile_tag ?? null,
+                name_color: updated.name_color ?? null,
+              }
+            ];
+          }
+        });
         if (updated.user_id === selfIdRef.current) {
           setCurrentUser(current => current ? { ...current, display_name: updated.display_name ?? current.display_name, avatar_url: updated.avatar_url ?? null, name_color: updated.name_color ?? null } : current);
         }
@@ -968,6 +996,21 @@ export function App() {
       if (event.op === "screen.sources") { setSources(event.data.sources ?? []); setSourcesLoading(false); }
       if (event.op === "attachment.uploaded") { setAttachmentIds(current => [...current, event.data.id]); setUploading(false); }
       if (event.op === "attachment.cancelled") setUploading(false);
+      if (event.op === "update.available") {
+        setUpdateInfo(event.data);
+        setUpdateDismissed(false);
+      }
+      if (event.op === "update.progress") {
+        setUpdateProgress(typeof event.data.percent === "number" ? event.data.percent : 0);
+      }
+      if (event.op === "update.ready") {
+        setUpdateProgress(null);
+        setUpdateReady(true);
+      }
+      if (event.op === "update.error") {
+        setUpdateProgress(null);
+        setError(`Erro ao atualizar: ${event.data?.message ?? "Falha no download"}`);
+      }
       if (event.op === "error") {
         // Version skew: an op this client sends that the (older) server build
         // doesn't know yet — e.g. `activity.report` against a server without
@@ -986,6 +1029,19 @@ export function App() {
   // Session restore must happen exactly once — re-running it on every channel
   // switch re-publishes app.bootstrap and churns the RTC/WS setup.
   useEffect(() => { send("auth.session.restore"); }, []);
+
+  // Global user interaction handler to resume/pre-warm all AudioContexts
+  useEffect(() => {
+    const resumeAudio = () => {
+      rtc.ensureRemoteAudioCtx();
+      rtc.ensureSpeakingAudioCtx();
+      rtc.initializeNoiseSuppression();
+    };
+    window.addEventListener("click", resumeAudio);
+    return () => {
+      window.removeEventListener("click", resumeAudio);
+    };
+  }, []);
 
   // Safety net: if the native host never answers session.restore (dead bridge,
   // offline), stop showing the splash after a few seconds and fall through to
@@ -1668,18 +1724,28 @@ export function App() {
   // separate screen tile whenever their share is being watched.
   type VoiceTileDesc =
     | { key: string; kind: "cam"; participant: Participant; stream?: MediaStream }
-    | { key: string; kind: "screen"; participant: Participant; stream: MediaStream };
+    | { key: string; kind: "screen"; participant: Participant; stream?: MediaStream };
 
   function tilesForParticipant(participant: Participant): VoiceTileDesc[] {
     const isSelf = participant.user_id === currentUserId;
     const camera = isSelf
       ? (selfCameraStream ?? undefined)
       : pickRemoteVideo(participant.user_id, "camera");
+
+    const screenRow = streams.find(s => s.owner === participant.user_id && s.kind === "screen");
     const screen = isSelf
       ? (mySharingStreamId ? rtc.getLocalScreenStream() ?? undefined : undefined)
       : (watching[participant.user_id] ? pickRemoteVideo(participant.user_id, "screen") : undefined);
+
     const tiles: VoiceTileDesc[] = [{ key: `cam:${participant.user_id}`, kind: "cam", participant, stream: camera }];
-    if (screen) tiles.push({ key: `screen:${participant.user_id}`, kind: "screen", participant, stream: screen });
+
+    if (isSelf) {
+      if (mySharingStreamId) {
+        tiles.push({ key: `screen:${participant.user_id}`, kind: "screen", participant, stream: screen });
+      }
+    } else if (screenRow) {
+      tiles.push({ key: `screen:${participant.user_id}`, kind: "screen", participant, stream: screen });
+    }
     return tiles;
   }
 
@@ -1690,13 +1756,34 @@ export function App() {
     const isMicMuted = isSelf ? muted : participant.muted;
     const speaking = speakingUsers.has(participant.user_id);
     const screenRow = streams.find(s => s.owner === participant.user_id && s.kind === "screen");
-    const watchable = desc.kind === "cam" && !!screenRow && !isSelf && !watching[participant.user_id];
 
     if (desc.kind === "screen") {
+      if (!desc.stream) {
+        return (
+          <div className={speaking ? "vtile is-speaking" : "vtile"} key={desc.key}>
+            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '12px' }}>
+              <span style={{ color: 'var(--text-muted)' }}><Icon name="share-screen" size={48} /></span>
+              {screenRow && (
+                <button
+                  className="vtile__watch"
+                  style={{ position: 'relative', right: 'auto', bottom: 'auto' }}
+                  onClick={() => toggleWatch(participant.user_id, screenRow.stream_id)}
+                >
+                  Assistir transmissão
+                </button>
+              )}
+            </div>
+            <div className="vtile__name">
+              <span>{name} — tela</span>
+            </div>
+          </div>
+        );
+      }
+
       return (
         <VideoTile
           key={desc.key}
-          stream={desc.stream}
+          stream={desc.stream!}
           variant="screen"
           name={`${name} — tela`}
           micMuted={isMicMuted}
@@ -1735,14 +1822,6 @@ export function App() {
           {isMicMuted && <Icon name="mic-muted" size={14} />}
           <span>{name}</span>
         </div>
-        {watchable && (
-          <button
-            className="vtile__watch"
-            onClick={() => toggleWatch(participant.user_id, screenRow!.stream_id)}
-          >
-            Assistir tela
-          </button>
-        )}
       </div>
     );
   }
@@ -1750,6 +1829,39 @@ export function App() {
   return (
     <main className="app" onContextMenu={event => event.preventDefault()}>
       {menu && <ContextMenu {...menu} onClose={() => setMenu(null)} />}
+      {updateInfo && !updateDismissed && (
+        <div className="update-banner">
+          <div className="update-banner__content">
+            <span className="update-banner__badge">UPDATE</span>
+            <span className="update-banner__text">
+              Nova versão disponível: <strong>{updateInfo.latest_version}</strong>
+            </span>
+          </div>
+          <div className="update-banner__actions">
+            {updateProgress !== null ? (
+              <div className="update-banner__progress-wrap">
+                <div className="update-banner__progress-bar" style={{ width: `${Math.max(updateProgress, 5)}%` }} />
+                <span className="update-banner__progress-text">
+                  {updateProgress >= 0 ? `Baixando ${updateProgress}%` : "Baixando..."}
+                </span>
+              </div>
+            ) : updateReady ? (
+              <button className="update-banner__btn update-banner__btn--ready" onClick={() => send("update.apply", {})}>
+                Reiniciar e Atualizar
+              </button>
+            ) : (
+              <>
+                <button className="update-banner__btn update-banner__btn--download" onClick={() => { setUpdateProgress(0); send("update.download", { download_url: updateInfo.download_url }); }}>
+                  Atualizar Agora
+                </button>
+                <button className="update-banner__btn update-banner__btn--dismiss" onClick={() => setUpdateDismissed(true)}>
+                  Depois
+                </button>
+              </>
+            )}
+          </div>
+        </div>
+      )}
       {mySharingStreamId && showSharingToast && (
         <div className="sharing-bar">
           <Icon name="share-screen" size={16} />
@@ -2420,8 +2532,8 @@ function MemberList({
   botNowPlaying: string | null;
   onMemberContextMenu: (event: ReactMouseEvent, member: Member) => void;
 }) {
-  const online = members.filter(member => presence[member.id] !== "offline");
-  const offline = members.filter(member => presence[member.id] === "offline");
+  const online = members.filter(member => presence[member.id] === "online" || presence[member.id] === "busy");
+  const offline = members.filter(member => !presence[member.id] || presence[member.id] === "offline");
   const row = (member: Member, isOffline: boolean) => (
     <div
       key={member.id}

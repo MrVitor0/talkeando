@@ -662,6 +662,12 @@ export async function joinCall(channelId: string, muted: boolean, deafened: bool
   joinedCall = true;
   localMuted = muted;
   localDeafened = deafened;
+
+  // Initialize all AudioContexts synchronously within the click gesture context!
+  ensureRemoteAudioCtx();
+  ensureSpeakingAudioCtx();
+  noiseSuppression.initialize();
+
   try {
     // Chromium's built-in audio processing (WebRTC APM): steady-state noise
     // suppression, acoustic echo cancellation, automatic gain. Free, no
@@ -780,10 +786,16 @@ export function setPeerAudioMuted(peerUserId: string, isMuted: boolean) {
   applyRemoteMuting();
 }
 
-function ensureRemoteAudioCtx(): AudioContext {
+export function ensureRemoteAudioCtx(): AudioContext {
   if (!remoteAudioCtx) remoteAudioCtx = new AudioContext();
   if (remoteAudioCtx.state === "suspended") void remoteAudioCtx.resume().catch(() => { /* needs a gesture */ });
   return remoteAudioCtx;
+}
+
+export function ensureSpeakingAudioCtx(): AudioContext {
+  if (!speakingAudioCtx) speakingAudioCtx = new AudioContext();
+  if (speakingAudioCtx.state === "suspended") void speakingAudioCtx.resume().catch(() => { /* needs a gesture */ });
+  return speakingAudioCtx;
 }
 
 /// (Re)build the gain graph that feeds one peer's <audio> sink. Must run
@@ -1124,10 +1136,9 @@ function startSpeakingSampling() {
   if (!speakingTimer) speakingTimer = setInterval(sampleSpeaking, 100);
   if (localStream && !localLevelAnalyser) {
     try {
-      speakingAudioCtx ??= new AudioContext();
-      if (speakingAudioCtx.state === "suspended") void speakingAudioCtx.resume().catch(() => { /* needs a gesture */ });
-      const source = speakingAudioCtx.createMediaStreamSource(localStream);
-      localLevelAnalyser = speakingAudioCtx.createAnalyser();
+      const ctx = ensureSpeakingAudioCtx();
+      const source = ctx.createMediaStreamSource(localStream);
+      localLevelAnalyser = ctx.createAnalyser();
       localLevelAnalyser.fftSize = 512;
       localLevelAnalyser.smoothingTimeConstant = 0.1;
       localLevelBuf = new Uint8Array(new ArrayBuffer(localLevelAnalyser.fftSize));
@@ -1149,4 +1160,8 @@ function stopSpeakingSampling() {
 
 export function getLocalScreenStream(): MediaStream | null {
   return localScreenStream;
+}
+
+export function initializeNoiseSuppression() {
+  noiseSuppression.initialize();
 }

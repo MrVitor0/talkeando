@@ -115,6 +115,9 @@ pub async fn register(
 
     tx.commit().await?;
 
+    // Broadcast the new member to the rest of the community
+    let _ = crate::routes::profile::broadcast_member_updated(&state, &user).await;
+
     tracing::info!(user_id = %user.id, "user registered");
     Ok(Json(AuthResponse {
         token,

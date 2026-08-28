@@ -178,8 +178,19 @@ async fn shares_community(state: &AppState, actor: Uuid, target: Uuid) -> AppRes
     Ok(row.is_some())
 }
 
-async fn broadcast_member_updated(state: &AppState, user: &User) {
+pub async fn broadcast_member_updated(state: &AppState, user: &User) {
     let public: PublicUser = user.clone().into();
+    let role = match sqlx::query_scalar::<_, String>(
+        "SELECT role FROM community_members WHERE user_id = $1 LIMIT 1",
+    )
+    .bind(user.id)
+    .fetch_optional(&state.pool)
+    .await
+    {
+        Ok(Some(r)) => r,
+        _ => "member".to_string(),
+    };
+
     match db::related_member_ids(&state.pool, user.id).await {
         Ok(recipients) => {
             state
@@ -190,11 +201,13 @@ async fn broadcast_member_updated(state: &AppState, user: &User) {
                         "member.updated",
                         MemberUpdated {
                             user_id: public.id,
+                            username: public.username,
                             display_name: public.display_name,
                             avatar_url: public.avatar_url,
                             avatar_color: public.avatar_color,
                             profile_tag: public.profile_tag,
                             name_color: public.name_color,
+                            role,
                         },
                     ),
                 )

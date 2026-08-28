@@ -2187,6 +2187,123 @@ a:hover {
 }
 
 /* ==========================================================================
+   In-App Auto-Update Banner & Dialog
+   ========================================================================== */
+.update-banner {
+  position: fixed;
+  top: 12px;
+  right: 20px;
+  z-index: 1001;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  padding: 10px 16px;
+  border-radius: 12px;
+  background: rgba(30, 31, 34, 0.94);
+  backdrop-filter: blur(12px);
+  border: 1px solid rgba(88, 101, 242, 0.35);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5), 0 0 15px rgba(88, 101, 242, 0.2);
+  color: var(--text-normal);
+  font-size: 13px;
+  animation: update-in 0.3s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+@keyframes update-in {
+  from { transform: translateY(-20px); opacity: 0; }
+  to { transform: translateY(0); opacity: 1; }
+}
+.update-banner__content {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.update-banner__badge {
+  padding: 2px 6px;
+  border-radius: 6px;
+  background: var(--brand);
+  color: #fff;
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0.5px;
+}
+.update-banner__text {
+  font-weight: 500;
+}
+.update-banner__text strong {
+  color: #fff;
+  font-weight: 700;
+}
+.update-banner__actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.update-banner__btn {
+  padding: 6px 14px;
+  border-radius: 8px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  transition: all 0.15s ease;
+  border: none;
+}
+.update-banner__btn--download {
+  background: var(--brand);
+  color: #fff;
+}
+.update-banner__btn--download:hover {
+  background: var(--brand-hover);
+  transform: translateY(-1px);
+}
+.update-banner__btn--ready {
+  background: var(--green);
+  color: #fff;
+  animation: pulse-ready 2s infinite;
+}
+@keyframes pulse-ready {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(35, 165, 90, 0.4); }
+  50% { box-shadow: 0 0 0 6px rgba(35, 165, 90, 0); }
+}
+.update-banner__btn--ready:hover {
+  background: #1f9450;
+}
+.update-banner__btn--dismiss {
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--text-muted);
+}
+.update-banner__btn--dismiss:hover {
+  background: rgba(255, 255, 255, 0.14);
+  color: #fff;
+}
+.update-banner__progress-wrap {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 140px;
+  height: 28px;
+  background: rgba(0, 0, 0, 0.35);
+  border-radius: 8px;
+  overflow: hidden;
+  border: 1px solid rgba(255, 255, 255, 0.06);
+}
+.update-banner__progress-bar {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  background: linear-gradient(90deg, var(--brand), #7983f5);
+  transition: width 0.2s ease;
+}
+.update-banner__progress-text {
+  position: relative;
+  z-index: 1;
+  font-size: 11px;
+  font-weight: 700;
+  color: #fff;
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.6);
+}
+
+/* ==========================================================================
    Screen-share source picker
    ========================================================================== */
 .sp-overlay {

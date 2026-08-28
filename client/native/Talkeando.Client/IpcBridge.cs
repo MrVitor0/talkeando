@@ -35,6 +35,7 @@ public sealed class IpcBridge : IDisposable
     public Action<byte[], int>? WriteFrameSlot { get; set; }
     public Action<byte[], int>? WriteAudioSlot { get; set; }
     public int AudioSlotCount { get; set; } = 16;
+    public uint BrowserProcessId { get; set; }
 
     private readonly SessionStore _sessions = new();
     private readonly NetworkClient _network;
@@ -42,6 +43,7 @@ public sealed class IpcBridge : IDisposable
     private readonly AudioCapture _audio = new();
     private readonly MusicPlayback _music = new();
     private readonly ActivityMonitor _activity;
+    private readonly UpdateChecker _updater = new();
     private int _frameSeq;
     private int _audioSeq;
 
@@ -204,7 +206,7 @@ public sealed class IpcBridge : IDisposable
                     });
                     if (withAudio)
                     {
-                        var (pid, mode) = ScreenCapture.ResolveAudioTarget(sourceId);
+                        var (pid, mode) = ScreenCapture.ResolveAudioTarget(sourceId, BrowserProcessId);
                         _audio.Start(pid, mode, pcm =>
                         {
                             var slot = (int)((uint)System.Threading.Interlocked.Increment(ref _audioSeq) % (uint)AudioSlotCount);
@@ -244,6 +246,54 @@ public sealed class IpcBridge : IDisposable
                         root.GetProperty("data").TryGetProperty("text", out var titleText)
                             ? titleText.GetString() ?? "" : "");
                     break;
+                case "update.check":
+                {
+                    var update = await _updater.CheckAsync();
+                    if (update != null)
+                    {
+                        Publish("update.available", new
+                        {
+                            current_version = update.CurrentVersion,
+                            latest_version = update.LatestVersion,
+                            release_notes = update.ReleaseNotes,
+                            download_url = update.DownloadUrl,
+                            file_size_bytes = update.FileSizeBytes
+                        });
+                    }
+                    else
+                    {
+                        Publish("update.not_available", new { current_version = UpdateChecker.GetCurrentVersion() });
+                    }
+                    break;
+                }
+                case "update.download":
+                {
+                    var downloadUrl = root.GetProperty("data").GetProperty("download_url").GetString()
+                        ?? throw new InvalidOperationException("Download URL não informada.");
+                    _ = Task.Run(async () =>
+                    {
+                        try
+                        {
+                            var setupPath = await _updater.DownloadUpdateAsync(downloadUrl, (percent, downloaded, total) =>
+                            {
+                                Publish("update.progress", new { percent, downloaded, total });
+                            });
+                            Publish("update.ready", new { file_path = setupPath });
+                        }
+                        catch (Exception ex)
+                        {
+                            DebugLog.Write($"Update download failed: {ex.Message}");
+                            Publish("update.error", new { message = ex.Message });
+                        }
+                    });
+                    break;
+                }
+                case "update.apply":
+                {
+                    var path = root.GetProperty("data").TryGetProperty("file_path", out var p) ? p.GetString() : null;
+                    _updater.ApplyUpdate(path);
+                    break;
+                }
                 default:
                     Publish("error", new { code = "unknown_ipc_op", op });
                     break;
@@ -368,6 +418,30 @@ public sealed class IpcBridge : IDisposable
     {
         DebugLog.Write($"publishing to UI: op={op} hasSubscriber={EventReady is not null}");
         EventReady?.Invoke(this, JsonSerializer.Serialize(new { v = 1, op, data }));
+    }
+
+    public void CheckUpdatesOnStartup()
+    {
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await Task.Delay(3500); // Give the web UI time to mount and register IPC handlers
+                var update = await _updater.CheckAsync();
+                if (update != null)
+                {
+                    Publish("update.available", new
+                    {
+                        current_version = update.CurrentVersion,
+                        latest_version = update.LatestVersion,
+                        release_notes = update.ReleaseNotes,
+                        download_url = update.DownloadUrl,
+                        file_size_bytes = update.FileSizeBytes
+                    });
+                }
+            }
+            catch (Exception ex) { DebugLog.Write($"Startup update check failed: {ex.Message}"); }
+        });
     }
 
     public void Dispose() { _music.Dispose(); _screen.Dispose(); _audio.Dispose(); _activity.Dispose(); }

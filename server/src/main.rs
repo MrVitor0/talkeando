@@ -68,7 +68,7 @@ async fn main() -> anyhow::Result<()> {
     let database_url = config.database_url.replace("-pooler.", ".");
     let connect_options = PgConnectOptions::from_str(&database_url)?;
     let pool = PgPoolOptions::new()
-        .max_connections(10)
+        .max_connections(50)
         .after_connect(|conn, _meta| {
             Box::pin(async move {
                 // Harmless on a direct connection; a safety net if the URL

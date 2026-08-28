@@ -276,6 +276,7 @@ public sealed class NetworkClient
             _webSocket?.Dispose();
             var generation = Interlocked.Increment(ref _connectionGeneration);
             var socket = new ClientWebSocket();
+            socket.Options.KeepAliveInterval = TimeSpan.FromSeconds(15);
             _webSocket = socket;
             var wsUrl = Environment.GetEnvironmentVariable("TUPI_WS_URL")
                 ?? ReadEndpointSetting("webSocketUrl")
@@ -367,7 +368,7 @@ public sealed class NetworkClient
             while (_sessions.HasToken && Volatile.Read(ref _reconnecting) == 1)
             {
                 var attempt = Interlocked.Increment(ref _reconnectAttempt);
-                var delaySeconds = Math.Min(30, Math.Pow(2, Math.Min(attempt, 5))) + Random.Shared.NextDouble();
+                var delaySeconds = attempt == 1 ? 0.5 : (Math.Min(20, Math.Pow(1.8, Math.Min(attempt, 5))) + Random.Shared.NextDouble());
                 await Task.Delay(TimeSpan.FromSeconds(delaySeconds));
                 if (!_sessions.HasToken || Volatile.Read(ref _reconnecting) == 0) break;
                 try

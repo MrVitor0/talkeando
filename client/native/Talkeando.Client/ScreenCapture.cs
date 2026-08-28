@@ -71,6 +71,10 @@ public sealed class ScreenCapture : IDisposable
     private const int CURSOR_SHOWING = 0x00000001;
     private const int DI_NORMAL = 0x0003;
 
+    private const uint GW_OWNER = 4;
+    [DllImport("user32.dll")] private static extern IntPtr GetWindow(IntPtr hWnd, uint uCmd);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] private static extern int GetClassName(IntPtr hWnd, StringBuilder lpClassName, int nMaxCount);
+
     // ---- enumeration -----------------------------------------------------
     public static List<CaptureSource> Enumerate()
     {
@@ -94,16 +98,25 @@ public sealed class ScreenCapture : IDisposable
         }
 
         var shell = GetShellWindow();
-        var ownPid = Environment.ProcessId;
+        var ownPid = (uint)Environment.ProcessId;
         EnumWindows((hWnd, _) =>
         {
             if (hWnd == shell || !IsWindowVisible(hWnd) || IsIconic(hWnd)) return true;
             if (GetWindowTextLength(hWnd) == 0) return true;
 
+            GetWindowThreadProcessId(hWnd, out var windowPid);
+            if (windowPid == ownPid) return true;
+
             var style = GetWindowLong(hWnd, GWL_STYLE);
             var exStyle = GetWindowLong(hWnd, GWL_EXSTYLE);
-            if ((style & WS_CAPTION) != WS_CAPTION) return true;           // tool/child windows
+            // Skip child windows (WS_CHILD = 0x40000000) and tool windows
+            if ((style & 0x40000000) != 0) return true;
             if ((exStyle & WS_EX_TOOLWINDOW) == WS_EX_TOOLWINDOW) return true;
+
+            // Only allow top-level root windows or windows without an active visible owner
+            var owner = GetWindow(hWnd, GW_OWNER);
+            if (owner != IntPtr.Zero && IsWindowVisible(owner)) return true;
+
             if (DwmGetWindowAttribute(hWnd, DWMWA_CLOAKED, out var cloaked, sizeof(int)) == 0 && cloaked != 0) return true;
 
             if (!GetWindowRect(hWnd, out var r)) return true;
@@ -111,10 +124,16 @@ public sealed class ScreenCapture : IDisposable
             var h = r.Bottom - r.Top;
             if (w < 160 || h < 120) return true;
 
+            var className = new StringBuilder(256);
+            GetClassName(hWnd, className, className.Capacity);
+            var cls = className.ToString();
+            if (cls is "Progman" or "Shell_TrayWnd" or "Windows.UI.Core.CoreWindow" or "MSCTFIME UI" or "Default IME") return true;
+
             var title = new StringBuilder(512);
             GetWindowText(hWnd, title, title.Capacity);
-            var name = title.ToString();
-            if (name is "Tupi" || name.StartsWith("Tupi (")) return true;
+            var name = title.ToString().Trim();
+            if (string.IsNullOrEmpty(name)) return true;
+            if (name is "Tupi" || name.StartsWith("Tupi (") || name is "Talkeando" || name.StartsWith("Talkeando (")) return true;
 
             var handle = hWnd;
             sources.Add(new CaptureSource($"window:{hWnd.ToInt64()}", "window", name,
@@ -127,17 +146,17 @@ public sealed class ScreenCapture : IDisposable
 
     /// Which process's audio to loop back for a given capture source:
     ///  - a window/game -> that window's process, INCLUDE its tree
-    ///  - a whole screen -> our own process, EXCLUDE its tree (everything
-    ///    else the system plays, minus the remote voices we're already
-    ///    hearing, so no echo).
-    public static (uint processId, int loopbackMode) ResolveAudioTarget(string sourceId)
+    ///  - a whole screen -> WebView2 browser process (or our host), EXCLUDE its tree (everything
+    ///    else the system plays, minus our own call voices, so no echo).
+    public static (uint processId, int loopbackMode) ResolveAudioTarget(string sourceId, uint browserProcessId = 0)
     {
         if (sourceId.StartsWith("window:") && long.TryParse(sourceId.Substring("window:".Length), out var handle))
         {
             GetWindowThreadProcessId(new IntPtr(handle), out var pid);
             if (pid != 0) return (pid, AudioCapture.ModeIncludeTree);
         }
-        return ((uint)Environment.ProcessId, AudioCapture.ModeExcludeTree);
+        var targetPid = browserProcessId != 0 ? browserProcessId : (uint)Environment.ProcessId;
+        return (targetPid, AudioCapture.ModeExcludeTree);
     }
 
     private static string Thumbnail(Func<Bitmap?> grab)

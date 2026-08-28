@@ -158,6 +158,7 @@ pub struct ActivityUpdate {
 #[derive(Debug, Serialize)]
 pub struct MemberUpdated {
     pub user_id: Uuid,
+    pub username: String,
     pub display_name: String,
     /// `/api/users/<id>/avatar` when the member has one, else `None`. The
     /// native host inlines this to a `data:` URI before it reaches the UI
@@ -166,6 +167,7 @@ pub struct MemberUpdated {
     pub avatar_color: Option<String>,
     pub profile_tag: Option<String>,
     pub name_color: Option<String>,
+    pub role: String,
 }
 
 #[derive(Debug, Serialize)]
