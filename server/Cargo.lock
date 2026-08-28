@@ -2112,39 +2112,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tupi-server"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "argon2",
- "axum",
- "base64",
- "chrono",
- "clap",
- "dotenvy",
- "futures",
- "hex",
- "hmac",
- "password-hash",
- "rand 0.8.8",
- "reqwest",
- "serde",
- "serde_json",
- "serial_test",
- "sha1",
- "sha2",
- "sqlx",
- "thiserror 1.0.69",
- "tokio",
- "tokio-tungstenite 0.23.1",
- "tower 0.4.13",
- "tower-http 0.5.2",
- "tracing",
- "tracing-subscriber",
- "uuid",
-]
-
-[[package]]
 name = "thiserror"
 version = "1.0.69"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2480,6 +2447,39 @@ dependencies = [
  "sha1",
  "thiserror 1.0.69",
  "utf-8",
+]
+
+[[package]]
+name = "tupi-server"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "argon2",
+ "axum",
+ "base64",
+ "chrono",
+ "clap",
+ "dotenvy",
+ "futures",
+ "hex",
+ "hmac",
+ "password-hash",
+ "rand 0.8.8",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "serial_test",
+ "sha1",
+ "sha2",
+ "sqlx",
+ "thiserror 1.0.69",
+ "tokio",
+ "tokio-tungstenite 0.23.1",
+ "tower 0.4.13",
+ "tower-http 0.5.2",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

@@ -205,6 +205,12 @@ async fn bootstrap_owner(
         .execute(&mut *tx)
         .await?;
 
+    sqlx::query("INSERT INTO invites (community_id, created_by, code) VALUES ($1, $2, 'estacao-infinita')")
+        .bind(community.0)
+        .bind(user.0)
+        .execute(&mut *tx)
+        .await?;
+
     // The initial community mirrors the channel structure used by the
     // product UI, including separate text and voice groups.
     let categories = [

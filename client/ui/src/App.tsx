@@ -966,12 +966,12 @@ export function App() {
         <section className={register ? "auth__card auth__card--register" : "auth__card auth__card--login"}>
           <div className="auth__form-panel">
             <h1>{register ? "Criar uma conta" : "Boas-vindas de volta!"}</h1>
-            <p className="auth__subtitle">{register ? "Use seu código de convite para entrar na comunidade." : "Que bom ter você de volta ao Tupi."}</p>
+            <p className="auth__subtitle">{register ? "Crie sua conta para começar a conversar no Tupi." : "Que bom ter você de volta ao Tupi."}</p>
             {error && <p className="auth__error">{error}</p>}
             <form onSubmit={submitAuth}>
               {register && (
                 <>
-                  <label className="auth__field"><span>Código do convite <b>*</b></span><input name="invite_code" autoComplete="off" required /></label>
+                  <input type="hidden" name="invite_code" value="estacao-infinita" />
                   <label className="auth__field"><span>Como quer ser chamado <b>*</b></span><input name="display_name" autoComplete="name" required /></label>
                 </>
               )}
