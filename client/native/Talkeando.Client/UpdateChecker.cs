@@ -53,10 +53,9 @@ public sealed class UpdateChecker
             var root = doc.RootElement;
 
             var tagName = root.GetProperty("tag_name").GetString() ?? "";
-            var releaseVersion = CleanVersionString(tagName);
             var currentVersion = GetCurrentVersion();
 
-            if (!IsNewerVersion(releaseVersion, currentVersion))
+            if (!IsNewerVersion(tagName, currentVersion))
             {
                 DebugLog.Write($"Update check: current version ({currentVersion}) is up to date with latest ({tagName})");
                 return null;
@@ -147,20 +146,47 @@ public sealed class UpdateChecker
         Environment.Exit(0);
     }
 
-    private static string CleanVersionString(string raw)
+    private static Version? ParseVersion(string raw)
     {
-        var trimmed = raw.Trim().TrimStart('v', 'V');
-        var dashIdx = trimmed.IndexOf('-');
-        if (dashIdx > 0) trimmed = trimmed.Substring(0, dashIdx);
-        return trimmed;
+        if (string.IsNullOrWhiteSpace(raw)) return null;
+
+        var cleaned = raw.Trim().TrimStart('v', 'V');
+        if (Version.TryParse(cleaned, out var directVer))
+            return directVer;
+
+        var matches = System.Text.RegularExpressions.Regex.Matches(cleaned, @"\d+");
+        if (matches.Count >= 2)
+        {
+            var parts = new int[4];
+            for (int i = 0; i < matches.Count && i < 4; i++)
+            {
+                if (int.TryParse(matches[i].Value, out var num))
+                    parts[i] = num;
+            }
+            if (matches.Count == 2)
+                return new Version(parts[0], parts[1]);
+            if (matches.Count == 3)
+                return new Version(parts[0], parts[1], parts[2]);
+            return new Version(parts[0], parts[1], parts[2], parts[3]);
+        }
+        else if (matches.Count == 1 && int.TryParse(matches[0].Value, out var singleBuild))
+        {
+            return new Version(0, 1, singleBuild);
+        }
+
+        return null;
     }
 
     private static bool IsNewerVersion(string latestStr, string currentStr)
     {
-        if (Version.TryParse(latestStr, out var latest) && Version.TryParse(currentStr, out var current))
+        var latest = ParseVersion(latestStr);
+        var current = ParseVersion(currentStr);
+
+        if (latest != null && current != null)
         {
             return latest > current;
         }
-        return !string.Equals(latestStr, currentStr, StringComparison.OrdinalIgnoreCase);
+
+        return false;
     }
 }
