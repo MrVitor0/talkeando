@@ -17,6 +17,7 @@ for (const path in iconUrls) {
 export type IconName =
   | "activities"
   | "add-media"
+  | "camera"
   | "camera-closed"
   | "config"
   | "crisp-nois-cenaceling-on"

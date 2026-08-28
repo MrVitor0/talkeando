@@ -24,6 +24,14 @@ public sealed class NetworkClient
     private ClientWebSocket? _webSocket;
     private Action<string, JsonElement>? _onWebSocketEvent;
     private int _reconnectAttempt;
+    // Bumped on every (re)connect. A receive loop carries the generation it
+    // was started with and ignores its own failure once a newer socket has
+    // taken over — without this, each stale loop spawned its own reconnect
+    // and the UI flip-flopped between "connected" and "reconnecting".
+    private int _connectionGeneration;
+    // 0 = no reconnect loop running, 1 = one is. Single-flight guard so
+    // several failing sockets can't stack up reconnect loops.
+    private int _reconnecting;
 
     /// API root without a trailing slash (e.g. `http://localhost:8080/api`).
     /// Handed to the UI in the bootstrap payload so it can build `<img>` URLs
@@ -238,22 +246,55 @@ public sealed class NetworkClient
     public async Task ConnectWebSocketAsync(Action<string, JsonElement> onEvent)
     {
         _onWebSocketEvent = onEvent;
-        if (_webSocket?.State == WebSocketState.Open) return;
         await _webSocketGate.WaitAsync();
         try
         {
-            if (_webSocket?.State == WebSocketState.Open) return;
+            if (_webSocket?.State == WebSocketState.Open)
+            {
+                // A racing reconnect attempt already won — just make sure the
+                // UI isn't stuck showing "Reconectando…".
+                _reconnectAttempt = 0;
+                Interlocked.Exchange(ref _reconnecting, 0);
+                _onWebSocketEvent?.Invoke("connection.state", JsonSerializer.SerializeToElement(new { state = "connected" }));
+                return;
+            }
+
             _webSocket?.Dispose();
-            _webSocket = new ClientWebSocket();
+            var generation = Interlocked.Increment(ref _connectionGeneration);
+            var socket = new ClientWebSocket();
+            _webSocket = socket;
             var wsUrl = Environment.GetEnvironmentVariable("TUPI_WS_URL")
                 ?? ReadEndpointSetting("webSocketUrl")
                 ?? "ws://localhost:8080/ws";
-            await _webSocket.ConnectAsync(new Uri(wsUrl), CancellationToken.None);
+            await socket.ConnectAsync(new Uri(wsUrl), CancellationToken.None);
             var token = _sessions.Load() ?? throw new InvalidOperationException("Sessão não encontrada.");
             await SendWebSocketAsync("auth.hello", JsonSerializer.SerializeToElement(new { token }));
             _reconnectAttempt = 0;
+            Interlocked.Exchange(ref _reconnecting, 0);
             _onWebSocketEvent?.Invoke("connection.state", JsonSerializer.SerializeToElement(new { state = "connected" }));
-            _ = ReceiveWebSocketAsync(_webSocket);
+            _ = ReceiveWebSocketAsync(socket, generation);
+        }
+        finally { _webSocketGate.Release(); }
+    }
+
+    /// Cleanly closes the realtime socket so the server registers the
+    /// disconnect right away (instead of waiting for its heartbeat to time
+    /// out) — used on logout. Safe to call with nothing connected.
+    public async Task DisconnectWebSocketAsync()
+    {
+        await _webSocketGate.WaitAsync();
+        try
+        {
+            var socket = _webSocket;
+            _webSocket = null;
+            if (socket is null) return;
+            try
+            {
+                if (socket.State is WebSocketState.Open or WebSocketState.CloseReceived)
+                    await socket.CloseAsync(WebSocketCloseStatus.NormalClosure, "logout", CancellationToken.None);
+            }
+            catch { /* socket already faulted — nothing to close */ }
+            finally { socket.Dispose(); }
         }
         finally { _webSocketGate.Release(); }
     }
@@ -265,7 +306,7 @@ public sealed class NetworkClient
         await _webSocket.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, CancellationToken.None);
     }
 
-    private async Task ReceiveWebSocketAsync(ClientWebSocket socket)
+    private async Task ReceiveWebSocketAsync(ClientWebSocket socket, int generation)
     {
         var buffer = new byte[64 * 1024];
         try
@@ -288,6 +329,16 @@ public sealed class NetworkClient
         }
         catch (Exception exception)
         {
+            // A newer socket already replaced this one (reconnect, or a fresh
+            // ConnectWebSocketAsync). This loop's failure is stale — swallow it
+            // so it doesn't kick off a competing reconnect and make the UI
+            // bounce between "connected" and "reconnecting".
+            if (generation != _connectionGeneration) return;
+            // Logout (or any state where we no longer hold a token) tore the
+            // socket down on purpose — don't fight it with a reconnect.
+            if (!_sessions.HasToken) return;
+            // Single-flight: only the first failing socket starts the loop.
+            if (Interlocked.CompareExchange(ref _reconnecting, 1, 0) != 0) return;
             _onWebSocketEvent?.Invoke("connection.state", JsonSerializer.SerializeToElement(new { state = "reconnecting" }));
             _ = ReconnectWebSocketAsync(exception.Message);
         }
@@ -297,24 +348,36 @@ public sealed class NetworkClient
     {
         // Bounded exponential backoff with a little jitter keeps a short
         // server outage from making every installed client reconnect at once.
-        while (_sessions.HasToken)
+        try
         {
-            var attempt = Interlocked.Increment(ref _reconnectAttempt);
-            var delaySeconds = Math.Min(30, Math.Pow(2, Math.Min(attempt, 5))) + Random.Shared.NextDouble();
-            await Task.Delay(TimeSpan.FromSeconds(delaySeconds));
-            try
+            while (_sessions.HasToken && Volatile.Read(ref _reconnecting) == 1)
             {
-                await ConnectWebSocketAsync(_onWebSocketEvent ?? ((_, _) => { }));
-                return;
-            }
-            catch
-            {
-                _onWebSocketEvent?.Invoke("connection.state", JsonSerializer.SerializeToElement(new {
-                    state = "reconnecting", message = $"Reconectando ao servidor ({lastError})"
-                }));
+                var attempt = Interlocked.Increment(ref _reconnectAttempt);
+                var delaySeconds = Math.Min(30, Math.Pow(2, Math.Min(attempt, 5))) + Random.Shared.NextDouble();
+                await Task.Delay(TimeSpan.FromSeconds(delaySeconds));
+                if (!_sessions.HasToken || Volatile.Read(ref _reconnecting) == 0) break;
+                try
+                {
+                    // On success this clears _reconnecting and emits "connected".
+                    await ConnectWebSocketAsync(_onWebSocketEvent ?? ((_, _) => { }));
+                    return;
+                }
+                catch
+                {
+                    _onWebSocketEvent?.Invoke("connection.state", JsonSerializer.SerializeToElement(new {
+                        state = "reconnecting", message = $"Reconectando ao servidor ({lastError})"
+                    }));
+                }
             }
         }
-        _onWebSocketEvent?.Invoke("connection.state", JsonSerializer.SerializeToElement(new { state = "disconnected" }));
+        finally
+        {
+            Interlocked.Exchange(ref _reconnecting, 0);
+        }
+        // Loop exited without reconnecting — only happens when the token is
+        // gone (logout). Let the UI settle on a final "disconnected".
+        if (!_sessions.HasToken)
+            _onWebSocketEvent?.Invoke("connection.state", JsonSerializer.SerializeToElement(new { state = "disconnected" }));
     }
 
     private async Task<JsonElement> AuthenticateAsync(string path, JsonElement data)

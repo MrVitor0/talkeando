@@ -38,6 +38,7 @@ pub struct PublishedStream {
     pub kind: String,
     pub label: Option<String>,
     pub has_audio: bool,
+    pub msid: Option<String>,
     pub viewers: HashSet<UserId>,
 }
 
@@ -49,6 +50,7 @@ impl From<&PublishedStream> for StreamDto {
             kind: s.kind.clone(),
             label: s.label.clone(),
             has_audio: s.has_audio,
+            msid: s.msid.clone(),
         }
     }
 }
@@ -252,6 +254,7 @@ impl CallRegistry {
         kind: String,
         label: Option<String>,
         has_audio: bool,
+        msid: Option<String>,
     ) -> Result<(), CallOpError> {
         let call = self.calls.get_mut(&channel_id).ok_or(CallOpError::NotInCall)?;
         if !call.participants.contains_key(&owner) {
@@ -270,6 +273,7 @@ impl CallRegistry {
                 kind,
                 label,
                 has_audio,
+                msid,
                 viewers: HashSet::new(),
             },
         );

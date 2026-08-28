@@ -82,6 +82,7 @@ public sealed class IpcBridge : IDisposable
                     break;
                 case "auth.session.clear":
                     _sessions.Clear();
+                    await _network.DisconnectWebSocketAsync();
                     Publish("auth.state_changed", new { state = "logged_out" });
                     break;
                 case "chat.history.load":
@@ -154,6 +155,7 @@ public sealed class IpcBridge : IDisposable
                 case "call.join":
                 case "call.leave":
                 case "call.state.update":
+                case "voice.move_member":
                 case "stream.publish":
                 case "stream.unpublish":
                 case "stream.subscribe":

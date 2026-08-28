@@ -262,6 +262,25 @@ pub struct CallStateUpdate {
     pub deafened: Option<bool>,
 }
 
+/// Inbound `voice.move_member` — a community owner dragging another member's
+/// row onto a different voice channel in the sidebar. The server only tells
+/// the target to move; the target's own client performs the `call.join`, so
+/// all the usual join validation and RTC setup is reused unchanged.
+#[derive(Debug, Deserialize)]
+pub struct VoiceMoveMember {
+    /// Who to move.
+    pub user_id: Uuid,
+    /// Destination voice channel.
+    pub channel_id: Uuid,
+}
+
+/// Outbound `voice.moved` — delivered only to the member being moved.
+#[derive(Debug, Serialize, Clone)]
+pub struct VoiceMoved {
+    pub channel_id: Uuid,
+    pub moved_by: Uuid,
+}
+
 #[derive(Debug, Serialize, Clone)]
 pub struct ParticipantDto {
     pub user_id: Uuid,
@@ -278,6 +297,12 @@ pub struct StreamDto {
     pub kind: String,
     pub label: Option<String>,
     pub has_audio: bool,
+    /// The publisher's local `MediaStream.id` for this stream's WebRTC tracks.
+    /// Opaque to the server — relayed verbatim so a receiver can map an
+    /// incoming video track (which carries the same msid) to the right
+    /// `kind` when a peer sends both a screen and a camera at once.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub msid: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -375,11 +400,14 @@ pub struct RtcConnectionState {
 pub struct StreamPublish {
     pub channel_id: Uuid,
     pub stream_id: Uuid,
-    pub kind: String, // "screen" | "camera"
+    pub kind: String, // "screen" | "camera" | "music"
     #[serde(default)]
     pub label: Option<String>,
     #[serde(default)]
     pub has_audio: bool,
+    /// Publisher's local `MediaStream.id` — see `StreamDto::msid`.
+    #[serde(default)]
+    pub msid: Option<String>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -390,6 +418,8 @@ pub struct StreamPublished {
     pub kind: String,
     pub label: Option<String>,
     pub has_audio: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub msid: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

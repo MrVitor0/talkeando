@@ -64,6 +64,7 @@ impl TestApp {
             attachment_storage_path: attachment_dir.to_string_lossy().to_string(),
             allowed_origins: vec!["http://localhost:5173".to_string()],
             unattached_attachment_ttl_hours: 24,
+            music_bot_token: "test-music-bot-token".to_string(),
         };
 
         let state = AppState::new(pool.clone(), config);

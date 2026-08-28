@@ -279,18 +279,25 @@ a:hover {
 
 .channels__list {
   flex: 1;
-  overflow-y: hidden;
-  padding: 8px 8px 0;
-}
-/* Discord keeps the sidebar scrollbar out of the way until you hover it */
-.channels:hover .channels__list {
+  /* Always scrollable with a reserved gutter so the row never reflows when
+     the scrollbar shows on hover — the "+" buttons used to jump 8px left the
+     moment the pointer entered the sidebar. The gutter takes the place of the
+     old 8px right padding. */
   overflow-y: auto;
+  scrollbar-gutter: stable;
+  padding: 8px 0 0 8px;
 }
 .channels__list::-webkit-scrollbar {
   width: 8px;
 }
+/* Discord keeps the scrollbar thumb invisible until you hover the sidebar —
+   the gutter above stays reserved either way, so nothing moves. */
 .channels__list::-webkit-scrollbar-thumb {
   border-width: 2px;
+  background-color: transparent;
+}
+.channels:hover .channels__list::-webkit-scrollbar-thumb {
+  background-color: #1a1b1e;
 }
 
 .server-shortcuts {
@@ -385,6 +392,18 @@ a:hover {
 }
 .chan.is-connected {
   color: var(--interactive-active);
+}
+/* Dragging a member row over a voice channel (owner-only "move member"). */
+.chan.is-drop-target {
+  background: var(--bg-active);
+  color: var(--interactive-active);
+  box-shadow: inset 0 0 0 1.5px var(--green);
+}
+.voice-member.is-draggable {
+  cursor: grab;
+}
+.voice-member.is-draggable:active {
+  cursor: grabbing;
 }
 .chan__icon {
   color: var(--channel-icon);
@@ -1690,6 +1709,14 @@ a:hover {
   object-fit: contain;
   background: #000;
 }
+/* Webcam fills the tile (crop, don't letterbox); the local preview is
+   mirrored so it reads like a mirror, the way every video app does it. */
+.vtile__video.is-cam {
+  object-fit: cover;
+}
+.vtile__video.is-cam.is-self {
+  transform: scaleX(-1);
+}
 .vtile__name {
   position: absolute;
   left: 12px;
@@ -1772,6 +1799,71 @@ a:hover {
 .vc-btn:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+/* Camera control = the round button + a small caret that opens the
+   device picker above it. */
+.vc-cam {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+}
+.vc-cam__caret {
+  position: absolute;
+  right: -2px;
+  bottom: -2px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  line-height: 1;
+  color: #fff;
+  background: #1e1f22;
+  border: 2px solid var(--bg-secondary, #2b2d31);
+}
+.vc-cam__caret:hover {
+  background: #35373c;
+}
+.vc-cam__menu {
+  position: absolute;
+  bottom: calc(100% + 10px);
+  left: 50%;
+  transform: translateX(-50%);
+  min-width: 220px;
+  max-width: 320px;
+  background: var(--bg-floating, #111214);
+  border: 1px solid rgba(0, 0, 0, 0.4);
+  border-radius: 8px;
+  padding: 6px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.5);
+  z-index: 30;
+}
+.vc-cam__menu button {
+  display: block;
+  width: 100%;
+  text-align: left;
+  padding: 8px 10px;
+  border-radius: 4px;
+  font-size: 14px;
+  color: var(--interactive-normal, #b5bac1);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.vc-cam__menu button:hover {
+  background: var(--brand, #5865f2);
+  color: #fff;
+}
+.vc-cam__menu button.is-active {
+  color: #fff;
+  font-weight: 600;
+}
+.vc-cam__empty {
+  padding: 8px 10px;
+  font-size: 13px;
+  color: var(--text-muted, #949ba4);
 }
 /* ==========================================================================
    Auth

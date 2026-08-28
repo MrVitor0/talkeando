@@ -355,22 +355,43 @@ async fn import_author_avatar(
     user_id: Uuid,
     author: &DiscordAuthor,
 ) -> Result<()> {
-    if let Some(hash) = author.avatar.as_deref() {
+    let avatar_url = author.avatar.as_deref().map(|hash| {
         let extension = if hash.starts_with("a_") { "gif" } else { "png" };
-        let url = format!("https://cdn.discordapp.com/avatars/{}/{}.{}?size=128", author.id, hash, extension);
-        let image = download_remote_image(config, client, &url, "avatar").await?;
+        format!("https://cdn.discordapp.com/avatars/{}/{}.{}?size=128", author.id, hash, extension)
+    });
+    let badge_url = author.clan.as_ref().and_then(|clan| {
+        match (clan.identity_guild_id.as_deref(), clan.badge.as_deref()) {
+            (Some(guild_id), Some(badge)) => {
+                Some(format!("https://cdn.discordapp.com/clan-badges/{guild_id}/{badge}.png?size=64"))
+            }
+            _ => None,
+        }
+    });
+    apply_user_images(pool, config, client, user_id, avatar_url.as_deref(), badge_url.as_deref()).await
+}
+
+/// Downloads an avatar (required when present) and profile badge (best effort)
+/// into the attachment volume and points the user row at the local copies, so
+/// imported identities never depend on an expiring Discord CDN URL.
+async fn apply_user_images(
+    pool: &PgPool,
+    config: &Config,
+    client: &reqwest::Client,
+    user_id: Uuid,
+    avatar_url: Option<&str>,
+    badge_url: Option<&str>,
+) -> Result<()> {
+    if let Some(url) = avatar_url {
+        let image = download_remote_image(config, client, url, "avatar").await?;
         sqlx::query("UPDATE users SET avatar_storage_path = $2, avatar_content_type = $3 WHERE id = $1")
             .bind(user_id).bind(image.path.to_string_lossy().to_string()).bind(image.content_type)
             .execute(pool).await?;
     }
-    if let Some(clan) = &author.clan {
-        if let (Some(guild_id), Some(badge)) = (clan.identity_guild_id.as_deref(), clan.badge.as_deref()) {
-            let badge_url = format!("https://cdn.discordapp.com/clan-badges/{guild_id}/{badge}.png?size=64");
-            if let Ok(badge) = download_remote_image(config, client, &badge_url, "badge").await {
-                sqlx::query("UPDATE users SET profile_badge_storage_path = $2, profile_badge_content_type = $3 WHERE id = $1")
-                    .bind(user_id).bind(badge.path.to_string_lossy().to_string()).bind(badge.content_type)
-                    .execute(pool).await?;
-            }
+    if let Some(url) = badge_url {
+        if let Ok(badge) = download_remote_image(config, client, url, "badge").await {
+            sqlx::query("UPDATE users SET profile_badge_storage_path = $2, profile_badge_content_type = $3 WHERE id = $1")
+                .bind(user_id).bind(badge.path.to_string_lossy().to_string()).bind(badge.content_type)
+                .execute(pool).await?;
         }
     }
     Ok(())
@@ -482,4 +503,255 @@ fn sanitize_filename(filename: &str) -> String {
     let cleaned: String = filename.chars().filter(|character| !matches!(character, '/' | '\\' | '\0')).collect();
     let trimmed = cleaned.trim();
     if trimmed.is_empty() { "attachment".to_string() } else { trimmed.chars().take(255).collect() }
+}
+
+// ---------------------------------------------------------------------------
+// JSON import (step 2). The `scripts/discord-import/har-to-json.mjs` script
+// turns the HAR into a reviewable JSON already shaped like our tables; this
+// path downloads the referenced images into the attachment volume and inserts
+// the rows. It shares the idempotency ledger with `import_har`, so a message
+// first seen in an earlier HAR capture is updated in place, not duplicated.
+// ---------------------------------------------------------------------------
+
+#[derive(Deserialize)]
+struct ImportFile {
+    users: Vec<ImportUser>,
+    messages: Vec<ImportMessage>,
+}
+
+#[derive(Deserialize)]
+struct ImportUser {
+    /// JSON-local id used only to link a message to its author within the file.
+    id: String,
+    discord_id: String,
+    display_name: String,
+    avatar_url: Option<String>,
+    profile_tag: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ImportMessage {
+    id: Uuid,
+    discord_id: String,
+    channel_name: String,
+    author_id: String,
+    content: String,
+    created_at: String,
+    edited_at: Option<String>,
+    #[serde(default)] attachments: Vec<ImportAttachment>,
+    #[serde(default)] link_preview: Option<ImportLinkPreview>,
+    #[serde(default)] embeds: Vec<ImportEmbed>,
+}
+
+#[derive(Deserialize)]
+struct ImportAttachment {
+    discord_id: String,
+    filename: String,
+    content_type: Option<String>,
+    source_url: String,
+}
+
+#[derive(Deserialize)]
+struct ImportLinkPreview {
+    url: String,
+    title: Option<String>,
+    description: Option<String>,
+    site_name: Option<String>,
+    image_source_url: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ImportEmbed {
+    position: i32,
+    title: Option<String>,
+    description: Option<String>,
+    url: Option<String>,
+    color: Option<i32>,
+    author_name: Option<String>,
+    author_url: Option<String>,
+    provider_name: Option<String>,
+    footer_text: Option<String>,
+    footer_icon_source_url: Option<String>,
+    image_source_url: Option<String>,
+    thumbnail_source_url: Option<String>,
+    #[serde(default)] fields: serde_json::Value,
+}
+
+pub async fn import_json(pool: &PgPool, config: &Config, json_path: &Path) -> Result<()> {
+    let raw = tokio::fs::read_to_string(json_path)
+        .await
+        .with_context(|| format!("failed to read import JSON at {}", json_path.display()))?;
+    let file: ImportFile = serde_json::from_str(&raw).context("invalid import JSON")?;
+    let client = reqwest::Client::builder()
+        .user_agent("Mozilla/5.0 (Tupi personal history migration)")
+        .build()?;
+    tokio::fs::create_dir_all(&config.attachment_storage_path).await?;
+
+    // 1. Authors: upsert by the `d_<discord_id>` username so a re-run (or a row
+    // created by the older HAR importer) is reused, not duplicated.
+    let mut author_db_id: HashMap<String, Uuid> = HashMap::new();
+    for user in &file.users {
+        let username = format!("d_{}", user.discord_id);
+        let password_hash = auth::hash_password(&Uuid::new_v4().to_string())?;
+        let db_id: Uuid = sqlx::query_scalar(
+            "INSERT INTO users (username, display_name, password_hash, profile_tag) VALUES ($1, $2, $3, $4) \
+             ON CONFLICT (username) DO UPDATE SET display_name = EXCLUDED.display_name, profile_tag = EXCLUDED.profile_tag RETURNING id",
+        )
+        .bind(&username).bind(&user.display_name).bind(&password_hash).bind(&user.profile_tag)
+        .fetch_one(pool).await?;
+        author_db_id.insert(user.id.clone(), db_id);
+        if let Err(error) = apply_user_images(pool, config, &client, db_id, user.avatar_url.as_deref(), None).await {
+            eprintln!("Skipping avatar for imported user {}: {error:#}", user.discord_id);
+        }
+    }
+
+    let mut channel_id: HashMap<String, Uuid> = HashMap::new();
+    let mut inserted = 0usize;
+    let mut updated = 0usize;
+    let mut imported_attachments = 0usize;
+    let mut imported_embeds = 0usize;
+
+    let mut messages = file.messages;
+    messages.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+
+    for message in &messages {
+        let target_channel_id = match channel_id.get(&message.channel_name) {
+            Some(id) => *id,
+            None => {
+                let id: Uuid = sqlx::query_scalar(
+                    "SELECT id FROM channels WHERE name = $1 AND kind = 'text' ORDER BY created_at LIMIT 1",
+                )
+                .bind(&message.channel_name)
+                .fetch_optional(pool)
+                .await?
+                .with_context(|| format!("target channel #{} does not exist", message.channel_name))?;
+                channel_id.insert(message.channel_name.clone(), id);
+                id
+            }
+        };
+        let author_id = *author_db_id
+            .get(&message.author_id)
+            .with_context(|| format!("message {} references unknown author {}", message.discord_id, message.author_id))?;
+        let created_at = parse_timestamp(&message.created_at)?;
+        let edited_at = message.edited_at.as_deref().map(parse_timestamp).transpose()?;
+
+        let existing: Option<Uuid> = sqlx::query_scalar(
+            "SELECT message_id FROM imported_message_sources WHERE source = $1 AND source_message_id = $2",
+        )
+        .bind(DISCORD_SOURCE)
+        .bind(&message.discord_id)
+        .fetch_optional(pool)
+        .await?;
+
+        let message_id = match existing {
+            Some(id) => {
+                sqlx::query(
+                    "UPDATE messages SET channel_id = $2, author_id = $3, content = $4, created_at = $5, edited_at = $6 WHERE id = $1",
+                )
+                .bind(id).bind(target_channel_id).bind(author_id).bind(&message.content).bind(created_at).bind(edited_at)
+                .execute(pool).await?;
+                updated += 1;
+                id
+            }
+            None => {
+                let mut tx = pool.begin().await?;
+                sqlx::query(
+                    "INSERT INTO messages (id, channel_id, author_id, content, created_at, edited_at, client_req_id) \
+                     VALUES ($1, $2, $3, $4, $5, $6, $7)",
+                )
+                .bind(message.id).bind(target_channel_id).bind(author_id).bind(&message.content)
+                .bind(created_at).bind(edited_at).bind(format!("discord:{}", message.discord_id))
+                .execute(&mut *tx).await?;
+                sqlx::query(
+                    "INSERT INTO imported_message_sources (source, source_message_id, message_id) VALUES ($1, $2, $3)",
+                )
+                .bind(DISCORD_SOURCE).bind(&message.discord_id).bind(message.id)
+                .execute(&mut *tx).await?;
+                tx.commit().await?;
+                inserted += 1;
+                message.id
+            }
+        };
+
+        for attachment in &message.attachments {
+            let already_imported: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM imported_attachment_sources WHERE source = $1 AND source_attachment_id = $2)",
+            )
+            .bind(DISCORD_SOURCE).bind(&attachment.discord_id).fetch_one(pool).await?;
+            if already_imported { continue; }
+            let discord_attachment = DiscordAttachment {
+                id: attachment.discord_id.clone(),
+                filename: attachment.filename.clone(),
+                url: attachment.source_url.clone(),
+                content_type: attachment.content_type.clone(),
+            };
+            match import_attachment(pool, config, &client, message_id, author_id, &discord_attachment).await {
+                Ok(()) => imported_attachments += 1,
+                Err(error) => eprintln!("Skipping unavailable Discord attachment {}: {error:#}", attachment.discord_id),
+            }
+        }
+
+        if let Some(preview) = &message.link_preview {
+            let image = match preview.image_source_url.as_deref() {
+                Some(url) => download_remote_image(config, &client, url, "preview").await.ok(),
+                None => None,
+            };
+            sqlx::query(
+                "INSERT INTO message_link_previews (message_id, url, title, description, site_name, image_storage_path, image_content_type) \
+                 VALUES ($1, $2, $3, $4, $5, $6, $7) \
+                 ON CONFLICT (message_id) DO UPDATE SET url = EXCLUDED.url, title = EXCLUDED.title, description = EXCLUDED.description, \
+                 site_name = EXCLUDED.site_name, image_storage_path = COALESCE(EXCLUDED.image_storage_path, message_link_previews.image_storage_path), \
+                 image_content_type = COALESCE(EXCLUDED.image_content_type, message_link_previews.image_content_type)",
+            )
+            .bind(message_id).bind(&preview.url).bind(&preview.title).bind(&preview.description).bind(&preview.site_name)
+            .bind(image.as_ref().map(|image| image.path.to_string_lossy().to_string()))
+            .bind(image.as_ref().map(|image| image.content_type.as_str()))
+            .execute(pool).await?;
+        }
+
+        // Rich embeds have no natural key; replacing the message's set on every
+        // run keeps the import idempotent without a dedicated ledger.
+        sqlx::query("DELETE FROM message_embeds WHERE message_id = $1").bind(message_id).execute(pool).await?;
+        for embed in &message.embeds {
+            let image = opt_download(config, &client, embed.image_source_url.as_deref(), "embed").await;
+            let thumbnail = opt_download(config, &client, embed.thumbnail_source_url.as_deref(), "embed-thumb").await;
+            let footer_icon = opt_download(config, &client, embed.footer_icon_source_url.as_deref(), "embed-footer").await;
+            let fields = if embed.fields.is_null() { serde_json::json!([]) } else { embed.fields.clone() };
+            sqlx::query(
+                "INSERT INTO message_embeds (message_id, position, title, description, url, color, author_name, author_url, \
+                 provider_name, footer_text, fields, image_storage_path, image_content_type, thumbnail_storage_path, \
+                 thumbnail_content_type, footer_icon_storage_path, footer_icon_content_type) \
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)",
+            )
+            .bind(message_id).bind(embed.position).bind(&embed.title).bind(&embed.description).bind(&embed.url)
+            .bind(embed.color).bind(&embed.author_name).bind(&embed.author_url).bind(&embed.provider_name)
+            .bind(&embed.footer_text).bind(fields)
+            .bind(image.as_ref().map(|i| i.path.to_string_lossy().to_string())).bind(image.as_ref().map(|i| i.content_type.clone()))
+            .bind(thumbnail.as_ref().map(|i| i.path.to_string_lossy().to_string())).bind(thumbnail.as_ref().map(|i| i.content_type.clone()))
+            .bind(footer_icon.as_ref().map(|i| i.path.to_string_lossy().to_string())).bind(footer_icon.as_ref().map(|i| i.content_type.clone()))
+            .execute(pool).await?;
+            imported_embeds += 1;
+        }
+    }
+
+    println!(
+        "Discord JSON import complete: {inserted} inserted, {updated} updated, {imported_attachments} attachments downloaded, {imported_embeds} embeds."
+    );
+    Ok(())
+}
+
+async fn opt_download(
+    config: &Config,
+    client: &reqwest::Client,
+    url: Option<&str>,
+    prefix: &str,
+) -> Option<DownloadedImage> {
+    let url = url?;
+    match download_remote_image(config, client, url, prefix).await {
+        Ok(image) => Some(image),
+        Err(error) => {
+            eprintln!("Skipping embed image {url}: {error:#}");
+            None
+        }
+    }
 }

@@ -46,6 +46,7 @@ pub fn router() -> Router<AppState> {
         .route("/api/users/:id/avatar", get(media::avatar))
         .route("/api/users/:id/profile-badge", get(media::profile_badge))
         .route("/api/messages/:id/preview-image", get(media::preview_image))
+        .route("/api/message-embeds/:id/:slot", get(media::embed_image))
         .route("/api/channels/:id/attachments", post(attachments::upload))
         .route("/api/attachments/:id", get(attachments::download))
         .route("/api/activity-assets", post(activity_assets::upload))

@@ -26,7 +26,12 @@ type Message = {
 // duplicate send to the original row instead of inserting a second message.
 const SEND_TIMEOUT_MS = 8000;
 type Participant = { user_id: string; muted: boolean; deafened: boolean; is_bot?: boolean };
-type StreamInfo = { stream_id: string; owner: string; kind: string; label?: string | null };
+type StreamInfo = { stream_id: string; owner: string; kind: string; label?: string | null; msid?: string | null };
+// Remote video tracks for one peer, tagged with the sender's MediaStream.id
+// so a screen and a camera from the same peer stay separate. `kind` is
+// resolved at render time by matching `msid` against the published-stream
+// list (a track whose msid matches nothing is treated as a screen).
+type RemoteVid = { stream: MediaStream; msid: string | null };
 // Community-wide projection of a voice channel's occupants — kept live for
 // every voice channel, not just the one this client has joined.
 type VoiceRosterEntry = { user_id: string; muted: boolean; deafened: boolean; sharing: boolean; is_bot?: boolean };
@@ -203,6 +208,7 @@ function VideoTile({
   onToggleMute,
   onToggleFocus,
   isSelf = false,
+  variant = "screen",
 }: {
   stream: MediaStream;
   name: string;
@@ -213,7 +219,9 @@ function VideoTile({
   onToggleMute: () => void;
   onToggleFocus: () => void;
   isSelf?: boolean;
+  variant?: "screen" | "camera";
 }) {
+  const isCamera = variant === "camera";
   const wrapRef = useRef<HTMLDivElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const [menuOpen, setMenuOpen] = useState(false);
@@ -249,9 +257,19 @@ function VideoTile({
 
   return (
     <div ref={wrapRef} className={"vtile is-video" + (focused ? " is-focused" : "") + (speaking ? " is-speaking" : "")} onDoubleClick={toggleFullscreen}>
-      <video ref={videoRef} autoPlay playsInline muted={isSelf || peerMuted} className="vtile__video" />
-      {!ready && <StreamLoading label={`Carregando a tela de ${name}`} />}
-      {isSelf && (
+      <video
+        ref={videoRef}
+        autoPlay
+        playsInline
+        muted={isSelf || peerMuted}
+        className={
+          "vtile__video"
+          + (isCamera ? " is-cam" : "")
+          + (isCamera && isSelf ? " is-self" : "")
+        }
+      />
+      {!ready && <StreamLoading label={isCamera ? `Ativando a câmera de ${name}` : `Carregando a tela de ${name}`} />}
+      {isSelf && !isCamera && (
         <div style={{
           position: "absolute",
           top: "12px",
@@ -558,6 +576,8 @@ export function App() {
   const [sourcesLoading, setSourcesLoading] = useState(false);
   const [watching, setWatching] = useState<Record<string, boolean>>({});
   const [peekOwner, setPeekOwner] = useState<string | null>(null);
+  // Voice channel currently under a member-drag, for the drop-target highlight.
+  const [dragOverVoice, setDragOverVoice] = useState<string | null>(null);
   // Mouse is inside the floating peek → expand it and show the watch button.
   const [previewHot, setPreviewHot] = useState(false);
   const peekHideTimer = useRef<number | null>(null);
@@ -576,7 +596,15 @@ export function App() {
   // join completes and the stream shows up, promote it to a full watch.
   const pendingWatchRef = useRef<{ ownerId: string; streamId: string } | null>(null);
   const voiceRowRefs = useRef<Record<string, HTMLElement>>({});
-  const [remoteVideos, setRemoteVideos] = useState<Record<string, MediaStream>>({});
+  const [remoteVideos, setRemoteVideos] = useState<Record<string, RemoteVid[]>>({});
+  // Our own webcam publication (streamId for unpublish) + live preview stream.
+  const [myCameraStreamId, setMyCameraStreamId] = useState<string | null>(null);
+  const [selfCameraStream, setSelfCameraStream] = useState<MediaStream | null>(null);
+  const [cameras, setCameras] = useState<MediaDeviceInfo[]>([]);
+  const [cameraDeviceId, setCameraDeviceId] = useState<string | null>(() => {
+    try { return localStorage.getItem("tk.cameraDeviceId"); } catch { return null; }
+  });
+  const [cameraMenuOpen, setCameraMenuOpen] = useState(false);
   const [focusedUser, setFocusedUser] = useState<string | null>(null);
   const [theater, setTheater] = useState(false);
   const [mutedPeers, setMutedPeers] = useState<Record<string, boolean>>({});
@@ -657,6 +685,12 @@ export function App() {
       if (event.op === "call.peer_joined") { if (event.data.channel_id === callChannelIdRef.current && event.data.participant?.user_id !== selfIdRef.current && Date.now() - joinedAtRef.current > 1500) playSound("joinCall"); setCall(current => !current || current.channelId !== event.data.channel_id ? current : { channelId: current.channelId, participants: [...current.participants.filter(participant => participant.user_id !== event.data.participant.user_id), event.data.participant] }); }
       if (event.op === "call.peer_left") { if (event.data.channel_id === callChannelIdRef.current && event.data.user_id !== selfIdRef.current && Date.now() - joinedAtRef.current > 1500) playSound("leaveCall"); setCall(current => !current || current.channelId !== event.data.channel_id ? current : { channelId: current.channelId, participants: current.participants.filter(participant => participant.user_id !== event.data.user_id) }); }
       if (event.op === "call.state.update") setCall(current => !current || current.channelId !== event.data.channel_id ? current : { channelId: current.channelId, participants: current.participants.map(participant => participant.user_id === event.data.user_id ? { ...participant, muted: event.data.muted, deafened: event.data.deafened } : participant) });
+      // The owner dragged us (or we dragged ourselves) into another voice
+      // channel — join it, reusing the normal join path.
+      if (event.op === "voice.moved") {
+        const dest = channels.find(channel => channel.id === event.data.channel_id);
+        if (dest) { setActiveChannel(dest); joinCall(dest); }
+      }
       if (event.op === "voice.rooms") {
         const rooms: Array<{ channel_id: string; participants: VoiceRosterEntry[]; streams?: StreamInfo[] }> = event.data.rooms ?? [];
         setVoiceRooms(Object.fromEntries(rooms.map(room => [room.channel_id, room.participants])));
@@ -854,12 +888,38 @@ export function App() {
     }
   }, [streams, call, watching]);
 
-  useEffect(() => rtc.onRemoteStream((peerUserId, stream) => {
+  useEffect(() => rtc.onRemoteStream((peerUserId, stream, msid) => {
     setRemoteVideos(current => {
-      if (!stream) { if (!(peerUserId in current)) return current; const next = { ...current }; delete next[peerUserId]; return next; }
-      return { ...current, [peerUserId]: stream };
+      const list = current[peerUserId] ?? [];
+      // Removal: `null` msid clears every video for the peer (peer left /
+      // connection closed); a specific msid clears just that track.
+      if (!stream) {
+        if (msid == null) {
+          if (!(peerUserId in current)) return current;
+          const next = { ...current }; delete next[peerUserId]; return next;
+        }
+        const trimmed = list.filter(v => v.msid !== msid);
+        if (trimmed.length === list.length) return current;
+        const next = { ...current };
+        if (trimmed.length) next[peerUserId] = trimmed; else delete next[peerUserId];
+        return next;
+      }
+      // Upsert by msid (and de-dupe by the stream object itself).
+      const rest = list.filter(v => v.msid !== msid && v.stream.id !== stream.id);
+      return { ...current, [peerUserId]: [...rest, { stream, msid: msid ?? stream.id }] };
     });
   }), []);
+
+  // Keep the self-preview stream and publish id in sync with the engine — a
+  // camera the OS revokes (unplug / another app) ends the track, and the
+  // engine fires this with `null`.
+  useEffect(() => rtc.onLocalCamera(stream => {
+    setSelfCameraStream(stream);
+    if (!stream) setMyCameraStreamId(null);
+  }), []);
+
+  // List cameras up front (labels stay blank until permission is granted once).
+  useEffect(() => { void rtc.listCameras().then(setCameras); }, []);
 
   useEffect(() => rtc.onConnectionQuality(setConnQuality), []);
   useEffect(() => rtc.onSpeaking(setSpeakingUsers), []);
@@ -960,6 +1020,7 @@ export function App() {
     if (call) { playSound("leaveCall"); void rtc.leaveCall(); }
     musicStreamRef.current = null;
     setCall(null); setStreams([]); setMySharingStreamId(null); setMyMusicStreamId(null);
+    setMyCameraStreamId(null); setSelfCameraStream(null); setCameraMenuOpen(false);
     setWatching({}); setRemoteVideos({}); cancelPeekHide(); peekMetaRef.current = null;
     peekOwnerRef.current = null; setPeekOwner(null); setPreviewHot(false);
 
@@ -1015,6 +1076,41 @@ export function App() {
     }
   }
   function stopSharing() { if (!call || !mySharingStreamId) return; playSound("stopScreen"); void rtc.unpublishScreen(call.channelId, mySharingStreamId); setMySharingStreamId(null); }
+
+  async function startCamera(deviceId?: string | null) {
+    if (!call) return;
+    const streamId = crypto.randomUUID();
+    try {
+      await rtc.startCamera(call.channelId, streamId, deviceId ?? cameraDeviceId);
+      setMyCameraStreamId(streamId);
+      playSound("startScreen");
+      // Permission is granted now — re-list so the menu shows real labels.
+      void rtc.listCameras().then(setCameras);
+    } catch (error) {
+      console.error("[ui] startCamera failed", error);
+      setError("Não foi possível acessar a câmera. Verifique as permissões.");
+    }
+  }
+  function stopCamera() {
+    if (!call || !myCameraStreamId) return;
+    playSound("stopScreen");
+    void rtc.stopCamera(call.channelId, myCameraStreamId);
+    setMyCameraStreamId(null);
+  }
+  function toggleCamera() { if (myCameraStreamId) stopCamera(); else void startCamera(); }
+  function openCameraMenu() {
+    void rtc.listCameras().then(setCameras);
+    setCameraMenuOpen(open => !open);
+  }
+  async function pickCamera(deviceId: string) {
+    try { localStorage.setItem("tk.cameraDeviceId", deviceId); } catch { /* private mode */ }
+    setCameraDeviceId(deviceId);
+    setCameraMenuOpen(false);
+    if (myCameraStreamId) {
+      try { await rtc.switchCamera(deviceId); }
+      catch (error) { console.error("[ui] switchCamera failed", error); setError("Não foi possível trocar de câmera."); }
+    }
+  }
   function toggleWatch(ownerId: string, streamId: string) {
     if (!call) return;
     const isWatching = !!watching[ownerId];
@@ -1129,6 +1225,8 @@ export function App() {
   const connected = connectionState === "connected";
   const myStatus: "online" | "busy" =
     currentUserId && presence[currentUserId] === "busy" ? "busy" : "online";
+  // Only the community owner can drag members between voice channels.
+  const canMoveMembers = members.find(member => member.id === currentUserId)?.role === "owner";
 
   /* ---- custom context menu + category collapse ---- */
   function openMenu(event: ReactMouseEvent, items: MenuItem[]) {
@@ -1204,25 +1302,71 @@ export function App() {
     setFocusedUser(current => (current === userId ? null : userId));
   }
 
-  function renderVoiceTile(participant: Participant) {
+  // Resolve one of a peer's remote video tracks by kind. A track whose msid
+  // matches a published "camera" row is the camera; anything else (including
+  // an msid we haven't seen a row for yet) is treated as the screen.
+  function pickRemoteVideo(userId: string, want: "screen" | "camera"): MediaStream | undefined {
+    for (const vid of remoteVideos[userId] ?? []) {
+      const row = streams.find(s => s.msid && s.msid === vid.msid);
+      const kind = row ? row.kind : "screen";
+      if (kind === want) return vid.stream;
+    }
+    return undefined;
+  }
+
+  // One participant expands to a base tile (camera video, or avatar) plus a
+  // separate screen tile whenever their share is being watched.
+  type VoiceTileDesc =
+    | { key: string; kind: "cam"; participant: Participant; stream?: MediaStream }
+    | { key: string; kind: "screen"; participant: Participant; stream: MediaStream };
+
+  function tilesForParticipant(participant: Participant): VoiceTileDesc[] {
+    const isSelf = participant.user_id === currentUserId;
+    const camera = isSelf
+      ? (selfCameraStream ?? undefined)
+      : pickRemoteVideo(participant.user_id, "camera");
+    const screen = isSelf
+      ? (mySharingStreamId ? rtc.getLocalScreenStream() ?? undefined : undefined)
+      : (watching[participant.user_id] ? pickRemoteVideo(participant.user_id, "screen") : undefined);
+    const tiles: VoiceTileDesc[] = [{ key: `cam:${participant.user_id}`, kind: "cam", participant, stream: camera }];
+    if (screen) tiles.push({ key: `screen:${participant.user_id}`, kind: "screen", participant, stream: screen });
+    return tiles;
+  }
+
+  function renderVoiceTile(desc: VoiceTileDesc) {
+    const { participant } = desc;
     const isSelf = participant.user_id === currentUserId;
     const name = isSelf ? selfName : memberName(participant.user_id);
-    const stream = streams.find(s => s.owner === participant.user_id && s.kind === "screen");
-    const watchable = !!stream && !isSelf;
-    const localStream = isSelf && mySharingStreamId ? rtc.getLocalScreenStream() : null;
-    const video = (isSelf && mySharingStreamId)
-      ? (localStream ?? undefined)
-      : (watching[participant.user_id] ? remoteVideos[participant.user_id] : undefined);
     const isMicMuted = isSelf ? muted : participant.muted;
-
     const speaking = speakingUsers.has(participant.user_id);
+    const screenRow = streams.find(s => s.owner === participant.user_id && s.kind === "screen");
+    const watchable = desc.kind === "cam" && !!screenRow && !isSelf && !watching[participant.user_id];
 
-    if (video) {
+    if (desc.kind === "screen") {
       return (
         <VideoTile
-          key={participant.user_id}
-          stream={video}
-          name={isSelf && mySharingStreamId ? `${name} — compartilhando` : name}
+          key={desc.key}
+          stream={desc.stream}
+          variant="screen"
+          name={`${name} — tela`}
+          micMuted={isMicMuted}
+          peerMuted={!!mutedPeers[participant.user_id]}
+          focused={focusedUser === participant.user_id}
+          speaking={speaking}
+          onToggleMute={() => togglePeerMute(participant.user_id)}
+          onToggleFocus={() => toggleFocus(participant.user_id)}
+          isSelf={isSelf}
+        />
+      );
+    }
+
+    if (desc.stream) {
+      return (
+        <VideoTile
+          key={desc.key}
+          stream={desc.stream}
+          variant="camera"
+          name={name}
           micMuted={isMicMuted}
           peerMuted={!!mutedPeers[participant.user_id]}
           focused={focusedUser === participant.user_id}
@@ -1235,18 +1379,18 @@ export function App() {
     }
 
     return (
-      <div className={speaking ? "vtile is-speaking" : "vtile"} key={participant.user_id}>
+      <div className={speaking ? "vtile is-speaking" : "vtile"} key={desc.key}>
         <Avatar label={name} size={88} className="vtile__avatar" imageUrl={isSelf ? currentUser?.avatar_url : members.find(member => member.id === participant.user_id)?.avatar_url} />
         <div className="vtile__name">
           {isMicMuted && <Icon name="mic-muted" size={14} />}
-          <span>{name}{isSelf && mySharingStreamId ? " — compartilhando" : ""}</span>
+          <span>{name}</span>
         </div>
         {watchable && (
           <button
-            className={watching[participant.user_id] ? "vtile__watch is-on" : "vtile__watch"}
-            onClick={() => toggleWatch(participant.user_id, stream!.stream_id)}
+            className="vtile__watch"
+            onClick={() => toggleWatch(participant.user_id, screenRow!.stream_id)}
           >
-            {watching[participant.user_id] ? "Parar" : "Assistir tela"}
+            Assistir tela
           </button>
         )}
       </div>
@@ -1346,10 +1490,25 @@ export function App() {
                   className={
                     "chan" +
                     (activeChannel?.id === channel.id && activeChannel?.kind === "voice" ? " is-active" : "") +
-                    (here ? " is-connected" : "")
+                    (here ? " is-connected" : "") +
+                    (dragOverVoice === channel.id ? " is-drop-target" : "")
                   }
                   onClick={() => chooseVoiceChannel(channel)}
                   onContextMenu={event => openMenu(event, channelMenuItems(channel))}
+                  onDragOver={canMoveMembers ? (event => {
+                    if (!event.dataTransfer.types.includes("application/x-tk-member")) return;
+                    event.preventDefault();
+                    event.dataTransfer.dropEffect = "move";
+                    setDragOverVoice(channel.id);
+                  }) : undefined}
+                  onDragLeave={canMoveMembers ? (() => setDragOverVoice(current => current === channel.id ? null : current)) : undefined}
+                  onDrop={canMoveMembers ? (event => {
+                    event.preventDefault();
+                    setDragOverVoice(null);
+                    const userId = event.dataTransfer.getData("application/x-tk-member");
+                    const from = event.dataTransfer.getData("application/x-tk-member-src");
+                    if (userId && from !== channel.id) send("voice.move_member", { user_id: userId, channel_id: channel.id });
+                  }) : undefined}
                 >
                   <Icon name="voice-chat" size={18} className="chan__icon" />
                   <span className="chan__name">{channel.name}</span>
@@ -1374,7 +1533,7 @@ export function App() {
                       // once you're actually watching, the main stage carries
                       // the video and the row just shows a "Parar" button.
                       const preview = canPeek && !watching[entry.user_id] && peekOwner === entry.user_id
-                        ? remoteVideos[entry.user_id]
+                        ? pickRemoteVideo(entry.user_id, "screen")
                         : undefined;
                       const promoteWatch = () => {
                         cancelPeekHide();
@@ -1395,9 +1554,17 @@ export function App() {
                             "voice-member"
                             + (isLive ? " is-live" : "")
                             + (speakingUsers.has(entry.user_id) ? " is-speaking" : "")
+                            + (canMoveMembers ? " is-draggable" : "")
                           }
                           key={entry.user_id}
                           ref={node => { if (node) voiceRowRefs.current[entry.user_id] = node; }}
+                          draggable={canMoveMembers || undefined}
+                          onDragStart={canMoveMembers ? (event => {
+                            event.dataTransfer.setData("application/x-tk-member", entry.user_id);
+                            event.dataTransfer.setData("application/x-tk-member-src", channel.id);
+                            event.dataTransfer.effectAllowed = "move";
+                          }) : undefined}
+                          onDragEnd={canMoveMembers ? (() => setDragOverVoice(null)) : undefined}
                           onMouseEnter={() => canPeek && peekEnter(channel.id, entry.user_id, share!.stream_id, here)}
                           onMouseLeave={() => canPeek && peekLeave(entry.user_id)}
                           onContextMenu={event => openMenu(event, memberMenuItems(entry.user_id))}
@@ -1484,7 +1651,13 @@ export function App() {
               >
                 <Icon name="share-screen" size={18} />
               </button>
-              <button className="vp-btn" title="Câmera" disabled><Icon name="camera-closed" size={18} /></button>
+              <button
+                className={myCameraStreamId ? "vp-btn is-on" : "vp-btn"}
+                onClick={toggleCamera}
+                title={myCameraStreamId ? "Desligar câmera" : "Ligar câmera"}
+              >
+                <Icon name={myCameraStreamId ? "camera" : "camera-closed"} size={18} />
+              </button>
             </div>
           </div>
         )}
@@ -1588,25 +1761,27 @@ export function App() {
               </button>
             </div>
             {(() => {
-              const focused = voiceParticipants.find(p => p.user_id === focusedUser);
+              const tiles = voiceParticipants.flatMap(tilesForParticipant);
+              const focused = focusedUser && tiles.some(t => t.participant.user_id === focusedUser)
+                ? focusedUser : null;
               if (focused) {
+                const main = tiles.filter(t => t.participant.user_id === focused);
+                const strip = tiles.filter(t => t.participant.user_id !== focused);
                 return (
                   <div className="voice-focus">
-                    <div className="voice-focus__main">{renderVoiceTile(focused)}</div>
-                    <div className="voice-strip">
-                      {voiceParticipants.filter(p => p.user_id !== focused.user_id).map(renderVoiceTile)}
-                    </div>
+                    <div className="voice-focus__main">{main.map(renderVoiceTile)}</div>
+                    <div className="voice-strip">{strip.map(renderVoiceTile)}</div>
                   </div>
                 );
               }
               return (
                 <div
                   className="voice-grid"
-                  style={{ gridTemplateColumns: `repeat(${tileGridColumns(Math.max(voiceParticipants.length, 1))}, minmax(0, 1fr))` }}
+                  style={{ gridTemplateColumns: `repeat(${tileGridColumns(Math.max(tiles.length, 1))}, minmax(0, 1fr))` }}
                 >
-                  {voiceParticipants.length === 0
+                  {tiles.length === 0
                     ? <div className="empty">Conectando…</div>
-                    : voiceParticipants.map(renderVoiceTile)}
+                    : tiles.map(renderVoiceTile)}
                 </div>
               );
             })()}
@@ -1620,7 +1795,30 @@ export function App() {
               >
                 <Icon name="share-screen" size={22} />
               </button>
-              <button className="vc-btn" title="Câmera" disabled><Icon name="camera-closed" size={22} /></button>
+              <div className="vc-cam">
+                <button
+                  className={myCameraStreamId ? "vc-btn is-on" : "vc-btn"}
+                  onClick={toggleCamera}
+                  title={myCameraStreamId ? "Desligar câmera" : "Ligar câmera"}
+                >
+                  <Icon name={myCameraStreamId ? "camera" : "camera-closed"} size={22} />
+                </button>
+                <button className="vc-cam__caret" onClick={openCameraMenu} title="Escolher câmera" aria-label="Escolher câmera">▾</button>
+                {cameraMenuOpen && (
+                  <div className="vc-cam__menu" onMouseLeave={() => setCameraMenuOpen(false)}>
+                    {cameras.length === 0 && <div className="vc-cam__empty">Nenhuma câmera encontrada</div>}
+                    {cameras.map((cam, index) => (
+                      <button
+                        key={cam.deviceId || index}
+                        className={cam.deviceId === cameraDeviceId ? "is-active" : ""}
+                        onClick={() => void pickCamera(cam.deviceId)}
+                      >
+                        {cam.label || `Câmera ${index + 1}`}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
               <button
                 className={muted ? "vc-btn is-danger" : "vc-btn"}
                 onClick={() => updateAudioState(!muted, deafened)}

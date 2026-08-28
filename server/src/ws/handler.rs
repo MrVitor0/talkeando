@@ -1,4 +1,7 @@
-use std::{collections::HashSet, time::Duration};
+use std::{
+    collections::HashSet,
+    time::{Duration, Instant},
+};
 
 use axum::{
     extract::{
@@ -12,6 +15,16 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 const MUSIC_BOT_ID: Uuid = Uuid::from_u128(1);
+
+/// How often the server pings an idle socket, and how long it tolerates
+/// silence before treating the connection as dead. Without this a client
+/// that vanishes uncleanly (Wi-Fi drop, laptop sleep, killed process) would
+/// sit in `conns` — and stay "online" for everyone — until the OS TCP
+/// keepalive eventually reaped it (hours). The .NET/browser client answers
+/// WebSocket Pings at the transport layer, so a live-but-idle client keeps
+/// itself marked online for free.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(30);
 
 use crate::{
     auth::authenticate_token,
@@ -136,23 +149,47 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
     let mut joined_calls: HashSet<Uuid> = HashSet::new();
 
-    while let Some(msg) = receiver.next().await {
-        let msg = match msg {
-            Ok(m) => m,
-            Err(_) => break,
-        };
-        match msg {
-            Message::Text(text) => {
-                dispatch(&state, user_id, &text, &mut joined_calls).await;
+    // Application-level heartbeat: any inbound frame (including the Pong the
+    // client sends in reply to our Ping) refreshes `last_seen`; if nothing
+    // arrives for HEARTBEAT_TIMEOUT we drop the socket so the disconnect
+    // path below runs and the user goes offline.
+    let mut last_seen = Instant::now();
+    let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    heartbeat.tick().await; // consume the immediate first tick
+
+    loop {
+        tokio::select! {
+            incoming = receiver.next() => {
+                let Some(msg) = incoming else { break };
+                let msg = match msg {
+                    Ok(m) => m,
+                    Err(_) => break,
+                };
+                last_seen = Instant::now();
+                match msg {
+                    Message::Text(text) => {
+                        dispatch(&state, user_id, &text, &mut joined_calls).await;
+                    }
+                    Message::Ping(payload) => {
+                        let _ = state
+                            .hub
+                            .send_to_raw(user_id, Message::Pong(payload))
+                            .await;
+                    }
+                    Message::Close(_) => break,
+                    _ => {}
+                }
             }
-            Message::Ping(payload) => {
-                let _ = state
-                    .hub
-                    .send_to_raw(user_id, Message::Pong(payload))
-                    .await;
+            _ = heartbeat.tick() => {
+                if last_seen.elapsed() > HEARTBEAT_TIMEOUT {
+                    tracing::info!(%user_id, "ws heartbeat timeout; dropping dead connection");
+                    break;
+                }
+                if tx.send(Message::Ping(Vec::new())).is_err() {
+                    break;
+                }
             }
-            Message::Close(_) => break,
-            _ => {}
         }
     }
 
@@ -168,6 +205,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     state.begin_offline_grace(user_id).await;
     let delayed_state = state.clone();
     tokio::spawn(async move {
+        // Grace window so a page refresh / brief network blip doesn't flap the
+        // member list. A genuine disconnect still clears well inside this once
+        // the heartbeat above has torn the dead socket down.
         tokio::time::sleep(Duration::from_secs(8)).await;
         if delayed_state.hub.is_online(user_id).await
             || !delayed_state.presence_epoch_is_current(user_id, disconnect_epoch).await
@@ -470,6 +510,10 @@ async fn dispatch(state: &AppState, user_id: Uuid, text: &str, joined_calls: &mu
         "call.state.update" => {
             let data: CallStateUpdate = parse_or_reject!(CallStateUpdate);
             handle_call_state_update(state, user_id, data).await;
+        }
+        "voice.move_member" => {
+            let data: VoiceMoveMember = parse_or_reject!(VoiceMoveMember);
+            handle_voice_move_member(state, user_id, data).await;
         }
         "rtc.offer" => {
             let data: RtcOffer = parse_or_reject!(RtcOffer);
@@ -1000,6 +1044,57 @@ async fn handle_call_state_update(
     broadcast_voice_roster(state, data.channel_id).await;
 }
 
+/// A community owner drags another member's sidebar row onto a voice channel.
+/// The server only validates the action and tells the target to move — the
+/// target's client then sends a normal `call.join`, so channel-membership
+/// checks, the previous-call teardown and all RTC setup run through the
+/// existing path with nothing special-cased.
+async fn handle_voice_move_member(state: &AppState, actor_id: Uuid, data: VoiceMoveMember) {
+    let dest = match db::channel_by_id(&state.pool, data.channel_id).await {
+        Ok(Some(channel)) if channel.kind == "voice" => channel,
+        _ => {
+            state.hub.send_to(actor_id, OutboundEnvelope::error("not_found", "voice channel not found", None)).await;
+            return;
+        }
+    };
+
+    // Only the community owner may drag other members around.
+    if !matches!(db::is_community_owner(&state.pool, dest.community_id, actor_id).await, Ok(true)) {
+        state.hub.send_to(actor_id, OutboundEnvelope::error("forbidden", "only the community owner can move members", None)).await;
+        return;
+    }
+
+    if data.user_id == actor_id {
+        // Moving yourself is just a normal join.
+        state.hub.send_to(actor_id, OutboundEnvelope::new(
+            "voice.moved", VoiceMoved { channel_id: data.channel_id, moved_by: actor_id },
+        )).await;
+        return;
+    }
+
+    // Target must belong to the destination channel's community.
+    if !matches!(db::channel_if_member(&state.pool, dest.id, data.user_id).await, Ok(Some(_))) {
+        state.hub.send_to(actor_id, OutboundEnvelope::error("validation_error", "that member is not in this community", None)).await;
+        return;
+    }
+
+    // Target must be online and already sitting in some voice call — dragging
+    // is for relocating an occupant, not pulling someone into voice cold.
+    let in_a_call = {
+        let calls = state.hub.calls.read().await;
+        calls.calls.values().any(|call| call.participants.contains_key(&data.user_id))
+    };
+    if !state.hub.is_online(data.user_id).await || !in_a_call {
+        state.hub.send_to(actor_id, OutboundEnvelope::error("validation_error", "that member is not in a voice channel", None)).await;
+        return;
+    }
+
+    state.hub.send_to(data.user_id, OutboundEnvelope::new(
+        "voice.moved", VoiceMoved { channel_id: data.channel_id, moved_by: actor_id },
+    )).await;
+    tracing::info!(%actor_id, target = %data.user_id, channel_id = %data.channel_id, "voice.move_member");
+}
+
 async fn relay_rtc(
     state: &AppState,
     from: Uuid,
@@ -1062,10 +1157,10 @@ async fn relay_rtc(
 }
 
 async fn handle_stream_publish(state: &AppState, user_id: Uuid, data: StreamPublish) {
-    if data.kind != "screen" && data.kind != "music" {
+    if data.kind != "screen" && data.kind != "music" && data.kind != "camera" {
         state
             .hub
-            .send_to(user_id, OutboundEnvelope::error("validation_error", "only screen and music streams are available", None))
+            .send_to(user_id, OutboundEnvelope::error("validation_error", "only screen, camera and music streams are available", None))
             .await;
         return;
     }
@@ -1079,12 +1174,13 @@ async fn handle_stream_publish(state: &AppState, user_id: Uuid, data: StreamPubl
             data.kind.clone(),
             data.label.clone(),
             data.has_audio,
+            data.msid.clone(),
         )
     };
     if let Err(error) = result {
         let (code, message) = match error {
             CallOpError::NotInCall => ("forbidden", "join the call before publishing"),
-            CallOpError::StreamAlreadyPublished => ("conflict", "only one screen stream per publisher is allowed"),
+            CallOpError::StreamAlreadyPublished => ("conflict", "only one stream of each kind per publisher is allowed"),
             _ => ("validation_error", "unable to publish stream"),
         };
         state.hub.send_to(user_id, OutboundEnvelope::error(code, message, None)).await;
@@ -1104,6 +1200,7 @@ async fn handle_stream_publish(state: &AppState, user_id: Uuid, data: StreamPubl
                     kind: data.kind.clone(),
                     label: data.label.clone(),
                     has_audio: data.has_audio,
+                    msid: data.msid.clone(),
                 },
             ),
         )

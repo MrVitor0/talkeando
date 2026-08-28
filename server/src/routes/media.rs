@@ -39,6 +39,35 @@ pub async fn preview_image(
     serve(row).await
 }
 
+/// Serves an imported rich-embed image (`slot` is `image`, `thumbnail` or
+/// `footer-icon`). Access mirrors `preview_image`: the caller must belong to
+/// the community that owns the embed's message.
+pub async fn embed_image(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path((embed_id, slot)): Path<(Uuid, String)>,
+) -> AppResult<Response<Body>> {
+    // Fixed allowlist — the column names below are never caller-controlled.
+    let (path_col, content_type_col) = match slot.as_str() {
+        "image" => ("image_storage_path", "image_content_type"),
+        "thumbnail" => ("thumbnail_storage_path", "thumbnail_content_type"),
+        "footer-icon" => ("footer_icon_storage_path", "footer_icon_content_type"),
+        _ => return Err(AppError::NotFound),
+    };
+    let query = format!(
+        "SELECT e.{path_col}, e.{content_type_col} FROM message_embeds e \
+         JOIN messages m ON m.id = e.message_id JOIN channels c ON c.id = m.channel_id \
+         JOIN community_members cm ON cm.community_id = c.community_id \
+         WHERE e.id = $1 AND cm.user_id = $2 AND e.{path_col} IS NOT NULL"
+    );
+    let row: Option<(String, String)> = sqlx::query_as(&query)
+        .bind(embed_id)
+        .bind(auth.user.id)
+        .fetch_optional(&state.pool)
+        .await?;
+    serve(row).await
+}
+
 async fn serve(row: Option<(String, String)>) -> AppResult<Response<Body>> {
     let (path, content_type) = row.ok_or(AppError::NotFound)?;
     let bytes = tokio::fs::read(path).await.map_err(|_| AppError::NotFound)?;

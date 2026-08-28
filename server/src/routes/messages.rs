@@ -39,6 +39,7 @@ pub struct HistoryMessage {
     pub edited_at: Option<DateTime<Utc>>,
     pub attachments: Vec<MessageAttachment>,
     pub link_preview: Option<LinkPreview>,
+    pub embeds: Vec<MessageEmbedDto>,
 }
 
 #[derive(Clone, Serialize, sqlx::FromRow)]
@@ -47,6 +48,41 @@ pub struct LinkPreview {
     pub title: Option<String>,
     pub site_name: Option<String>,
     pub image_url: Option<String>,
+}
+
+/// A rich embed imported from Discord (bot polls, "now playing", changelog
+/// cards). See migration 0007 and `discord_import::import_json`.
+#[derive(Clone, Serialize)]
+pub struct MessageEmbedDto {
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub url: Option<String>,
+    pub color: Option<i32>,
+    pub author_name: Option<String>,
+    pub author_url: Option<String>,
+    pub provider_name: Option<String>,
+    pub footer_text: Option<String>,
+    pub footer_icon_url: Option<String>,
+    pub image_url: Option<String>,
+    pub thumbnail_url: Option<String>,
+    pub fields: serde_json::Value,
+}
+
+#[derive(sqlx::FromRow)]
+struct EmbedRow {
+    message_id: Uuid,
+    title: Option<String>,
+    description: Option<String>,
+    url: Option<String>,
+    color: Option<i32>,
+    author_name: Option<String>,
+    author_url: Option<String>,
+    provider_name: Option<String>,
+    footer_text: Option<String>,
+    fields: serde_json::Value,
+    image_url: Option<String>,
+    thumbnail_url: Option<String>,
+    footer_icon_url: Option<String>,
 }
 
 #[derive(Serialize, sqlx::FromRow)]
@@ -151,6 +187,31 @@ pub async fn history(
         LinkPreview { url: preview.url, title: preview.title, site_name: preview.site_name, image_url: preview.image_url },
     )).collect();
 
+    let embed_rows = sqlx::query_as::<_, EmbedRow>(
+        "SELECT message_id, title, description, url, color, author_name, author_url, provider_name, footer_text, fields, \
+                CASE WHEN image_storage_path IS NULL THEN NULL ELSE '/api/message-embeds/' || id::text || '/image' END AS image_url, \
+                CASE WHEN thumbnail_storage_path IS NULL THEN NULL ELSE '/api/message-embeds/' || id::text || '/thumbnail' END AS thumbnail_url, \
+                CASE WHEN footer_icon_storage_path IS NULL THEN NULL ELSE '/api/message-embeds/' || id::text || '/footer-icon' END AS footer_icon_url \
+         FROM message_embeds WHERE message_id = ANY($1) ORDER BY message_id, position",
+    ).bind(&message_ids).fetch_all(&state.pool).await?;
+    let mut embeds_by_message = std::collections::HashMap::<Uuid, Vec<MessageEmbedDto>>::new();
+    for embed in embed_rows {
+        embeds_by_message.entry(embed.message_id).or_default().push(MessageEmbedDto {
+            title: embed.title,
+            description: embed.description,
+            url: embed.url,
+            color: embed.color,
+            author_name: embed.author_name,
+            author_url: embed.author_url,
+            provider_name: embed.provider_name,
+            footer_text: embed.footer_text,
+            footer_icon_url: embed.footer_icon_url,
+            image_url: embed.image_url,
+            thumbnail_url: embed.thumbnail_url,
+            fields: embed.fields,
+        });
+    }
+
     let mut attachments_by_message = std::collections::HashMap::<Uuid, Vec<MessageAttachment>>::new();
     for attachment in attachment_rows {
         attachments_by_message.entry(attachment.message_id).or_default().push(MessageAttachment {
@@ -178,6 +239,7 @@ pub async fn history(
         edited_at: row.edited_at,
             attachments: attachments_by_message.remove(&row.id).unwrap_or_default(),
             link_preview: previews_by_message.get(&row.id).cloned(),
+            embeds: embeds_by_message.remove(&row.id).unwrap_or_default(),
     }).collect();
 
     Ok(Json(HistoryResponse { messages, has_more }))

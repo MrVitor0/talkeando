@@ -55,5 +55,13 @@ jobs:
               tar -xzf - -C /opt/talkeando
               cd /opt/talkeando/infra
               docker compose -f docker-compose.production.yml up -d --build --remove-orphans
+              # `up` does not recreate caddy when only the bind-mounted Caddyfile
+              # changed (compose hashes the service def, not the file contents),
+              # and caddy reads its config once at process start — so an
+              # upstream/host rename in the Caddyfile is otherwise ignored until
+              # something restarts the container. `caddy reload` proved
+              # unreliable over `compose exec` (exits 0 without applying), so just
+              # recreate it — a ~1s restart on this box.
+              docker compose -f docker-compose.production.yml up -d --force-recreate caddy
               docker compose -f docker-compose.production.yml ps
             '

@@ -34,6 +34,13 @@ enum Command {
         #[arg(long)]
         har_path: PathBuf,
     },
+    /// Imports the reviewed JSON produced by
+    /// `scripts/discord-import/har-to-json.mjs` (step 2 of the HAR import).
+    ImportDiscordJson {
+        /// Path to the JSON file generated from the HAR.
+        #[arg(long)]
+        path: PathBuf,
+    },
     /// Imports all approved Discord channels using a temporary credential in
     /// DISCORD_AUTHORIZATION. The secret is never stored by Tupi.
     ImportDiscordLive {
@@ -84,6 +91,9 @@ async fn main() -> anyhow::Result<()> {
         } => bootstrap_owner(pool, username, password, display_name, community_name).await,
         Command::ImportDiscordHar { har_path } => {
             discord_import::import_har(&pool, &config, &har_path).await
+        }
+        Command::ImportDiscordJson { path } => {
+            discord_import::import_json(&pool, &config, &path).await
         }
         Command::ImportDiscordLive { replace_imported } => {
             let authorization = std::env::var("DISCORD_AUTHORIZATION")

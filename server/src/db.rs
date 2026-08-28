@@ -186,6 +186,25 @@ pub async fn community_member_ids(
     Ok(rows.into_iter().map(|(user_id,)| user_id).collect())
 }
 
+/// Whether `user_id` is the `owner` of `community_id`. Used to gate
+/// moderator-style actions (e.g. dragging another member between voice
+/// channels) — mirrors the `role = 'owner'` checks in the HTTP routes.
+pub async fn is_community_owner(
+    pool: &PgPool,
+    community_id: Uuid,
+    user_id: Uuid,
+) -> Result<bool, sqlx::Error> {
+    let found: Option<(Uuid,)> = sqlx::query_as(
+        "SELECT user_id FROM community_members \
+         WHERE community_id = $1 AND user_id = $2 AND role = 'owner'",
+    )
+    .bind(community_id)
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(found.is_some())
+}
+
 // ---- game_sessions (SDD/specs/activity.md, ACT-FR-030..032) ----
 
 #[derive(Debug, Clone, sqlx::FromRow)]

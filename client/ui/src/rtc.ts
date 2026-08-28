@@ -21,7 +21,11 @@ import { pauseNativeMusic, startNativeMusic, stopNativeMusic } from "./nativeMus
 import * as noiseSuppression from "./noiseSuppression";
 
 type TurnCredentials = { username: string; credential: string; uris: string[] };
-type RemoteStreamListener = (peerUserId: string, stream: MediaStream | null) => void;
+// `msid` is the sender's local MediaStream.id for this track — the UI matches
+// it against the `msid` on the published-stream metadata to tell a peer's
+// camera track apart from their screen track (a peer can send both at once).
+// `null` stream + `null` msid means "drop every remote video for this peer".
+type RemoteStreamListener = (peerUserId: string, stream: MediaStream | null, msid: string | null) => void;
 
 const peers = new Map<string, RTCPeerConnection>();
 const pendingPeers = new Map<string, Promise<RTCPeerConnection>>();
@@ -92,6 +96,33 @@ const screenNeedsOffer = new Set<string>();
 let localMusicTrack: MediaStreamTrack | null = null;
 const musicSlots = new Map<string, RTCRtpTransceiver>();
 
+// Camera (send side): a plain getUserMedia video track that — unlike screen —
+// is broadcast to every call peer with no per-viewer subscribe gate, the same
+// way the mic is (everyone in a call wants to see faces). `stream.publish`
+// with kind:"camera" is still sent so the roster/tiles know it exists and so
+// receivers get the msid → kind mapping. One dedicated sendonly transceiver
+// per peer, created once and then reused (replaceTrack + direction) — never
+// removeTrack — mirroring the screen path so repeated on/off can't pile up
+// dead m-lines. `cameraOn` is the desired state used when retrying a
+// renegotiation that had to be deferred mid-signalling.
+let localCameraStream: MediaStream | null = null;
+let localCameraTrack: MediaStreamTrack | null = null;
+let cameraOn = false;
+let cameraDeviceId: string | null = null;
+const cameraSlots = new Map<string, RTCRtpTransceiver>();
+const cameraNeedsOffer = new Set<string>();
+const localCameraListeners = new Set<(stream: MediaStream | null) => void>();
+
+const CAMERA_CONSTRAINTS = (deviceId?: string | null): MediaStreamConstraints => ({
+  video: {
+    ...(deviceId ? { deviceId: { exact: deviceId } } : {}),
+    width: { ideal: 1280 },
+    height: { ideal: 720 },
+    frameRate: { ideal: 30, max: 30 },
+  },
+  audio: false,
+});
+
 // Offers/answers we relay carry no value in their inline ICE candidates — we
 // trickle every candidate over rtc.ice anyway — and a full candidate list can
 // add tens of KiB to a renegotiation. Strip them before send() so the payload
@@ -115,9 +146,9 @@ function requestTurnCredentials(): Promise<TurnCredentials> {
   });
 }
 
-function emitRemoteStream(peerUserId: string, stream: MediaStream | null) {
-  console.log(`[rtc] emitRemoteStream(${peerUserId}, ${stream ? "stream" : "null"}) to ${remoteVideoListeners.size} listener(s)`);
-  remoteVideoListeners.forEach(listener => listener(peerUserId, stream));
+function emitRemoteStream(peerUserId: string, stream: MediaStream | null, msid: string | null = null) {
+  console.log(`[rtc] emitRemoteStream(${peerUserId}, ${stream ? "stream" : "null"}, msid=${msid ?? "-"}) to ${remoteVideoListeners.size} listener(s)`);
+  remoteVideoListeners.forEach(listener => listener(peerUserId, stream, msid));
 }
 
 function getOrCreatePeer(peerUserId: string): Promise<RTCPeerConnection> {
@@ -171,8 +202,12 @@ async function createPeer(peerUserId: string): Promise<RTCPeerConnection> {
       void audioEl.play().catch(error => console.error("[rtc] remote audio play() failed", error));
     } else if (event.track.kind === "video") {
       const stream = event.streams[0] ?? new MediaStream([event.track]);
-      emitRemoteStream(peerUserId, stream);
-      event.track.onended = () => { console.log(`[rtc] remote video track ended for ${peerUserId}`); emitRemoteStream(peerUserId, null); };
+      // The msid rides along on event.streams[0].id and equals the sender's
+      // local MediaStream.id, so the UI can pair this track with the
+      // matching `stream.published` metadata (screen vs camera).
+      const msid = stream.id;
+      emitRemoteStream(peerUserId, stream, msid);
+      event.track.onended = () => { console.log(`[rtc] remote video track ended for ${peerUserId}`); emitRemoteStream(peerUserId, null, msid); };
     }
   };
 
@@ -276,6 +311,9 @@ function handleIncomingOffer(data: any) {
       // was half-applied. Roll ours back and take theirs — the screen-share
       // owner is the single source of truth for the video m-line.
       try { await pc.setLocalDescription({ type: "rollback" }); } catch { /* already stable */ }
+      // Anything we had queued in our rolled-back offer (e.g. our own camera
+      // just turned on) needs to be re-offered once we're stable again.
+      if (cameraSlots.has(peerUserId)) cameraNeedsOffer.add(peerUserId);
     }
     await pc.setRemoteDescription({ type: "offer", sdp: data.sdp });
     lastRemoteSdp.set(peerUserId, data.sdp);
@@ -291,6 +329,7 @@ function handleIncomingOffer(data: any) {
     // peer subscribed to it, and flush a renegotiation that had to be deferred.
     if (localScreenStream && screenSubscribers.has(peerUserId)) void applyScreenSend(peerUserId, true);
     if (localMusicTrack) void applyMusicSend(peerUserId, true);
+    syncCameraToPeer(peerUserId);
   });
 }
 
@@ -311,6 +350,7 @@ function handleIncomingAnswer(data: any) {
   }).then(() => {
     if (localScreenStream && screenSubscribers.has(peerUserId)) void applyScreenSend(peerUserId, true);
     if (localMusicTrack) void applyMusicSend(peerUserId, true);
+    syncCameraToPeer(peerUserId);
   });
 }
 
@@ -345,6 +385,8 @@ function closePeer(peerUserId: string) {
   if (pc) { pc.close(); peers.delete(peerUserId); }
   screenSlots.delete(peerUserId);
   musicSlots.delete(peerUserId);
+  cameraSlots.delete(peerUserId);
+  cameraNeedsOffer.delete(peerUserId);
   screenNeedsOffer.delete(peerUserId);
   spectatedStreams.delete(peerUserId);
   spectatorPeers.delete(peerUserId);
@@ -375,6 +417,53 @@ async function applyMusicSend(peerUserId: string, sending: boolean) {
   });
 }
 
+/// Owner side: activate or idle THIS peer's dedicated camera transceiver,
+/// then renegotiate once. Same reuse discipline as the screen path — the
+/// transceiver is created a single time and toggled with replaceTrack +
+/// direction, never removeTrack. A renegotiation that can't run yet
+/// (signalling mid-flight) is remembered in `cameraNeedsOffer` and retried
+/// from handleIncomingOffer/Answer once stable.
+function applyCameraSend(peerUserId: string, sending: boolean) {
+  return withSdpLock(peerUserId, async () => {
+    const pc = peers.get(peerUserId);
+    if (!pc) { console.warn(`[rtc] applyCameraSend(${peerUserId}, ${sending}) — no peer yet`); return; }
+    let slot = cameraSlots.get(peerUserId);
+
+    if (sending && localCameraTrack && localCameraStream) {
+      if (!slot) {
+        slot = pc.addTransceiver(localCameraTrack, { direction: "sendonly", streams: [localCameraStream] });
+        cameraSlots.set(peerUserId, slot);
+      } else {
+        await slot.sender.replaceTrack(localCameraTrack);
+        slot.direction = "sendonly";
+      }
+    } else if (slot) {
+      await slot.sender.replaceTrack(null);
+      slot.direction = "inactive";
+    } else {
+      return; // nothing to send and no slot to idle
+    }
+
+    if (!currentChannelId || pc.signalingState !== "stable") { cameraNeedsOffer.add(peerUserId); return; }
+    cameraNeedsOffer.delete(peerUserId);
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    sendSdp("rtc.offer", currentChannelId, peerUserId, offer.sdp);
+  });
+}
+
+/// Push the current camera state to a peer whose connection just reached a
+/// usable point (new participant, or renegotiation that had been deferred).
+function syncCameraToPeer(peerUserId: string) {
+  if (!cameraOn && !cameraSlots.has(peerUserId)) return;
+  if (cameraOn && cameraSlots.get(peerUserId)?.direction === "sendonly" && !cameraNeedsOffer.has(peerUserId)) return;
+  void applyCameraSend(peerUserId, cameraOn);
+}
+
+function emitLocalCamera(stream: MediaStream | null) {
+  localCameraListeners.forEach(listener => listener(stream));
+}
+
 /// Handles every WS event forwarded by the native host. Call this from the
 /// same `subscribe` callback the rest of the UI uses — it only reacts to
 /// the ops it owns and ignores everything else.
@@ -391,14 +480,14 @@ function handleEnvelope(event: Envelope) {
       if (!selfUserId) break;
       for (const participant of data.participants ?? []) {
         const peerUserId: string = participant.user_id;
-        if (peerUserId !== selfUserId && selfUserId < peerUserId) void connectToPeer(peerUserId, data.channel_id).then(() => { if (localMusicTrack) void applyMusicSend(peerUserId, true); });
+        if (peerUserId !== selfUserId && selfUserId < peerUserId) void connectToPeer(peerUserId, data.channel_id).then(() => { if (localMusicTrack) void applyMusicSend(peerUserId, true); syncCameraToPeer(peerUserId); });
       }
       break;
     }
     case "call.peer_joined": {
       if (data.channel_id) currentChannelId = data.channel_id;
       const peerUserId: string = data.participant.user_id;
-      if (selfUserId && peerUserId !== selfUserId && selfUserId < peerUserId) void connectToPeer(peerUserId, data.channel_id).then(() => { if (localMusicTrack) void applyMusicSend(peerUserId, true); });
+      if (selfUserId && peerUserId !== selfUserId && selfUserId < peerUserId) void connectToPeer(peerUserId, data.channel_id).then(() => { if (localMusicTrack) void applyMusicSend(peerUserId, true); syncCameraToPeer(peerUserId); });
       break;
     }
     case "call.peer_left":
@@ -584,6 +673,12 @@ export async function leaveCall() {
   for (const peerUserId of Array.from(peers.keys())) closePeer(peerUserId);
   stopNativeScreen();
   stopNativeMusic(); localMusicTrack = null; musicSlots.clear();
+  cameraOn = false;
+  cameraSlots.clear();
+  cameraNeedsOffer.clear();
+  if (localCameraStream) { for (const track of localCameraStream.getTracks()) track.stop(); }
+  localCameraStream = null; localCameraTrack = null;
+  emitLocalCamera(null);
   if (localScreenTrack) { localScreenTrack.stop(); localScreenTrack = null; }
   localScreenStream = null;
   screenSlots.clear();
@@ -670,7 +765,7 @@ export async function publishScreen(channelId: string, streamId: string, sourceI
   console.log(`[rtc] publishScreen: ${sourceId} video=${localScreenTrack?.readyState} audio=${hasAudio} subs=[${Array.from(screenSubscribers).join(",")}]`);
   // Anyone who already subscribed (before we had a track) now gets it.
   for (const peerUserId of screenSubscribers) await applyScreenSend(peerUserId, true);
-  send("stream.publish", { channel_id: channelId, stream_id: streamId, kind: "screen", has_audio: hasAudio, req_id: crypto.randomUUID() });
+  send("stream.publish", { channel_id: channelId, stream_id: streamId, kind: "screen", has_audio: hasAudio, msid: localScreenStream?.id, req_id: crypto.randomUUID() });
 }
 
 export async function unpublishScreen(channelId: string, streamId: string) {
@@ -681,6 +776,95 @@ export async function unpublishScreen(channelId: string, streamId: string) {
   if (localScreenTrack) { localScreenTrack.stop(); localScreenTrack = null; }
   localScreenStream = null;
   send("stream.unpublish", { channel_id: channelId, stream_id: streamId, req_id: crypto.randomUUID() });
+}
+
+// --- Camera -------------------------------------------------------------
+// A getUserMedia webcam track, broadcast to every current and future call
+// peer (no per-viewer subscribe gate — see the note by the camera state).
+// `startCamera`/`stopCamera` are the on/off toggle; `switchCamera` hot-swaps
+// the capture device with a plain replaceTrack (no renegotiation).
+
+/// The webcams this machine exposes. Labels are blank until the user has
+/// granted camera permission once (browser privacy rule), so the UI should
+/// re-list after a successful startCamera.
+export async function listCameras(): Promise<MediaDeviceInfo[]> {
+  try {
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    return devices.filter(device => device.kind === "videoinput");
+  } catch (error) {
+    console.error("[rtc] enumerateDevices failed", error);
+    return [];
+  }
+}
+
+/// Subscribe to the local camera stream (for the self-preview tile). Fires
+/// immediately with the current value, then on every start/stop/switch.
+export function onLocalCamera(listener: (stream: MediaStream | null) => void) {
+  localCameraListeners.add(listener);
+  listener(localCameraStream);
+  return () => { localCameraListeners.delete(listener); };
+}
+
+export function isCameraOn() { return cameraOn; }
+export function getLocalCameraStream(): MediaStream | null { return localCameraStream; }
+
+/// Turn the webcam on: capture it, start sending it to every call peer, and
+/// register the stream so it shows up in the roster/tiles. `deviceId` picks a
+/// specific camera (falls back to the OS default).
+export async function startCamera(channelId: string, streamId: string, deviceId?: string | null): Promise<void> {
+  if (cameraOn) return;
+  const stream = await navigator.mediaDevices.getUserMedia(CAMERA_CONSTRAINTS(deviceId ?? cameraDeviceId));
+  const track = stream.getVideoTracks()[0] ?? null;
+  if (!track) { for (const t of stream.getTracks()) t.stop(); throw new Error("Nenhuma câmera disponível."); }
+  localCameraStream = stream;
+  localCameraTrack = track;
+  cameraOn = true;
+  cameraDeviceId = track.getSettings().deviceId ?? deviceId ?? cameraDeviceId;
+  currentChannelId = channelId;
+  // OS-level camera loss (unplug / another app grabs it / permission revoked)
+  // → clean local teardown so the UI doesn't sit on a dead publication.
+  track.onended = () => {
+    console.warn("[rtc] camera track ended by the OS");
+    void stopCamera(channelId, streamId);
+  };
+  emitLocalCamera(stream);
+  for (const peerUserId of peers.keys()) await applyCameraSend(peerUserId, true);
+  send("stream.publish", { channel_id: channelId, stream_id: streamId, kind: "camera", has_audio: false, msid: stream.id, req_id: crypto.randomUUID() });
+}
+
+/// Turn the webcam off: stop sending to every peer, release the device, and
+/// unregister the stream.
+export async function stopCamera(channelId: string, streamId: string): Promise<void> {
+  if (!cameraOn && !localCameraStream) return;
+  cameraOn = false;
+  for (const peerUserId of Array.from(peers.keys())) await applyCameraSend(peerUserId, false);
+  cameraNeedsOffer.clear();
+  if (localCameraStream) { for (const track of localCameraStream.getTracks()) track.stop(); }
+  localCameraStream = null;
+  localCameraTrack = null;
+  emitLocalCamera(null);
+  send("stream.unpublish", { channel_id: channelId, stream_id: streamId, req_id: crypto.randomUUID() });
+}
+
+/// Swap the capture device without dropping the publication: grab the new
+/// camera, replaceTrack() on every peer's existing sender (no SDP change),
+/// then stop the old track.
+export async function switchCamera(deviceId: string): Promise<void> {
+  cameraDeviceId = deviceId;
+  if (!cameraOn) return;
+  const next = await navigator.mediaDevices.getUserMedia(CAMERA_CONSTRAINTS(deviceId));
+  const nextTrack = next.getVideoTracks()[0] ?? null;
+  if (!nextTrack) { for (const t of next.getTracks()) t.stop(); throw new Error("Câmera indisponível."); }
+  const previous = localCameraTrack;
+  localCameraStream = next;
+  localCameraTrack = nextTrack;
+  cameraDeviceId = nextTrack.getSettings().deviceId ?? deviceId;
+  nextTrack.onended = previous?.onended ?? null;
+  for (const slot of cameraSlots.values()) {
+    try { await slot.sender.replaceTrack(nextTrack); } catch (error) { console.error("[rtc] camera replaceTrack failed", error); }
+  }
+  if (previous) previous.stop();
+  emitLocalCamera(next);
 }
 
 /** Publish local-DJ audio to every call peer. The server's music stream
