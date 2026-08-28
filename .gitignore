@@ -29,3 +29,6 @@ Thumbs.db
 
 # YouTube cookies for the music bot (auth material — never commit)
 infra/cookies/
+
+# Local working notes / in-progress investigations — not project docs
+docs/investigations/

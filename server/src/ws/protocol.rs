@@ -167,6 +167,10 @@ pub struct MemberUpdated {
     pub avatar_color: Option<String>,
     pub profile_tag: Option<String>,
     pub name_color: Option<String>,
+    pub bio: Option<String>,
+    pub banner_preset: Option<String>,
+    pub pronouns: Option<String>,
+    pub created_at: Option<chrono::DateTime<chrono::Utc>>,
     pub role: String,
 }
 
@@ -235,6 +239,22 @@ pub struct ChatMessageDeleted {
     pub message_id: Uuid,
     pub channel_id: Uuid,
     pub in_reply_to: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LinkPreviewDto {
+    pub url: String,
+    pub title: Option<String>,
+    pub description: Option<String>,
+    pub site_name: Option<String>,
+    pub image_url: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ChatMessagePreviewUpdated {
+    pub channel_id: Uuid,
+    pub message_id: Uuid,
+    pub link_preview: Option<LinkPreviewDto>,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]

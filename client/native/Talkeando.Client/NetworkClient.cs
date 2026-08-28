@@ -162,6 +162,19 @@ public sealed class NetworkClient
         return result.RootElement.Clone();
     }
 
+    public async Task<JsonElement> UploadAttachmentBytesAsync(Guid channelId, byte[] bytes, string filename, string contentType)
+    {
+        using var form = new MultipartFormDataContent();
+        using var content = new ByteArrayContent(bytes);
+        content.Headers.ContentType = new MediaTypeHeaderValue(String.IsNullOrWhiteSpace(contentType) ? "image/png" : contentType);
+        form.Add(content, "file", String.IsNullOrWhiteSpace(filename) ? "image.png" : filename);
+        using var request = new HttpRequestMessage(HttpMethod.Post, $"channels/{channelId}/attachments") { Content = form };
+        AddAuthorization(request);
+        using var response = await _http.SendAsync(request);
+        using var result = await ReadJsonAsync(response);
+        return result.RootElement.Clone();
+    }
+
     /// PROFILE-FR: rename yourself. The server fans a `member.updated` event
     /// back over the WebSocket, so there is nothing to return here.
     public async Task UpdateDisplayNameAsync(string displayName)
@@ -170,6 +183,26 @@ public sealed class NetworkClient
         {
             Content = new StringContent(
                 JsonSerializer.Serialize(new { display_name = displayName }), Encoding.UTF8, "application/json"),
+        };
+        AddAuthorization(request);
+        using var response = await _http.SendAsync(request);
+        using var _ = await ReadJsonAsync(response);
+    }
+
+    /// PROFILE-FR: update profile details (bio, banner_preset, pronouns, name_color, display_name)
+    public async Task UpdateProfileAsync(string? displayName, string? bio, string? bannerPreset, string? pronouns, string? nameColor)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Patch, "me/profile")
+        {
+            Content = new StringContent(
+                JsonSerializer.Serialize(new
+                {
+                    display_name = displayName,
+                    bio = bio,
+                    banner_preset = bannerPreset,
+                    pronouns = pronouns,
+                    name_color = nameColor,
+                }), Encoding.UTF8, "application/json"),
         };
         AddAuthorization(request);
         using var response = await _http.SendAsync(request);
@@ -216,6 +249,16 @@ public sealed class NetworkClient
         AddAuthorization(request);
         using var response = await _http.SendAsync(request);
         using var _ = await ReadJsonAsync(response);
+    }
+
+    /// Open or get a 1:1 Direct Message channel with another member.
+    public async Task<JsonElement> OpenDmAsync(Guid targetUserId)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Post, $"channels/dm/{targetUserId}");
+        AddAuthorization(request);
+        using var response = await _http.SendAsync(request);
+        using var doc = await ReadJsonAsync(response);
+        return doc.RootElement.Clone();
     }
 
     /// PROFILE-FR: replace your own avatar with a local image file.

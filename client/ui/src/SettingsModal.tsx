@@ -1,6 +1,8 @@
 import React, { useState, useEffect, useRef } from "react";
 import { Icon } from "./Icon";
+import { send } from "./ipc";
 import * as rtc from "./rtc";
+import { BANNER_PRESETS, getBannerPreset } from "./banners";
 
 function Avatar({ label, size, imageUrl }: { label: string; size: number; imageUrl?: string | null }) {
   const initials = (label || "?").substring(0, 2).toUpperCase();
@@ -16,15 +18,53 @@ function Avatar({ label, size, imageUrl }: { label: string; size: number; imageU
 
 export type InputMode = "voice_activity" | "push_to_talk" | "toggle";
 
-interface SettingsModalProps {
-  onClose: () => void;
-  currentUser?: { id: string; display_name: string; username?: string; avatar_url?: string | null } | null;
-  onLogout?: () => void;
-  onInputModeChange?: (mode: InputMode) => void;
+export interface ProfileUpdateData {
+  display_name?: string;
+  bio?: string;
+  banner_preset?: string;
+  pronouns?: string;
+  name_color?: string | null;
 }
 
-export function SettingsModal({ onClose, currentUser, onLogout, onInputModeChange }: SettingsModalProps) {
-  const [activeTab, setActiveTab] = useState<"voice" | "account" | "appearance">("voice");
+interface SettingsModalProps {
+  onClose: () => void;
+  currentUser?: {
+    id: string;
+    display_name: string;
+    username?: string;
+    avatar_url?: string | null;
+    name_color?: string | null;
+    bio?: string | null;
+    banner_preset?: string | null;
+    pronouns?: string | null;
+  } | null;
+  onLogout?: () => void;
+  onInputModeChange?: (mode: InputMode) => void;
+  onShortcutRecordingChange?: (recording: boolean) => void;
+  currentBanner?: string;
+  onBannerChange?: (bannerId: string) => void;
+  onProfileSave?: (data: ProfileUpdateData) => void;
+  initialTab?: "voice" | "account" | "appearance";
+}
+
+export function SettingsModal({
+  onClose,
+  currentUser,
+  onLogout,
+  onInputModeChange,
+  onShortcutRecordingChange,
+  currentBanner = "sakura",
+  onBannerChange,
+  onProfileSave,
+  initialTab = "voice",
+}: SettingsModalProps) {
+  const [activeTab, setActiveTab] = useState<"voice" | "account" | "appearance">(initialTab);
+  const [selectedBanner, setSelectedBanner] = useState<string>(currentUser?.banner_preset || currentBanner);
+  const [displayName, setDisplayName] = useState(currentUser?.display_name || "");
+  const [pronouns, setPronouns] = useState(currentUser?.pronouns || "");
+  const [bio, setBio] = useState(currentUser?.bio || "");
+  const [nameColor, setNameColor] = useState(currentUser?.name_color || "");
+  const [savedToast, setSavedToast] = useState(false);
   
   // Devices
   const [audioInputs, setAudioInputs] = useState<MediaDeviceInfo[]>([]);
@@ -51,6 +91,13 @@ export function SettingsModal({ onClose, currentUser, onLogout, onInputModeChang
     try { return localStorage.getItem("tk.pttKeyLabel") || "V"; } catch { return "V"; }
   });
   const [recordingKey, setRecordingKey] = useState(false);
+  const onShortcutRecordingChangeRef = useRef(onShortcutRecordingChange);
+  onShortcutRecordingChangeRef.current = onShortcutRecordingChange;
+
+  useEffect(() => {
+    onShortcutRecordingChangeRef.current?.(recordingKey);
+    return () => onShortcutRecordingChangeRef.current?.(false);
+  }, [recordingKey]);
 
   // Mic Test
   const [testingMic, setTestingMic] = useState(false);
@@ -516,13 +563,188 @@ export function SettingsModal({ onClose, currentUser, onLogout, onInputModeChang
 
           {activeTab === "account" && (
             <div className="settings-tab-pane">
-              <h2 className="settings-tab-title">Minha Conta</h2>
-              <div className="settings-account-card">
-                <Avatar label={currentUser?.display_name ?? "User"} imageUrl={currentUser?.avatar_url} size={80} />
-                <div className="settings-account-info">
-                  <h3>{currentUser?.display_name}</h3>
-                  <p>@{currentUser?.username || "membro"}</p>
+              <h2 className="settings-tab-title">Perfil & Personalização</h2>
+
+              {/* Profile Card Live Preview */}
+              <div
+                className="settings-profile-preview"
+                style={{
+                  background: getBannerPreset(selectedBanner).cssBackground,
+                  backgroundSize: "cover",
+                  backgroundPosition: "center",
+                }}
+              >
+                <div className="settings-profile-preview__overlay" />
+                <div className="settings-profile-preview__body">
+                  <Avatar label={displayName || currentUser?.display_name || "User"} imageUrl={currentUser?.avatar_url} size={76} />
+                  <div className="settings-profile-preview__meta">
+                    <h3 className="settings-profile-preview__name" style={nameColor ? { color: nameColor } : undefined}>
+                      {displayName || currentUser?.display_name || "Nome de Exibição"}
+                    </h3>
+                    <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                      <span className="settings-profile-preview__user">@{currentUser?.username || "membro"}</span>
+                      {pronouns && <span className="user-profile-pronouns">{pronouns}</span>}
+                    </div>
+                    {bio && (
+                      <p style={{ margin: "4px 0 0", fontSize: "12px", color: "rgba(255, 255, 255, 0.85)", fontStyle: "italic", maxWidth: "340px" }}>
+                        "{bio.length > 75 ? bio.substring(0, 75) + "..." : bio}"
+                      </p>
+                    )}
+                    <span className="settings-profile-preview__badge" style={{ borderColor: getBannerPreset(selectedBanner).accentColor }}>
+                      {getBannerPreset(selectedBanner).name}
+                    </span>
+                  </div>
                 </div>
+              </div>
+
+              {/* Form Fields for Profile Info */}
+              <section className="settings-section" style={{ marginTop: "24px" }}>
+                <h3 className="settings-section-heading">Informações do Perfil</h3>
+
+                <div className="settings-field">
+                  <label className="settings-label">Nome de Exibição</label>
+                  <input
+                    type="text"
+                    className="settings-input"
+                    value={displayName}
+                    placeholder="Seu nome no Tupi"
+                    maxLength={80}
+                    onChange={e => setDisplayName(e.target.value)}
+                  />
+                </div>
+
+                <div className="settings-field" style={{ marginTop: "14px" }}>
+                  <label className="settings-label">Pronomes</label>
+                  <input
+                    type="text"
+                    className="settings-input"
+                    value={pronouns}
+                    placeholder="ex: ele/dele, ela/dela, they/them"
+                    maxLength={40}
+                    onChange={e => setPronouns(e.target.value)}
+                  />
+                </div>
+
+                <div className="settings-field" style={{ marginTop: "14px" }}>
+                  <label className="settings-label">Sobre Mim (Biografia)</label>
+                  <textarea
+                    className="settings-input"
+                    style={{ minHeight: "80px", resize: "vertical", fontFamily: "inherit" }}
+                    value={bio}
+                    placeholder="Conte um pouco sobre você..."
+                    maxLength={300}
+                    onChange={e => setBio(e.target.value)}
+                  />
+                </div>
+
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "14px", marginTop: "14px" }}>
+                  <div className="settings-field">
+                    <label className="settings-label">Foto de Perfil</label>
+                    <button
+                      type="button"
+                      className="settings-btn is-secondary"
+                      style={{ width: "100%", justifyContent: "center" }}
+                      onClick={() => send("profile.avatar.pick")}
+                    >
+                      <Icon name="camera" size={16} />
+                      <span>Alterar Foto</span>
+                    </button>
+                  </div>
+
+                  <div className="settings-field">
+                    <label className="settings-label">Cor do Nome</label>
+                    <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
+                      <input
+                        type="color"
+                        value={nameColor || "#5865f2"}
+                        onChange={e => setNameColor(e.target.value)}
+                        style={{ width: "42px", height: "36px", borderRadius: "8px", border: "1px solid rgba(255,255,255,0.15)", background: "transparent", cursor: "pointer" }}
+                      />
+                      {nameColor && (
+                        <button
+                          type="button"
+                          className="settings-btn is-secondary"
+                          style={{ padding: "0 10px", fontSize: "12px" }}
+                          onClick={() => setNameColor("")}
+                        >
+                          Limpar
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              </section>
+
+              {/* Banner Presets Selector */}
+              <section className="settings-section" style={{ marginTop: "24px" }}>
+                <h3 className="settings-section-heading">Banners de Perfil Predefinidos</h3>
+                <p style={{ fontSize: "13px", color: "var(--text-muted)", marginTop: "2px", marginBottom: "14px" }}>
+                  Escolha um tema estético para o fundo do seu perfil e da barra de usuário. Ele também é refletido na lista de membros.
+                </p>
+
+                <div className="settings-banners-grid">
+                  {BANNER_PRESETS.map(banner => {
+                    const isSelected = selectedBanner === banner.id;
+                    return (
+                      <button
+                        type="button"
+                        key={banner.id}
+                        className={`settings-banner-card ${isSelected ? "is-selected" : ""}`}
+                        onClick={() => {
+                          setSelectedBanner(banner.id);
+                          onBannerChange?.(banner.id);
+                        }}
+                      >
+                        <div
+                          className="settings-banner-card__thumb"
+                          style={{
+                            background: banner.cssBackground,
+                            backgroundSize: "cover",
+                            backgroundPosition: "center",
+                          }}
+                        >
+                          {isSelected && (
+                            <div className="settings-banner-card__check">
+                              <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth="3">
+                                <polyline points="20 6 9 17 4 12" />
+                              </svg>
+                            </div>
+                          )}
+                        </div>
+                        <div className="settings-banner-card__info">
+                          <span className="settings-banner-card__name">{banner.name}</span>
+                          <span className="settings-banner-card__cat">{banner.category}</span>
+                        </div>
+                      </button>
+                    );
+                  })}
+                </div>
+              </section>
+
+              {/* Save changes action bar */}
+              <div style={{ marginTop: "28px", display: "flex", alignItems: "center", justifyContent: "space-between", background: "rgba(0,0,0,0.3)", padding: "12px 18px", borderRadius: "10px", border: "1px solid rgba(255,255,255,0.1)" }}>
+                <div>
+                  <span style={{ fontSize: "13px", color: "var(--text-muted)" }}>
+                    {savedToast ? "Alterações salvas com sucesso!" : "Salve para atualizar seu perfil em toda a comunidade."}
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  className="settings-btn is-primary"
+                  onClick={() => {
+                    onProfileSave?.({
+                      display_name: displayName.trim() || undefined,
+                      bio: bio.trim() || undefined,
+                      banner_preset: selectedBanner,
+                      pronouns: pronouns.trim() || undefined,
+                      name_color: nameColor || null,
+                    });
+                    setSavedToast(true);
+                    setTimeout(() => setSavedToast(false), 3000);
+                  }}
+                >
+                  {savedToast ? "Salvo!" : "Salvar Alterações"}
+                </button>
               </div>
             </div>
           )}
@@ -530,9 +752,31 @@ export function SettingsModal({ onClose, currentUser, onLogout, onInputModeChang
           {activeTab === "appearance" && (
             <div className="settings-tab-pane">
               <h2 className="settings-tab-title">Aparência</h2>
-              <p style={{ color: "var(--text-muted)", fontSize: "14px" }}>
+              <p style={{ color: "var(--text-muted)", fontSize: "14px", marginBottom: "16px" }}>
                 Tema 3D Dark Glassmorphism ativo por padrão.
               </p>
+
+              <section className="settings-section">
+                <h3 className="settings-section-heading">Tema do Banner Ativo</h3>
+                <div
+                  style={{
+                    height: "80px",
+                    borderRadius: "12px",
+                    background: getBannerPreset(selectedBanner).cssBackground,
+                    backgroundSize: "cover",
+                    backgroundPosition: "center",
+                    display: "flex",
+                    alignItems: "center",
+                    padding: "0 20px",
+                    border: "1px solid rgba(255, 255, 255, 0.12)",
+                    boxShadow: "0 4px 16px rgba(0, 0, 0, 0.4)",
+                  }}
+                >
+                  <span style={{ fontWeight: 700, fontSize: "15px", color: "#fff", textShadow: "0 2px 8px rgba(0,0,0,0.8)" }}>
+                    {getBannerPreset(selectedBanner).name} ({getBannerPreset(selectedBanner).category})
+                  </span>
+                </div>
+              </section>
             </div>
           )}
         </main>

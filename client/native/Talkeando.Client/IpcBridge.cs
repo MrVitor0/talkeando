@@ -44,12 +44,17 @@ public sealed class IpcBridge : IDisposable
     private readonly MusicPlayback _music = new();
     private readonly ActivityMonitor _activity;
     private readonly UpdateChecker _updater = new();
+    private readonly GlobalHotkeyHook _hotkey = new();
     private int _frameSeq;
     private int _audioSeq;
 
     public IpcBridge()
     {
         _network = new NetworkClient(_sessions);
+        _hotkey.KeyEvent += (code, isDown) =>
+        {
+            Publish("hotkey.event", new { code, is_down = isDown });
+        };
         // SDD/specs/activity.md: native watches SMTC + running games and
         // pushes `activity.report` straight to the authenticated WebSocket —
         // the UI only toggles it on/off via `activity.config`. Game icons are
@@ -105,6 +110,17 @@ public sealed class IpcBridge : IDisposable
                         ?? throw new InvalidOperationException("Arquivo não informado.");
                     Publish("attachment.uploaded", await _network.UploadAttachmentAsync(attachmentChannel, attachmentPath));
                     break;
+                case "attachment.upload_base64":
+                {
+                    var data = root.GetProperty("data");
+                    var channelId = data.GetProperty("channel_id").GetGuid();
+                    var base64 = data.GetProperty("base64").GetString() ?? throw new InvalidOperationException("Base64 não informado.");
+                    var filename = data.TryGetProperty("filename", out var fn) && fn.ValueKind == JsonValueKind.String ? fn.GetString() ?? "imagem.png" : "imagem.png";
+                    var contentType = data.TryGetProperty("content_type", out var ct) && ct.ValueKind == JsonValueKind.String ? ct.GetString() ?? "image/png" : "image/png";
+                    var bytes = Convert.FromBase64String(base64);
+                    Publish("attachment.uploaded", await _network.UploadAttachmentBytesAsync(channelId, bytes, filename, contentType));
+                    break;
+                }
                 case "attachment.pick":
                     var selectedChannel = root.GetProperty("data").GetProperty("channel_id").GetGuid();
                     var picker = new Microsoft.Win32.OpenFileDialog { Title = "Selecionar anexo" };
@@ -128,6 +144,17 @@ public sealed class IpcBridge : IDisposable
                 case "profile.rename":
                     await _network.UpdateDisplayNameAsync(RequiredString(root, "display_name"));
                     break;
+                case "profile.update":
+                {
+                    var d = root.GetProperty("data");
+                    string? displayName = d.TryGetProperty("display_name", out var dn) && dn.ValueKind == JsonValueKind.String ? dn.GetString() : null;
+                    string? bio = d.TryGetProperty("bio", out var b) && b.ValueKind == JsonValueKind.String ? b.GetString() : null;
+                    string? bannerPreset = d.TryGetProperty("banner_preset", out var bp) && bp.ValueKind == JsonValueKind.String ? bp.GetString() : null;
+                    string? pronouns = d.TryGetProperty("pronouns", out var pr) && pr.ValueKind == JsonValueKind.String ? pr.GetString() : null;
+                    string? nameColor = d.TryGetProperty("name_color", out var nc) && nc.ValueKind == JsonValueKind.String ? nc.GetString() : null;
+                    await _network.UpdateProfileAsync(displayName, bio, bannerPreset, pronouns, nameColor);
+                    break;
+                }
                 case "member.rename":
                 {
                     var d = root.GetProperty("data");
@@ -138,6 +165,20 @@ public sealed class IpcBridge : IDisposable
                 {
                     var d = root.GetProperty("data");
                     await _network.RenameChannelAsync(d.GetProperty("channel_id").GetGuid(), RequiredString(root, "name"));
+                    break;
+                }
+                case "dm.open":
+                {
+                    var d = root.GetProperty("data");
+                    var targetUserId = d.GetProperty("target_user_id").GetGuid();
+                    var channel = await _network.OpenDmAsync(targetUserId);
+                    var reqId = d.TryGetProperty("req_id", out var r) && r.ValueKind == JsonValueKind.String ? r.GetString() : null;
+                    Publish("dm.opened", new
+                    {
+                        channel,
+                        target_user_id = targetUserId.ToString(),
+                        req_id = reqId,
+                    });
                     break;
                 }
                 case "member.set_color":
@@ -444,5 +485,5 @@ public sealed class IpcBridge : IDisposable
         });
     }
 
-    public void Dispose() { _music.Dispose(); _screen.Dispose(); _audio.Dispose(); _activity.Dispose(); }
+    public void Dispose() { _hotkey.Dispose(); _music.Dispose(); _screen.Dispose(); _audio.Dispose(); _activity.Dispose(); }
 }

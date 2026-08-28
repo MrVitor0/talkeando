@@ -38,6 +38,10 @@ const DOTS =
   "M6 12a2 2 0 1 1-4 0 2 2 0 0 1 4 0Zm8 0a2 2 0 1 1-4 0 2 2 0 0 1 4 0Zm6 2a2 2 0 1 0 0-4 2 2 0 0 0 0 4Z";
 const THEATER =
   "M3 5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5Zm2 3v8h14V8H5Z";
+const MUSIC_NOTE =
+  "M12 3v10.55c-.59-.34-1.27-.55-2-.55-2.21 0-4 1.79-4 4s1.79 4 4 4 4-1.79 4-4V7h4V3h-6Z";
+const LIGHTNING =
+  "M7 2v11h3v9l7-12h-4l4-8H7Z";
 
 export const HashIcon = (p: { size?: number; className?: string }) => <Svg d={HASH} size={p.size ?? 24} className={p.className} />;
 export const SearchIcon = (p: { size?: number; className?: string }) => <Svg d={SEARCH} size={p.size ?? 16} className={p.className} />;
@@ -49,3 +53,6 @@ export const ContractIcon = (p: { size?: number; className?: string }) => <Svg d
 export const PipIcon = (p: { size?: number; className?: string }) => <Svg d={PIP} size={p.size ?? 18} className={p.className} />;
 export const DotsIcon = (p: { size?: number; className?: string }) => <Svg d={DOTS} size={p.size ?? 18} className={p.className} />;
 export const TheaterIcon = (p: { size?: number; className?: string }) => <Svg d={THEATER} size={p.size ?? 18} className={p.className} />;
+export const MusicNoteIcon = (p: { size?: number; className?: string }) => <Svg d={MUSIC_NOTE} size={p.size ?? 14} className={p.className} />;
+export const LightningIcon = (p: { size?: number; className?: string }) => <Svg d={LIGHTNING} size={p.size ?? 14} className={p.className} />;
+

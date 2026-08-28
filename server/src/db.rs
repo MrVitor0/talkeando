@@ -19,6 +19,9 @@ pub struct User {
     /// Hex `#rrggbb` for the display name everywhere it is shown, or NULL for
     /// the client-side default.
     pub name_color: Option<String>,
+    pub bio: Option<String>,
+    pub banner_preset: Option<String>,
+    pub pronouns: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -32,6 +35,10 @@ pub struct PublicUser {
     pub profile_tag: Option<String>,
     pub profile_badge_url: Option<String>,
     pub name_color: Option<String>,
+    pub bio: Option<String>,
+    pub banner_preset: Option<String>,
+    pub pronouns: Option<String>,
+    pub created_at: Option<DateTime<Utc>>,
 }
 
 impl From<User> for PublicUser {
@@ -45,6 +52,10 @@ impl From<User> for PublicUser {
             profile_tag: u.profile_tag,
             profile_badge_url: u.profile_badge_storage_path.map(|_| format!("/api/users/{}/profile-badge", u.id)),
             name_color: u.name_color,
+            bio: u.bio,
+            banner_preset: u.banner_preset,
+            pronouns: u.pronouns,
+            created_at: Some(u.created_at),
         }
     }
 }

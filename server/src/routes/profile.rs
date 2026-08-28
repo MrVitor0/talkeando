@@ -24,9 +24,78 @@ pub struct RenameRequest {
 }
 
 #[derive(Deserialize)]
+pub struct UpdateProfileRequest {
+    pub display_name: Option<String>,
+    pub bio: Option<String>,
+    pub banner_preset: Option<String>,
+    pub pronouns: Option<String>,
+    pub name_color: Option<String>,
+}
+
+#[derive(Deserialize)]
 pub struct NameColorRequest {
     /// Hex `#rgb` / `#rrggbb`, or `null` to clear back to the default.
     pub name_color: Option<String>,
+}
+
+/// PROFILE-FR: update your own profile (display_name, bio, banner_preset, pronouns, name_color).
+pub async fn update_profile(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Json(req): Json<UpdateProfileRequest>,
+) -> AppResult<Json<PublicUser>> {
+    let mut display_name = None;
+    if let Some(name) = req.display_name.as_deref() {
+        display_name = Some(validate_display_name(name)?);
+    }
+    let color = match req.name_color.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        Some(value) if is_hex_color(value) => Some(Some(value.to_ascii_lowercase())),
+        Some(_) => return Err(AppError::Validation("name_color must be a #rgb or #rrggbb hex value".into())),
+        None => None,
+    };
+
+    let user = sqlx::query_as::<_, User>(
+        r#"
+        UPDATE users
+        SET display_name = COALESCE($1, display_name),
+            bio = COALESCE($2, bio),
+            banner_preset = COALESCE($3, banner_preset),
+            pronouns = COALESCE($4, pronouns),
+            name_color = CASE WHEN $5 IS TRUE THEN $6 ELSE name_color END
+        WHERE id = $7
+        RETURNING *
+        "#,
+    )
+    .bind(display_name)
+    .bind(req.bio)
+    .bind(req.banner_preset)
+    .bind(req.pronouns)
+    .bind(color.is_some())
+    .bind(color.flatten())
+    .bind(auth.user.id)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or(AppError::NotFound)?;
+
+    broadcast_member_updated(&state, &user).await;
+    Ok(Json(user.into()))
+}
+
+/// Get a user's full public profile.
+pub async fn get_user_profile(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(target_id): Path<Uuid>,
+) -> AppResult<Json<PublicUser>> {
+    if target_id != auth.user.id && !shares_community(&state, auth.user.id, target_id).await? {
+        return Err(AppError::Forbidden);
+    }
+    let user = sqlx::query_as::<_, User>("SELECT * FROM users WHERE id = $1")
+        .bind(target_id)
+        .fetch_optional(&state.pool)
+        .await?
+        .ok_or(AppError::NotFound)?;
+    Ok(Json(user.into()))
 }
 
 /// PROFILE-FR: set a member's display-name colour (your own or anyone else's,
@@ -207,6 +276,10 @@ pub async fn broadcast_member_updated(state: &AppState, user: &User) {
                             avatar_color: public.avatar_color,
                             profile_tag: public.profile_tag,
                             name_color: public.name_color,
+                            bio: public.bio,
+                            banner_preset: public.banner_preset,
+                            pronouns: public.pronouns,
+                            created_at: public.created_at,
                             role,
                         },
                     ),

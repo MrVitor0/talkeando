@@ -3,14 +3,17 @@ import { send, subscribe } from "./ipc";
 import * as rtc from "./rtc";
 import { playSound, setSoundsMuted } from "./sounds";
 import { Icon, IconName } from "./Icon";
-import { HashIcon, SearchIcon, PencilIcon, TrashIcon, CrownIcon, FullscreenIcon, ContractIcon, PipIcon, DotsIcon, TheaterIcon } from "./Glyphs";
+import { HashIcon, SearchIcon, PencilIcon, TrashIcon, CrownIcon, FullscreenIcon, ContractIcon, PipIcon, DotsIcon, TheaterIcon, MusicNoteIcon } from "./Glyphs";
 import { ScreenPicker, QualityControls, CaptureSource, ShareOptions } from "./ScreenPicker";
-import { SettingsModal } from "./SettingsModal";
+import { SettingsModal, ProfileUpdateData } from "./SettingsModal";
+import { UserProfileModal, UserProfileData, AnchorRect } from "./UserProfileModal";
+import { BANNER_PRESETS, getBannerPreset } from "./banners";
+import { type VoiceInputMode, VoiceShortcutController } from "./voiceShortcut";
 import logoUrl from "../icons/logo.webp";
 
 type Channel = { id: string; name: string; kind: "text" | "voice"; topic?: string | null };
 type ChannelCategory = { id: string; name: string; position: number; channels: Channel[] };
-type Member = { id: string; display_name: string; username: string; role: string; avatar_url?: string | null; profile_tag?: string | null; profile_badge_url?: string | null; name_color?: string | null };
+type Member = { id: string; display_name: string; username: string; role: string; avatar_url?: string | null; profile_tag?: string | null; profile_badge_url?: string | null; name_color?: string | null; banner_preset?: string | null; bio?: string | null; pronouns?: string | null; created_at?: string | null };
 type Attachment = { id: string; filename: string; content_type: string; size_bytes: number; url?: string | null };
 // Rich embed imported from Discord (bot polls, "now playing", changelog cards).
 // Image URLs are already rewritten to our own `/api/message-embeds/...` route
@@ -24,7 +27,7 @@ type MessageEmbed = {
 };
 type Message = {
   id: string; content: string; created_at: string; author?: { display_name: string; avatar_url?: string | null; profile_tag?: string | null; profile_badge_url?: string | null }; author_id?: string; attachments?: Attachment[];
-  link_preview?: { url: string; title?: string | null; site_name?: string | null; image_url?: string | null } | null;
+  link_preview?: { url: string; title?: string | null; description?: string | null; site_name?: string | null; image_url?: string | null } | null;
   embeds?: MessageEmbed[];
   // Optimistic-send bookkeeping (never sent to the server, purely local UI
   // state) — see submitMessage/retryMessage. `reqId` is the same id echoed
@@ -37,6 +40,9 @@ type Message = {
 // the server's idempotency key (channel_id, author_id, req_id) resolves a
 // duplicate send to the original row instead of inserting a second message.
 const SEND_TIMEOUT_MS = 8000;
+const NON_TEXT_INPUT_TYPES = new Set([
+  "button", "checkbox", "color", "file", "radio", "range", "reset", "submit",
+]);
 // Virtual music bot's fixed id (server: MUSIC_BOT_ID = Uuid::from_u128(1)).
 const MUSIC_BOT_ID = "00000000-0000-0000-0000-000000000001";
 
@@ -91,11 +97,162 @@ function initials(name: string) {
   return (first + last).toUpperCase();
 }
 
-function renderText(text: string) {
-  return text.split(/(https?:\/\/[^\s]+)/g).map((part, index) =>
-    /^https?:\/\//.test(part)
-      ? <a key={index} href={part} target="_blank" rel="noreferrer noopener">{part}</a>
-      : <span key={index}>{part}</span>
+function isUserMentioned(
+  content: string | undefined,
+  currentUserId: string | null,
+  currentUser: { display_name?: string; username?: string } | null
+) {
+  if (!content) return false;
+  const lower = content.toLowerCase();
+  if (lower.includes("@everyone") || lower.includes("@here")) return true;
+  if (currentUserId && content.includes(`<@${currentUserId}>`)) return true;
+  if (currentUser?.display_name && lower.includes(`@${currentUser.display_name.toLowerCase()}`)) return true;
+  if (currentUser?.username && lower.includes(`@${currentUser.username.toLowerCase()}`)) return true;
+  return false;
+}
+
+function renderText(
+  text: string,
+  currentUserId?: string | null,
+  currentUser?: { display_name?: string; username?: string } | null,
+  membersList: Member[] = []
+) {
+  if (!text) return null;
+
+  const currentDisplayName = currentUser?.display_name?.toLowerCase();
+  const currentUsername = currentUser?.username?.toLowerCase();
+
+  return text.split(/(https?:\/\/[^\s]+|@[a-zA-Z0-9_\u00C0-\u017F-]+|<@[a-f0-9-]+>)/g).map((part, index) => {
+    if (!part) return null;
+
+    if (/^https?:\/\//.test(part)) {
+      return (
+        <a key={index} href={part} target="_blank" rel="noreferrer noopener">
+          {part}
+        </a>
+      );
+    }
+
+    if (part.startsWith("@") || part.startsWith("<@")) {
+      let mentionDisplay = part;
+      let isMe = false;
+
+      if (part.startsWith("<@") && part.endsWith(">")) {
+        const id = part.slice(2, -1);
+        const m = membersList.find(mem => mem.id === id);
+        mentionDisplay = m ? `@${m.display_name}` : `@membro`;
+        isMe = id === currentUserId;
+      } else {
+        const query = part.slice(1).toLowerCase();
+        isMe =
+          query === "everyone" ||
+          query === "here" ||
+          (!!currentDisplayName && currentDisplayName === query) ||
+          (!!currentUsername && currentUsername === query);
+      }
+
+      return (
+        <span
+          key={index}
+          className={`msg__mention ${isMe ? "msg__mention--me" : ""}`}
+        >
+          {mentionDisplay}
+        </span>
+      );
+    }
+
+    return <span key={index}>{part}</span>;
+  });
+}
+
+// Renders rich Twitter / WhatsApp / Discord style link previews with 3D card layout
+function LinkPreviewCard({ preview }: { preview: NonNullable<Message["link_preview"]> }) {
+  const isYouTube =
+    (preview.site_name?.toLowerCase().includes("youtube") ?? false) ||
+    preview.url.includes("youtu.be") ||
+    preview.url.includes("youtube.com");
+
+  const [imgFailed, setImgFailed] = useState(false);
+
+  let hostname = preview.site_name;
+  if (!hostname) {
+    try {
+      hostname = new URL(preview.url).hostname.replace(/^www\./, "");
+    } catch {
+      hostname = preview.url;
+    }
+  }
+
+  const hasImage = !!preview.image_url && !imgFailed;
+  const isLargeMedia = isYouTube || hasImage;
+
+  return (
+    <a
+      className={`link-preview-card ${isLargeMedia ? "link-preview-card--media" : ""}`}
+      href={preview.url}
+      target="_blank"
+      rel="noreferrer noopener"
+    >
+      {hasImage && isYouTube && (
+        <div className="link-preview-card__media-wrap">
+          <img
+            src={preview.image_url!}
+            alt={preview.title ?? "Video thumbnail"}
+            className="link-preview-card__banner"
+            loading="lazy"
+            onError={() => setImgFailed(true)}
+          />
+          <div className="link-preview-card__play-badge" title="Assistir no YouTube">
+            <svg viewBox="0 0 24 24" width="26" height="26" fill="currentColor">
+              <path d="M8 5v14l11-7z" />
+            </svg>
+          </div>
+        </div>
+      )}
+
+      {hasImage && !isYouTube && (
+        <div className="link-preview-card__thumb-wrap">
+          <img
+            src={preview.image_url!}
+            alt=""
+            className="link-preview-card__thumb"
+            loading="lazy"
+            onError={() => setImgFailed(true)}
+          />
+        </div>
+      )}
+
+      <div className="link-preview-card__content">
+        <div className="link-preview-card__site">
+          {isYouTube ? (
+            <span className="link-preview-card__site-badge link-preview-card__site-badge--yt">
+              <svg viewBox="0 0 24 24" width="14" height="14" fill="currentColor">
+                <path d="M23.498 6.186a3.016 3.016 0 0 0-2.122-2.136C19.505 3.545 12 3.545 12 3.545s-7.505 0-9.377.505A3.017 3.017 0 0 0 .502 6.186C0 8.07 0 12 0 12s0 3.93.502 5.814a3.016 3.016 0 0 0 2.122 2.136c1.871.505 9.376.505 9.376.505s7.505 0 9.377-.505a3.015 3.015 0 0 0 2.122-2.136C24 15.93 24 12 24 12s0-3.93-.502-5.814zM9.545 15.568V8.432L15.818 12l-6.273 3.568z"/>
+              </svg>
+              YouTube
+            </span>
+          ) : (
+            <span className="link-preview-card__site-name">
+              <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" strokeWidth="2">
+                <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" />
+                <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" />
+              </svg>
+              {hostname}
+            </span>
+          )}
+        </div>
+
+        <strong className="link-preview-card__title">
+          {preview.title ?? preview.url}
+        </strong>
+
+        {preview.description && (
+          <p className="link-preview-card__desc">
+            {preview.description}
+          </p>
+        )}
+      </div>
+    </a>
   );
 }
 
@@ -628,6 +785,17 @@ function SignalBars({ quality }: { quality: rtc.ConnQuality }) {
   );
 }
 
+function AudioWaveform({ color = "var(--yellow)" }: { color?: string }) {
+  return (
+    <svg className="voice-panel__waveform" width={18} height={18} viewBox="0 0 18 18" fill="none">
+      <rect x="2" y="5" width="2.5" height="8" rx="1.25" fill={color} className="wave-bar wave-bar--1" />
+      <rect x="6" y="2" width="2.5" height="14" rx="1.25" fill={color} className="wave-bar wave-bar--2" />
+      <rect x="10" y="4" width="2.5" height="10" rx="1.25" fill={color} className="wave-bar wave-bar--3" />
+      <rect x="14" y="6" width="2.5" height="6" rx="1.25" fill={color} className="wave-bar wave-bar--4" />
+    </svg>
+  );
+}
+
 /* ------------------------------------------------------------------ */
 /* animated boot splash — shown until the session-restore answer lands */
 /* ------------------------------------------------------------------ */
@@ -699,12 +867,23 @@ export function App() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [content, setContent] = useState("");
   const [attachmentIds, setAttachmentIds] = useState<string[]>([]);
+  const [readyAttachments, setReadyAttachments] = useState<Array<{ id: string; name: string; previewUrl?: string | null; type: string }>>([]);
+  const [uploadingFile, setUploadingFile] = useState<{ name: string; previewUrl?: string | null; type: string } | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   // Slash-command palette: highlighted row + the content value the user last
   // pressed Esc on (so it stays closed without wiping what they typed).
   const [slashSel, setSlashSel] = useState(0);
   const [slashDismiss, setSlashDismiss] = useState("");
   const composerRef = useRef<HTMLInputElement>(null);
   const [uploading, setUploading] = useState(false);
+  const [navMode, setNavMode] = useState<"guild" | "dm">("guild");
+  const [activeDmUserId, setActiveDmUserId] = useState<string | null>(null);
+  const [activeDmConversations, setActiveDmConversations] = useState<string[]>(() => {
+    try { return JSON.parse(localStorage.getItem("tk.activeDmUsers") || "[]"); } catch { return []; }
+  });
+  const [newDmModalOpen, setNewDmModalOpen] = useState(false);
+  const [newDmSearch, setNewDmSearch] = useState("");
+  const pendingDmMessageRef = useRef<{ targetUserId: string; text: string } | null>(null);
   const [showMembers, setShowMembers] = useState(true);
   const [menu, setMenu] = useState<MenuState | null>(null);
   // Text channels with a message the reader hasn't opened yet (Discord's
@@ -717,7 +896,12 @@ export function App() {
   const [collapsedCats, setCollapsedCats] = useState<Record<string, boolean>>(() => {
     try { return JSON.parse(localStorage.getItem("tk.collapsedCats") || "{}"); } catch { return {}; }
   });
+  const [bannerPreset, setBannerPreset] = useState<string>(() => {
+    try { return localStorage.getItem("tk.bannerPreset") || "sakura"; } catch { return "sakura"; }
+  });
   const [call, setCall] = useState<{ channelId: string; participants: Participant[] } | null>(null);
+  const [voiceConnState, setVoiceConnState] = useState<"waiting_server" | "authenticating" | "connecting" | "connected" | "disconnected">("disconnected");
+  const voiceConnTimers = useRef<number[]>([]);
   const [connQuality, setConnQuality] = useState<rtc.ConnQuality>("good");
   // User ids currently making sound — drives the green speaking ring in the
   // voice roster and on the stage tiles.
@@ -800,6 +984,99 @@ export function App() {
   const [updateReadyPath, setUpdateReadyPath] = useState<string | null>(null);
   const [updateDismissed, setUpdateDismissed] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settingsInitialTab, setSettingsInitialTab] = useState<"voice" | "account" | "appearance">("voice");
+  const [selectedProfileUserId, setSelectedProfileUserId] = useState<string | null>(null);
+  const [profileAnchorRect, setProfileAnchorRect] = useState<AnchorRect | null>(null);
+
+  function openProfile(userId: string, anchorEl?: HTMLElement | null) {
+    if (anchorEl) {
+      const rect = anchorEl.getBoundingClientRect();
+      setProfileAnchorRect({ top: rect.top, left: rect.left, right: rect.right, bottom: rect.bottom });
+    } else {
+      setProfileAnchorRect(null);
+    }
+    setSelectedProfileUserId(userId);
+  }
+
+  const selectedProfileUser: UserProfileData | null = useMemo(() => {
+    if (!selectedProfileUserId) return null;
+    if (selectedProfileUserId === currentUserId && currentUser) {
+      const selfMember = members.find(m => m.id === currentUserId);
+      return {
+        id: currentUser.id,
+        display_name: currentUser.display_name,
+        username: currentUser.username || "membro",
+        avatar_url: currentUser.avatar_url,
+        name_color: currentUser.name_color,
+        bio: (currentUser as any).bio ?? selfMember?.bio,
+        banner_preset: (currentUser as any).banner_preset ?? selfMember?.banner_preset ?? bannerPreset,
+        pronouns: (currentUser as any).pronouns ?? selfMember?.pronouns,
+        created_at: (currentUser as any).created_at ?? selfMember?.created_at,
+        role: selfMember?.role || "member",
+        profile_tag: selfMember?.profile_tag,
+      };
+    }
+    if (
+      selectedProfileUserId === MUSIC_BOT_ID ||
+      selectedProfileUserId === "bot-music" ||
+      selectedProfileUserId === "tupi-musica"
+    ) {
+      return {
+        id: MUSIC_BOT_ID,
+        display_name: "Tupi Música",
+        username: "tupi-musica",
+        role: "bot",
+        profile_tag: "BOT",
+        name_color: "#5865f2",
+        banner_preset: "synthwave",
+        bio: "Bot oficial de entretenimento do Tupi. Toque qualquer música ou rádio do YouTube ou Spotify nos canais de voz usando /play.",
+        pronouns: "ele/bot",
+        created_at: "2026-08-28T00:00:00Z",
+      };
+    }
+    const target = members.find(m => m.id === selectedProfileUserId);
+    if (!target) return null;
+    return {
+      id: target.id,
+      display_name: target.display_name,
+      username: target.username || "membro",
+      avatar_url: target.avatar_url,
+      name_color: target.name_color,
+      bio: target.bio,
+      banner_preset: target.banner_preset,
+      pronouns: target.pronouns,
+      created_at: target.created_at,
+      role: target.role,
+      profile_tag: target.profile_tag,
+      profile_badge_url: target.profile_badge_url,
+    };
+  }, [selectedProfileUserId, currentUserId, currentUser, members, bannerPreset]);
+
+  function handleProfileSave(data: ProfileUpdateData) {
+    if (data.banner_preset) {
+      setBannerPreset(data.banner_preset);
+      try { localStorage.setItem("tk.bannerPreset", data.banner_preset); } catch {}
+    }
+    if (currentUserId) {
+      setMembers(current => current.map(m => m.id === currentUserId ? {
+        ...m,
+        display_name: data.display_name ?? m.display_name,
+        bio: data.bio !== undefined ? data.bio : m.bio,
+        banner_preset: data.banner_preset ?? m.banner_preset,
+        pronouns: data.pronouns !== undefined ? data.pronouns : m.pronouns,
+        name_color: data.name_color !== undefined ? data.name_color : m.name_color,
+      } : m));
+      setCurrentUser(current => current ? {
+        ...current,
+        display_name: data.display_name ?? current.display_name,
+        name_color: data.name_color !== undefined ? data.name_color : current.name_color,
+        bio: data.bio !== undefined ? data.bio : (current as any).bio,
+        banner_preset: data.banner_preset ?? (current as any).banner_preset,
+        pronouns: data.pronouns !== undefined ? data.pronouns : (current as any).pronouns,
+      } : current);
+    }
+    send("profile.update", data as unknown as Record<string, unknown>);
+  }
   // `historyLoading` now means only "show the skeleton" — it is true just on
   // the *first* visit to a text channel this session. Re-entering a channel
   // we already hydrated restores its messages from `historyCacheRef`
@@ -814,6 +1091,8 @@ export function App() {
   const messagesScrollRef = useRef<HTMLDivElement>(null);
   const pendingTimers = useRef<Record<string, ReturnType<typeof setTimeout>>>({});
   const selfIdRef = useRef<string | null>(null);
+  const currentUserRef = useRef<{ id: string; display_name: string; username?: string; avatar_url?: string | null; name_color?: string | null } | null>(null);
+  useEffect(() => { currentUserRef.current = currentUser; }, [currentUser]);
   const joinedAtRef = useRef(0);
   const textChannels = useMemo(() => channels.filter(channel => channel.kind === "text"), [channels]);
   const voiceChannels = useMemo(() => channels.filter(channel => channel.kind === "voice"), [channels]);
@@ -840,12 +1119,22 @@ export function App() {
       // avatar_url to a data: URI). Patch the roster, and our own identity if
       // it was us.
       if (event.op === "member.updated") {
-        const updated = event.data as { user_id: string; username?: string; role?: string; display_name: string; avatar_url?: string | null; profile_tag?: string | null; name_color?: string | null };
+        const updated = event.data as { user_id: string; username?: string; role?: string; display_name: string; avatar_url?: string | null; profile_tag?: string | null; name_color?: string | null; bio?: string | null; banner_preset?: string | null; pronouns?: string | null; created_at?: string | null };
         setMembers(current => {
           const exists = current.some(member => member.id === updated.user_id);
           if (exists) {
             return current.map(member => member.id === updated.user_id
-              ? { ...member, display_name: updated.display_name ?? member.display_name, avatar_url: updated.avatar_url ?? null, profile_tag: updated.profile_tag ?? member.profile_tag, name_color: updated.name_color ?? null }
+              ? {
+                  ...member,
+                  display_name: updated.display_name ?? member.display_name,
+                  avatar_url: updated.avatar_url !== undefined ? updated.avatar_url : member.avatar_url,
+                  profile_tag: updated.profile_tag !== undefined ? updated.profile_tag : member.profile_tag,
+                  name_color: updated.name_color !== undefined ? updated.name_color : member.name_color,
+                  bio: updated.bio !== undefined ? updated.bio : member.bio,
+                  banner_preset: updated.banner_preset !== undefined ? updated.banner_preset : member.banner_preset,
+                  pronouns: updated.pronouns !== undefined ? updated.pronouns : member.pronouns,
+                  created_at: updated.created_at !== undefined ? updated.created_at : member.created_at,
+                }
               : member);
           } else {
             return [
@@ -858,12 +1147,25 @@ export function App() {
                 avatar_url: updated.avatar_url ?? null,
                 profile_tag: updated.profile_tag ?? null,
                 name_color: updated.name_color ?? null,
+                bio: updated.bio ?? null,
+                banner_preset: updated.banner_preset ?? null,
+                pronouns: updated.pronouns ?? null,
+                created_at: updated.created_at ?? null,
               }
             ];
           }
         });
         if (updated.user_id === selfIdRef.current) {
-          setCurrentUser(current => current ? { ...current, display_name: updated.display_name ?? current.display_name, avatar_url: updated.avatar_url ?? null, name_color: updated.name_color ?? null } : current);
+          if (updated.banner_preset) setBannerPreset(updated.banner_preset);
+          setCurrentUser(current => current ? {
+            ...current,
+            display_name: updated.display_name ?? current.display_name,
+            avatar_url: updated.avatar_url !== undefined ? updated.avatar_url : current.avatar_url,
+            name_color: updated.name_color !== undefined ? updated.name_color : current.name_color,
+            bio: updated.bio !== undefined ? updated.bio : (current as any).bio,
+            banner_preset: updated.banner_preset !== undefined ? updated.banner_preset : (current as any).banner_preset,
+            pronouns: updated.pronouns !== undefined ? updated.pronouns : (current as any).pronouns,
+          } : current);
         }
       }
       // A channel was renamed (name-only edit — see routes/channels.rs rename).
@@ -961,17 +1263,52 @@ export function App() {
           setHistoryLoading(false);
         }
       }
+      if (event.op === "dm.opened") {
+        const ch = event.data?.channel as Channel | undefined;
+        const targetUserId = event.data?.target_user_id as string | undefined;
+        if (ch) {
+          chooseChannel(ch);
+          if (targetUserId) {
+            setActiveDmUserId(targetUserId);
+            setActiveDmConversations(curr => {
+              if (curr.includes(targetUserId)) return curr;
+              return [targetUserId, ...curr];
+            });
+          }
+          const pending = pendingDmMessageRef.current;
+          if (pending && pending.targetUserId === targetUserId) {
+            pendingDmMessageRef.current = null;
+            const reqId = crypto.randomUUID();
+            setMessages(curr => [...curr, {
+              id: reqId, reqId, content: pending.text, created_at: new Date().toISOString(), author_id: selfIdRef.current ?? undefined,
+              pending: true, pendingAttachmentIds: [],
+            }]);
+            sendOptimistic(reqId, ch.id, pending.text, []);
+          }
+        }
+      }
       if (event.op === "chat.message.created") {
         const created = event.data.message;
         const createdChannelId: string | undefined = created?.channel_id;
         const fromSomeoneElse = !!created?.author_id && created.author_id !== selfIdRef.current;
         const lookingAtIt = createdChannelId === activeChannel?.id;
-        // A message from someone else in a channel we're NOT reading: chime
-        // (unless we're "busy") and light up the channel. If we're already in
-        // that channel, neither happens (scenario 2).
-        if (fromSomeoneElse && !lookingAtIt) {
-          if (myStatusRef.current !== "busy") playSound("notification");
-          if (createdChannelId) setUnread(current => current[createdChannelId] ? current : { ...current, [createdChannelId]: true });
+        const isMention = fromSomeoneElse && isUserMentioned(created?.content, selfIdRef.current, currentUserRef.current);
+        // If received a message from someone else, auto-add them to active DM list if it's a DM channel
+        if (fromSomeoneElse && created.author_id) {
+          setActiveDmConversations(curr => {
+            if (curr.includes(created.author_id)) return curr;
+            return [created.author_id, ...curr];
+          });
+        }
+        // A message from someone else mentioning the user ALWAYS chimes and marks unread
+        if (fromSomeoneElse) {
+          if (isMention) {
+            if (myStatusRef.current !== "busy") playSound("notification");
+            if (createdChannelId) setUnread(current => ({ ...current, [createdChannelId]: true }));
+          } else if (!lookingAtIt) {
+            if (myStatusRef.current !== "busy") playSound("notification");
+            if (createdChannelId) setUnread(current => current[createdChannelId] ? current : { ...current, [createdChannelId]: true });
+          }
         }
       }
       if (event.op === "chat.message.created" && event.data.message?.channel_id === activeChannel?.id) {
@@ -994,11 +1331,26 @@ export function App() {
         });
       }
       if (event.op === "chat.message.edited") setMessages(current => current.map(message => message.id === event.data.message_id ? { ...message, content: event.data.content } : message));
+      if (event.op === "chat.message.preview_updated") setMessages(current => current.map(message => message.id === event.data.message_id ? { ...message, link_preview: event.data.link_preview } : message));
       if (event.op === "chat.message.deleted") setMessages(current => current.filter(message => message.id !== event.data.message_id));
       if (event.op === "connection.state") setConnectionState(event.data.state);
       if (event.op === "screen.sources") { setSources(event.data.sources ?? []); setSourcesLoading(false); }
-      if (event.op === "attachment.uploaded") { setAttachmentIds(current => [...current, event.data.id]); setUploading(false); }
-      if (event.op === "attachment.cancelled") setUploading(false);
+      if (event.op === "attachment.uploaded") {
+        const att = event.data;
+        setAttachmentIds(current => [...current, att.id]);
+        setReadyAttachments(current => [...current, {
+          id: att.id,
+          name: att.filename || "anexo",
+          previewUrl: (att.content_type ?? "").startsWith("image/") ? (att.url || null) : null,
+          type: att.content_type || "application/octet-stream"
+        }]);
+        setUploading(false);
+        setUploadingFile(null);
+      }
+      if (event.op === "attachment.cancelled") {
+        setUploading(false);
+        setUploadingFile(null);
+      }
       if (event.op === "update.available") {
         setUpdateInfo(event.data);
         setUpdateDismissed(false);
@@ -1014,6 +1366,14 @@ export function App() {
       if (event.op === "update.error") {
         setUpdateProgress(null);
         setError(`Erro ao atualizar: ${event.data?.message ?? "Falha no download"}`);
+      }
+      if (event.op === "hotkey.event") {
+        const { code, is_down } = event.data as { code: string; is_down: boolean };
+        // A key release must always pass through so PTT can never get stuck.
+        // Key presses are ignored only while the focused WebView is editing text.
+        if (!is_down || (!shortcutRecordingRef.current && !isEditableElementFocused())) {
+          voiceShortcutRef.current?.handle(code, is_down, readVoiceShortcutConfig());
+        }
       }
       if (event.op === "error") {
         // Version skew: an op this client sends that the (older) server build
@@ -1047,62 +1407,64 @@ export function App() {
     };
   }, []);
 
-  // Global Push-to-Talk (PTT) / Toggle Keyboard Listener
+  // Global Push-to-Talk (PTT) / Toggle listener. Both the native hook and the
+  // WebView fallback feed this controller; it owns de-duplication and edges.
   const mutedRef = useRef(muted);
   mutedRef.current = muted;
   const deafenedRef = useRef(deafened);
   deafenedRef.current = deafened;
-  const isPttActiveRef = useRef(false);
+  const voiceShortcutRef = useRef<VoiceShortcutController | null>(null);
+  const shortcutRecordingRef = useRef(false);
+  if (!voiceShortcutRef.current) {
+    voiceShortcutRef.current = new VoiceShortcutController({
+      onPushToTalkChange: pressed => updateAudioState(!pressed, deafenedRef.current, true),
+      onToggle: () => {
+        const currentPreference = deafenedRef.current
+          ? preDeafenMutedRef.current
+          : mutedRef.current;
+        updateAudioState(!currentPreference, deafenedRef.current);
+      },
+    });
+  }
+
+  function readVoiceShortcutConfig(): { mode: VoiceInputMode; key: string } {
+    try {
+      return {
+        mode: (localStorage.getItem("tk.inputMode") as VoiceInputMode) || "voice_activity",
+        key: localStorage.getItem("tk.pttKey") || "KeyV",
+      };
+    } catch {
+      return { mode: "voice_activity", key: "KeyV" };
+    }
+  }
+
+  function isEditableElementFocused(): boolean {
+    if (!document.hasFocus()) return false;
+    const element = document.activeElement as HTMLElement | null;
+    const tag = element?.tagName.toLowerCase();
+    if (tag === "textarea" || element?.isContentEditable) return true;
+    if (tag !== "input") return false;
+
+    // Radios and sliders are inputs too, but focusing them (for example when
+    // selecting PTT in Settings) must not disable the shortcut being tested.
+    return !NON_TEXT_INPUT_TYPES.has((element as HTMLInputElement).type);
+  }
 
   useEffect(() => {
-    const isInputFocused = () => {
-      const tag = document.activeElement?.tagName?.toLowerCase();
-      return tag === "input" || tag === "textarea" || (document.activeElement as HTMLElement)?.isContentEditable;
-    };
-
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (isInputFocused() || e.repeat) return;
-      const mode = (localStorage.getItem("tk.inputMode") as string) || "voice_activity";
-      const key = localStorage.getItem("tk.pttKey") || "KeyV";
-      const isMatch = e.code === key || e.key.toUpperCase() === key.toUpperCase() || (key === "Space" && e.code === "Space");
-
-      if (mode === "push_to_talk" && isMatch) {
-        if (!isPttActiveRef.current) {
-          isPttActiveRef.current = true;
-          updateAudioState(false, deafenedRef.current, true);
-        }
-      } else if (mode === "toggle" && isMatch) {
-        updateAudioState(!mutedRef.current, deafenedRef.current, true);
-      }
+      if (shortcutRecordingRef.current || isEditableElementFocused()) return;
+      voiceShortcutRef.current?.handle(e.code, true, readVoiceShortcutConfig());
     };
 
     const handleKeyUp = (e: KeyboardEvent) => {
-      if (isInputFocused()) return;
-      const mode = (localStorage.getItem("tk.inputMode") as string) || "voice_activity";
-      const key = localStorage.getItem("tk.pttKey") || "KeyV";
-      const isMatch = e.code === key || e.key.toUpperCase() === key.toUpperCase() || (key === "Space" && e.code === "Space");
-
-      if (mode === "push_to_talk" && isMatch) {
-        isPttActiveRef.current = false;
-        updateAudioState(true, deafenedRef.current, true);
-      }
-    };
-
-    const handleBlur = () => {
-      const mode = (localStorage.getItem("tk.inputMode") as string) || "voice_activity";
-      if (mode === "push_to_talk" && isPttActiveRef.current) {
-        isPttActiveRef.current = false;
-        updateAudioState(true, deafenedRef.current, true);
-      }
+      voiceShortcutRef.current?.handle(e.code, false, readVoiceShortcutConfig());
     };
 
     window.addEventListener("keydown", handleKeyDown);
     window.addEventListener("keyup", handleKeyUp);
-    window.addEventListener("blur", handleBlur);
     return () => {
       window.removeEventListener("keydown", handleKeyDown);
       window.removeEventListener("keyup", handleKeyUp);
-      window.removeEventListener("blur", handleBlur);
     };
   }, []);
 
@@ -1288,6 +1650,30 @@ export function App() {
     return () => clearTimeout(timer);
   }, [mySharingStreamId]);
 
+  useEffect(() => {
+    try { localStorage.setItem("tk.activeDmUsers", JSON.stringify(activeDmConversations)); } catch {}
+  }, [activeDmConversations]);
+
+  function openDmWithUser(targetUserId: string, initialMessage?: string) {
+    if (!currentUserId || targetUserId === currentUserId) return;
+    if (activeChannel?.kind === "text") {
+      historyCacheRef.current[activeChannel.id] = messagesRef.current;
+    }
+    setActiveDmConversations(curr => {
+      if (curr.includes(targetUserId)) return curr;
+      return [targetUserId, ...curr];
+    });
+    setActiveDmUserId(targetUserId);
+    setNavMode("dm");
+    setHistoryLoading(true);
+    setMessages([]);
+    setActiveChannel(null);
+    if (initialMessage && initialMessage.trim()) {
+      pendingDmMessageRef.current = { targetUserId, text: initialMessage.trim() };
+    }
+    send("dm.open", { target_user_id: targetUserId });
+  }
+
   function chooseChannel(channel: Channel) {
     // Snapshot the channel we're leaving so coming back is instant + current.
     if (activeChannel?.kind === "text" && activeChannel.id !== channel.id) {
@@ -1345,12 +1731,124 @@ export function App() {
     setSlashDismiss("");
     composerRef.current?.focus();
   }
+
+  // Mention palette: active when typing @ or @query
+  const mentionMatch = content.match(/(?:^|\s)@([a-zA-Z0-9_\u00C0-\u017F-]*)$/);
+  const [mentionSel, setMentionSel] = useState(0);
+  const [mentionDismiss, setMentionDismiss] = useState("");
+
+  const mentionList = useMemo(() => {
+    if (!mentionMatch || content === mentionDismiss) return null;
+    const q = mentionMatch[1].toLowerCase();
+    
+    // Filter community members
+    const matchedMembers = members.filter(m =>
+      m.display_name.toLowerCase().includes(q) ||
+      m.username.toLowerCase().includes(q)
+    );
+
+    const specials = [
+      { id: "everyone", name: "everyone", desc: "Notificar todos neste canal", isSpecial: true as const },
+      { id: "here", name: "here", desc: "Notificar membros online neste canal", isSpecial: true as const },
+    ].filter(s => s.name.toLowerCase().includes(q));
+
+    const total = matchedMembers.length + specials.length;
+    if (total === 0) return null;
+
+    return {
+      members: matchedMembers.slice(0, 10),
+      specials,
+      total: matchedMembers.slice(0, 10).length + specials.length,
+    };
+  }, [mentionMatch, content, mentionDismiss, members]);
+
+  const mentionOpen = !!mentionList && mentionList.total > 0;
+  const mentionIndex = Math.max(0, Math.min(mentionSel, (mentionList?.total ?? 1) - 1));
+
+  useEffect(() => { setMentionSel(0); }, [mentionMatch?.[1]]);
+
+  function applyMention(item: Member | { name: string; isSpecial: true }) {
+    const atIndex = content.lastIndexOf("@");
+    if (atIndex === -1) return;
+    const before = content.slice(0, atIndex);
+    const mentionText = "isSpecial" in item ? `@${item.name} ` : `@${item.display_name} `;
+    setContent(before + mentionText);
+    setMentionSel(0);
+    setMentionDismiss("");
+    composerRef.current?.focus();
+  }
+
   function onComposerKeyDown(event: ReactKeyboardEvent<HTMLInputElement>) {
+    if (mentionOpen && mentionList) {
+      const allItems = [...mentionList.members, ...mentionList.specials];
+      if (event.key === "ArrowDown") {
+        event.preventDefault();
+        setMentionSel(value => (value + 1) % allItems.length);
+        return;
+      }
+      if (event.key === "ArrowUp") {
+        event.preventDefault();
+        setMentionSel(value => (value - 1 + allItems.length) % allItems.length);
+        return;
+      }
+      if (event.key === "Enter" || event.key === "Tab") {
+        event.preventDefault();
+        if (allItems[mentionIndex]) applyMention(allItems[mentionIndex]);
+        return;
+      }
+      if (event.key === "Escape") {
+        event.preventDefault();
+        setMentionDismiss(content);
+        return;
+      }
+    }
+
     if (!slashOpen) return;
     if (event.key === "ArrowDown") { event.preventDefault(); setSlashSel(value => (value + 1) % slashMatches.length); }
     else if (event.key === "ArrowUp") { event.preventDefault(); setSlashSel(value => (value - 1 + slashMatches.length) % slashMatches.length); }
     else if (event.key === "Enter" || event.key === "Tab") { event.preventDefault(); applySlash(slashMatches[slashIndex]); }
     else if (event.key === "Escape") { event.preventDefault(); setSlashDismiss(content); }
+  }
+
+  function uploadFileBlob(file: File) {
+    if (!activeChannel) return;
+    const isImg = file.type.startsWith("image/");
+    const preview = isImg ? URL.createObjectURL(file) : null;
+    setUploading(true);
+    setUploadingFile({
+      name: file.name || "arquivo",
+      previewUrl: preview,
+      type: file.type || "application/octet-stream"
+    });
+    const reader = new FileReader();
+    reader.onload = () => {
+      const res = reader.result as string;
+      const comma = res.indexOf(",");
+      const rawBase64 = comma >= 0 ? res.slice(comma + 1) : res;
+      send("attachment.upload_base64", {
+        channel_id: activeChannel.id,
+        base64: rawBase64,
+        filename: file.name || "imagem.png",
+        content_type: file.type || "image/png",
+      });
+    };
+    reader.readAsDataURL(file);
+  }
+
+  function handlePaste(event: React.ClipboardEvent) {
+    const items = event.clipboardData?.items;
+    if (!items || !activeChannel) return;
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i];
+      if (item.kind === "file") {
+        const file = item.getAsFile();
+        if (file) {
+          event.preventDefault();
+          uploadFileBlob(file);
+          return;
+        }
+      }
+    }
   }
 
   function submitMessage(event: FormEvent) {
@@ -1363,13 +1861,15 @@ export function App() {
       setContent(""); return;
     }
     const reqId = crypto.randomUUID();
-    const text = content || "[anexo]";
+    const text = content.trim();
     setMessages(current => [...current, {
       id: reqId, reqId, content: text, created_at: new Date().toISOString(), author_id: currentUserId ?? undefined,
       pending: true, pendingAttachmentIds: attachmentIds,
     }]);
     sendOptimistic(reqId, activeChannel.id, text, attachmentIds);
-    setContent(""); setAttachmentIds([]);
+    setContent("");
+    setAttachmentIds([]);
+    setReadyAttachments([]);
   }
   function retryMessage(message: Message) {
     if (!activeChannel || !message.reqId) return;
@@ -1380,18 +1880,56 @@ export function App() {
     if (message.reqId && pendingTimers.current[message.reqId]) { clearTimeout(pendingTimers.current[message.reqId]); delete pendingTimers.current[message.reqId]; }
     setMessages(current => current.filter(entry => entry.reqId !== message.reqId));
   }
-  function pickAttachment() { if (!activeChannel) return; setUploading(true); send("attachment.pick", { channel_id: activeChannel.id }); }
+  function pickAttachment() {
+    if (!activeChannel) return;
+    if (fileInputRef.current) {
+      fileInputRef.current.value = "";
+      fileInputRef.current.click();
+    } else {
+      setUploading(true);
+      send("attachment.pick", { channel_id: activeChannel.id });
+    }
+  }
   function joinCall(channel: Channel) {
-    const mode = (localStorage.getItem("tk.inputMode") as string) || "voice_activity";
+    const mode = readVoiceShortcutConfig().mode;
     const initialMuted = mode === "push_to_talk";
+    voiceShortcutRef.current?.reset();
+    mutedRef.current = initialMuted;
+    deafenedRef.current = false;
     setMuted(initialMuted);
     setDeafened(false);
     joinedAtRef.current = Date.now();
     playSound("joinCall");
+
+    // Clear any previous progression timers
+    voiceConnTimers.current.forEach(id => window.clearTimeout(id));
+    voiceConnTimers.current = [];
+
+    // Discord-like progressive voice connection states
+    setVoiceConnState("waiting_server");
+
+    const t1 = window.setTimeout(() => {
+      setVoiceConnState("authenticating");
+    }, 450);
+
+    const t2 = window.setTimeout(() => {
+      setVoiceConnState("connecting");
+    }, 900);
+
+    const t3 = window.setTimeout(() => {
+      setVoiceConnState("connected");
+    }, 1450);
+
+    voiceConnTimers.current = [t1, t2, t3];
+
     void rtc.joinCall(channel.id, initialMuted, false);
   }
   function leaveCall() {
     if (call) { playSound("leaveCall"); void rtc.leaveCall(); }
+    voiceShortcutRef.current?.reset();
+    voiceConnTimers.current.forEach(id => window.clearTimeout(id));
+    voiceConnTimers.current = [];
+    setVoiceConnState("disconnected");
     musicStreamRef.current = null;
     setCall(null); setStreams([]); setMySharingStreamId(null); setMyMusicStreamId(null);
     setMyCameraStreamId(null); setSelfCameraStream(null); setCameraMenuOpen(false);
@@ -1408,12 +1946,18 @@ export function App() {
     if (atrium) chooseChannel(atrium);
   }
   function updateAudioState(nextMuted: boolean, nextDeafened: boolean, silent: boolean = false) {
-    const deafenChanged = nextDeafened !== deafened;
-    const muteChanged = nextMuted !== muted;
-    // Deafen implies mic muted: on the way into deafen, remember the mic
-    // state so it can be restored when deafen is turned back off.
-    if (nextDeafened && !deafened) { preDeafenMutedRef.current = nextMuted; nextMuted = true; }
-    else if (!nextDeafened && deafened) { nextMuted = preDeafenMutedRef.current; }
+    const currentMuted = mutedRef.current;
+    const currentDeafened = deafenedRef.current;
+    const deafenChanged = nextDeafened !== currentDeafened;
+    // Deafen always gates the microphone. Keep the requested mute preference
+    // separately so mode/hotkey changes made while deafened are restored later.
+    if (nextDeafened) {
+      preDeafenMutedRef.current = nextMuted;
+      nextMuted = true;
+    } else if (currentDeafened) {
+      nextMuted = preDeafenMutedRef.current;
+    }
+    const muteChanged = nextMuted !== currentMuted;
     // A headphone action can also mute/restore the microphone. Play one sound
     // for the action the user actually clicked, rather than both at once.
     if (!silent) {
@@ -1428,8 +1972,13 @@ export function App() {
       }
       else if (muteChanged) playSound(nextMuted ? "micMuted" : "micUnmuted");
     }
-    setMuted(nextMuted); setDeafened(nextDeafened);
-    if (call) rtc.setLocalAudioState(nextMuted, nextDeafened);
+    // Refs are updated synchronously so a second native/WebView event in the
+    // same render frame always observes the state that was actually applied.
+    mutedRef.current = nextMuted;
+    deafenedRef.current = nextDeafened;
+    setMuted(nextMuted);
+    setDeafened(nextDeafened);
+    rtc.setLocalAudioState(nextMuted, nextDeafened);
   }
   function openPicker(sourceOnly: boolean) {
     if (!call) return;
@@ -1694,10 +2243,11 @@ export function App() {
   function memberMenuItems(userId: string): MenuItem[] {
     if (userId && userId === currentUserId) {
       return [
+        { label: "Ver Meu Perfil", onClick: () => setSelectedProfileUserId(currentUserId) },
+        { label: "Editar Perfil", onClick: () => { setSettingsInitialTab("account"); setSettingsOpen(true); } },
         myStatus === "busy"
           ? { label: "Ficar disponível", onClick: () => setStatus("online") }
           : { label: "Não perturbe (ocupado)", onClick: () => setStatus("busy") },
-        { label: "Alterar meu nome", onClick: renameSelf },
         { label: "Alterar foto de perfil", onClick: () => send("profile.avatar.pick") },
         {
           kind: "color",
@@ -1709,7 +2259,9 @@ export function App() {
     }
     const member = members.find(entry => entry.id === userId);
     const callmate = call?.participants.find(participant => participant.user_id === userId);
-    const items: MenuItem[] = [];
+    const items: MenuItem[] = [
+      { label: "Ver Perfil", onClick: () => setSelectedProfileUserId(userId) },
+    ];
     // In a call together → tune this person's (or the music bot's) volume,
     // just for me. The bot's audio is a normal peer track, so the same
     // rtc.setPeerVolume path works.
@@ -1889,7 +2441,13 @@ export function App() {
     }
 
     return (
-      <div className={speaking ? "vtile is-speaking" : "vtile"} key={desc.key}>
+      <div
+        className={speaking ? "vtile is-speaking" : "vtile"}
+        key={desc.key}
+        onClick={e => openProfile(participant.user_id, e.currentTarget)}
+        style={{ cursor: "pointer" }}
+        title={`Ver perfil de ${name}`}
+      >
         <Avatar label={name} size={88} className="vtile__avatar" imageUrl={isSelf ? currentUser?.avatar_url : members.find(member => member.id === participant.user_id)?.avatar_url} />
         <div className="vtile__name">
           {isMicMuted && <Icon name="mic-muted" size={14} />}
@@ -1902,18 +2460,57 @@ export function App() {
   return (
     <main className="app" onContextMenu={event => event.preventDefault()}>
       {menu && <ContextMenu {...menu} onClose={() => setMenu(null)} />}
+      {selectedProfileUser && (
+        <UserProfileModal
+          user={selectedProfileUser}
+          presence={presence[selectedProfileUser.id] ?? "offline"}
+          isSelf={selectedProfileUser.id === currentUserId}
+          activities={activities[selectedProfileUser.id] ?? []}
+          anchorRect={profileAnchorRect}
+          onClose={() => {
+            setSelectedProfileUserId(null);
+            setProfileAnchorRect(null);
+          }}
+          onEditProfile={() => {
+            setSelectedProfileUserId(null);
+            setProfileAnchorRect(null);
+            setSettingsInitialTab("account");
+            setSettingsOpen(true);
+          }}
+          onSendMessage={text => {
+            openDmWithUser(selectedProfileUser.id, text);
+            setSelectedProfileUserId(null);
+            setProfileAnchorRect(null);
+          }}
+        />
+      )}
       {settingsOpen && (
         <SettingsModal
           currentUser={currentUser}
+          currentBanner={bannerPreset}
+          initialTab={settingsInitialTab}
+          onBannerChange={bannerId => {
+            setBannerPreset(bannerId);
+            try { localStorage.setItem("tk.bannerPreset", bannerId); } catch {}
+            send("profile.banner.set", { banner_preset: bannerId });
+          }}
+          onProfileSave={handleProfileSave}
           onClose={() => setSettingsOpen(false)}
           onLogout={() => {
             setSettingsOpen(false);
             send("auth.session.clear");
           }}
           onInputModeChange={mode => {
+            voiceShortcutRef.current?.reset();
             if (mode === "push_to_talk") {
-              updateAudioState(true, deafened, true);
+              updateAudioState(true, deafenedRef.current, true);
+            } else if (mode === "voice_activity") {
+              updateAudioState(false, deafenedRef.current, true);
             }
+          }}
+          onShortcutRecordingChange={recording => {
+            shortcutRecordingRef.current = recording;
+            if (recording) voiceShortcutRef.current?.reset();
           }}
         />
       )}
@@ -1980,34 +2577,128 @@ export function App() {
           <button onClick={stopSharing}>Parar</button>
         </div>
       )}
-      {/* ---- left nav: server rail + channel sidebar, sharing one bottom dock ---- */}
+      {/* ---- left nav: server rail + channel sidebar, sharing one full-width bottom dock ---- */}
       <div className="leftnav">
-       <div className="leftnav__cols">
-      <nav className="guilds">
-        <div className="guilds__pill is-plain" title="Início"><Icon name="discord-icon" size={26} /></div>
-        <div className="guilds__sep" />
-        <div className="guilds__pill is-active" title={communityName} style={{ overflow: "hidden", padding: 0 }}>
-          <img src={logoUrl} alt={communityName} style={{ width: "100%", height: "100%", objectFit: "cover" }} />
-        </div>
-        <div className="guilds__pill is-plain guilds__add" title="Adicionar um servidor">+</div>
-      </nav>
+        <div className="leftnav__cols">
+          <nav className="guilds">
+            <div
+              className={`guilds__pill ${navMode === "dm" ? "is-active" : "is-plain"}`}
+              onClick={() => {
+                setNavMode("dm");
+                if (activeDmUserId) {
+                  openDmWithUser(activeDmUserId);
+                } else {
+                  if (activeChannel?.kind === "text") {
+                    historyCacheRef.current[activeChannel.id] = messagesRef.current;
+                  }
+                  setActiveChannel(null);
+                  setMessages([]);
+                }
+              }}
+              title="Mensagens Diretas"
+            >
+              <Icon name="discord-icon" size={26} />
+            </div>
+            <div className="guilds__sep" />
+            <div
+              className={`guilds__pill ${navMode === "guild" ? "is-active" : "is-plain"}`}
+              onClick={() => {
+                setNavMode("guild");
+                if (textChannels.length > 0 && (!activeChannel || activeChannel.topic?.startsWith("dm:"))) {
+                  chooseChannel(textChannels[0]);
+                }
+              }}
+              title={communityName}
+              style={{ overflow: "hidden", padding: 0 }}
+            >
+              <img src={logoUrl} alt={communityName} style={{ width: "100%", height: "100%", objectFit: "cover" }} />
+            </div>
+            <div className="guilds__pill is-plain guilds__add" title="Adicionar um servidor">+</div>
+          </nav>
 
-      {/* ---- channel sidebar ---- */}
-      <aside className="channels">
-        <button className="channels__header">
-          <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
-            <img src={logoUrl} alt="" style={{ width: "18px", height: "18px", borderRadius: "4px", objectFit: "cover" }} />
-            <span>{communityName}</span>
-          </div>
-          <Icon name="config" size={16} />
-        </button>
+          {/* ---- channel sidebar or DM sidebar ---- */}
+          {navMode === "dm" ? (
+            <aside className="channels">
+              <div className="dm-search-bar">
+                <button type="button" className="dm-search-btn" onClick={() => setNewDmModalOpen(true)}>
+                  <span>Encontre ou comece uma conversa</span>
+                </button>
+              </div>
 
-        <div className="channels__list scroll-thin">
-          <div className="server-shortcuts">
-            <button className="server-shortcut"><Icon name="events" size={20} /><span>Eventos</span></button>
-            <button className="server-shortcut"><Icon name="notifications" size={20} /><span>Impulsos de servidor</span></button>
-          </div>
-          {(categories.length ? categories : [
+              <div className="dm-nav-links">
+                <button type="button" className="dm-nav-link is-active">
+                  <Icon name="friends" size={20} />
+                  <span>Amigos</span>
+                </button>
+              </div>
+
+              <div className="dm-section-header">
+                <span>MENSAGENS DIRETAS</span>
+                <button type="button" className="dm-add-btn" onClick={() => setNewDmModalOpen(true)} title="Criar DM">+</button>
+              </div>
+
+              <div className="dm-conversations-list scroll-thin">
+                {activeDmConversations.map(userId => {
+                  const member = members.find(m => m.id === userId);
+                  if (!member) return null;
+                  const isCurrentDm = activeDmUserId === userId;
+                  const userPresence = presence[userId] ?? "offline";
+                  return (
+                    <div
+                      key={userId}
+                      className={`dm-conv-item ${isCurrentDm ? "is-active" : ""}`}
+                      onClick={() => openDmWithUser(userId)}
+                    >
+                      <div className="dm-conv-avatar-wrap">
+                        <Avatar label={member.display_name} size={32} imageUrl={member.avatar_url} />
+                        <span className={`presence-dot presence-dot--${userPresence}`} />
+                      </div>
+                      <div className="dm-conv-info">
+                        <span className="dm-conv-name" style={member.name_color ? { color: member.name_color } : undefined}>
+                          {member.display_name}
+                        </span>
+                        <span className="dm-conv-sub">
+                          {activities[userId]?.[0]?.name ? `Jogando ${activities[userId][0].name}` : `@${member.username}`}
+                        </span>
+                      </div>
+                      <button
+                        type="button"
+                        className="dm-conv-close"
+                        onClick={e => {
+                          e.stopPropagation();
+                          setActiveDmConversations(curr => curr.filter(id => id !== userId));
+                          if (activeDmUserId === userId) setActiveDmUserId(null);
+                        }}
+                        title="Fechar DM"
+                      >
+                        ✕
+                      </button>
+                    </div>
+                  );
+                })}
+                {activeDmConversations.length === 0 && (
+                  <div style={{ padding: "16px 12px", fontSize: "13px", color: "var(--text-muted, #949ba4)", textAlign: "center" }}>
+                    Nenhuma conversa recente. Clique no + acima para iniciar uma DM!
+                  </div>
+                )}
+              </div>
+            </aside>
+          ) : (
+            <aside className="channels">
+              <button className="channels__header">
+                <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                  <img src={logoUrl} alt="" style={{ width: "18px", height: "18px", borderRadius: "4px", objectFit: "cover" }} />
+                  <span>{communityName}</span>
+                </div>
+                <Icon name="config" size={16} />
+              </button>
+
+              <div className="channels__list scroll-thin">
+                <div className="server-shortcuts">
+                  <button className="server-shortcut"><Icon name="events" size={20} /><span>Eventos</span></button>
+                  <button className="server-shortcut"><Icon name="notifications" size={20} /><span>Impulsos de servidor</span></button>
+                </div>
+                {(categories.length ? categories : [
             { id: "text", name: "Canais de texto", position: 0, channels: textChannels },
             { id: "voice", name: "Canais de voz", position: 1, channels: voiceChannels },
           ]).map(category => {
@@ -2154,6 +2845,7 @@ export function App() {
                           onDragEnd={canMoveMembers ? (() => setDragOverVoice(null)) : undefined}
                           onMouseEnter={() => canPeek && peekEnter(channel.id, entry.user_id, share!.stream_id, here)}
                           onMouseLeave={() => canPeek && peekLeave(entry.user_id)}
+                          onClick={event => openProfile(entry.user_id, event.currentTarget)}
                           onContextMenu={event => openMenu(event, memberMenuItems(entry.user_id))}
                         >
                           <Avatar label={name} size={24} className="voice-member__av" imageUrl={isBot ? "/tupi-mascot.png" : members.find(member => member.id === entry.user_id)?.avatar_url} />
@@ -2168,7 +2860,12 @@ export function App() {
                           {audioOff && <Icon name="headphone-muted" size={15} className="voice-member__flag" />}
                           {hasCamera && <Icon name="camera" size={15} className="voice-member__flag voice-member__flag--cam" title="Câmera ligada" />}
                           {isLive && <span className="voice-member__live-badge">AO VIVO</span>}
-                          {botPlaying && <span className="voice-member__live-badge voice-member__live-badge--bot">🎵 TOCANDO</span>}
+                          {botPlaying && (
+                            <span className="voice-member__live-badge voice-member__live-badge--bot" style={{ display: "inline-flex", alignItems: "center", gap: "4px" }}>
+                              <MusicNoteIcon size={11} />
+                              <span>TOCANDO</span>
+                            </span>
+                          )}
                           {here && !isSelf && watching[entry.user_id] && (
                             <button
                               className="voice-member__watch"
@@ -2195,22 +2892,35 @@ export function App() {
               </div>
             );
             })}
-          </section>;
-          })}
-        </div>
-      </aside>
-       </div>
+            </section>;
+            })}
+          </div>
+        </aside>
+      )}
+    </div>
 
-       <div className="leftnav__dock">
-        {/* ---- RTC connected panel ---- */}
+    <div className="leftnav__dock">
+        {/* ---- RTC connected panel with progressive statuses ---- */}
         {call && (
           <div className="voice-panel">
             <div className="voice-panel__row">
-              <SignalBars quality={connQuality} />
+              {voiceConnState === "connected" ? (
+                <SignalBars quality={connQuality} />
+              ) : (
+                <AudioWaveform color="var(--yellow)" />
+              )}
               <div className="voice-panel__info">
-                <div className="voice-panel__state">Voz conectada</div>
+                <div className={`voice-panel__state ${voiceConnState === "connected" ? "is-connected" : "is-connecting"}`}>
+                  {voiceConnState === "waiting_server"
+                    ? "Aguardando o servidor de voz"
+                    : voiceConnState === "authenticating"
+                    ? "Autenticando"
+                    : voiceConnState === "connecting"
+                    ? "Conexão RTC"
+                    : "Voz conectada"}
+                </div>
                 <div className="voice-panel__chan">
-                  {(channels.find(c => c.id === call.channelId)?.name ?? "canal")} / {communityName}
+                  *{(channels.find(c => c.id === call.channelId)?.name ?? "canal")}* / {communityName}
                 </div>
               </div>
               <button className="voice-panel__hangup" onClick={leaveCall} title="Desconectar">
@@ -2219,13 +2929,12 @@ export function App() {
             </div>
             <div className="voice-panel__grid">
               <button
-                className={noiseSup ? "vp-btn is-on" : "vp-btn"}
-                onClick={toggleNoiseSuppression}
-                title={noiseSup ? "Supressão de ruído: ligada" : "Supressão de ruído: desligada"}
+                className={myCameraStreamId ? "vp-btn is-on" : "vp-btn"}
+                onClick={toggleCamera}
+                title={myCameraStreamId ? "Desligar câmera" : "Ligar câmera"}
               >
-                <Icon name={noiseSup ? "crisp-nois-cenaceling-on" : "crisp-off"} size={18} />
+                <Icon name={myCameraStreamId ? "camera" : "camera-closed"} size={18} />
               </button>
-              <button className="vp-btn" title="Efeitos sonoros"><Icon name="sound-effects" size={18} /></button>
               <div className="vp-share">
                 <button
                   className={mySharingStreamId ? "vp-btn is-danger is-on" : "vp-btn"}
@@ -2237,32 +2946,57 @@ export function App() {
                 {renderSharePopover()}
               </div>
               <button
-                className={myCameraStreamId ? "vp-btn is-on" : "vp-btn"}
-                onClick={toggleCamera}
-                title={myCameraStreamId ? "Desligar câmera" : "Ligar câmera"}
+                className={noiseSup ? "vp-btn is-on" : "vp-btn"}
+                onClick={toggleNoiseSuppression}
+                title={noiseSup ? "Supressão de ruído: ligada" : "Supressão de ruído: desligada"}
               >
-                <Icon name={myCameraStreamId ? "camera" : "camera-closed"} size={18} />
+                <Icon name={noiseSup ? "crisp-nois-cenaceling-on" : "crisp-off"} size={18} />
               </button>
+              <button className="vp-btn" title="Efeitos sonoros"><Icon name="sound-effects" size={18} /></button>
             </div>
           </div>
         )}
 
-        {/* ---- user bar ---- */}
-        <div className="userbar">
+        {/* ---- user bar with customizable banner ---- */}
+        <div
+          className="userbar"
+          style={{
+            background: getBannerPreset(bannerPreset).cssBackground,
+            backgroundSize: "cover",
+            backgroundPosition: "center",
+          }}
+        >
+          <div className="userbar__backdrop-overlay" />
           <div
             className="userbar__id"
-            onContextMenu={event => openMenu(event, memberMenuItems(currentUserId ?? ""))}
-            title="Clique com o botão direito para editar seu perfil / status"
+            onContextMenu={event => openMenu(event, [
+              { label: "Ver Meu Perfil", onClick: () => currentUserId && openProfile(currentUserId) },
+              ...memberMenuItems(currentUserId ?? ""),
+              { label: "Personalizar Banner de Perfil", onClick: () => { setSettingsInitialTab("account"); setSettingsOpen(true); } },
+            ])}
+            onClick={e => currentUserId && openProfile(currentUserId, e.currentTarget)}
+            title="Clique para ver seu perfil / personalizar"
           >
             <Avatar
               label={selfName}
-              size={32}
+              size={36}
               className={myStatus === "busy" ? "userbar__avatar is-busy" : "userbar__avatar"}
               imageUrl={currentUser?.avatar_url}
             />
             <div className="userbar__meta">
               <div className="userbar__name">{selfName}</div>
-              <div className="userbar__sub">{myStatus === "busy" ? "Ocupado" : (currentUser?.username ? `@${currentUser.username}` : "online")}</div>
+              <div className="userbar__sub">
+                {currentUserId && activities[currentUserId]?.[0] ? (
+                  <span style={{ color: "#23a55a", display: "flex", alignItems: "center", gap: "4px" }}>
+                    <MusicNoteIcon size={12} />
+                    <span>{activities[currentUserId][0].name}</span>
+                  </span>
+                ) : myStatus === "busy" ? (
+                  "Ocupado"
+                ) : (
+                  currentUser?.username ? `@${currentUser.username}` : "online"
+                )}
+              </div>
             </div>
           </div>
           <div className="userbar__btns">
@@ -2277,19 +3011,39 @@ export function App() {
             </button>
           </div>
         </div>
-       </div>
       </div>
+    </div>
 
       {/* ---- main column ---- */}
       <div className="workspace">
         <header className="topbar">
-          {activeChannel ? (
+          {navMode === "dm" && activeDmUserId ? (
+            (() => {
+              const dmMember = members.find(m => m.id === activeDmUserId);
+              const dmPresence = presence[activeDmUserId] ?? "offline";
+              return (
+                <>
+                  <div style={{ display: "flex", alignItems: "center", gap: "8px" }}>
+                    <span style={{ fontSize: "20px", fontWeight: "700", color: "var(--text-muted, #949ba4)" }}>@</span>
+                    <span className="topbar__title" style={dmMember?.name_color ? { color: dmMember.name_color } : undefined}>
+                      {dmMember?.display_name || "Membro"}
+                    </span>
+                    <span className={`presence-dot presence-dot--${dmPresence}`} style={{ width: "10px", height: "10px", margin: "0 4px" }} />
+                  </div>
+                  <span className="topbar__divider" />
+                  <span className="topbar__topic">
+                    {activities[activeDmUserId]?.[0]?.name ? `Jogando ${activities[activeDmUserId][0].name}` : `@${dmMember?.username || "membro"}`}
+                  </span>
+                </>
+              );
+            })()
+          ) : activeChannel ? (
             <>
               {activeChannel.kind === "voice"
                 ? <Icon name="voice-chat" size={24} className="topbar__icon" />
                 : <HashIcon size={24} className="topbar__icon" />}
               <span className="topbar__title">{activeChannel.name}</span>
-              {activeChannel.topic && (
+              {activeChannel.topic && !activeChannel.topic.startsWith("dm:") && (
                 <>
                   <span className="topbar__divider" />
                   <span className="topbar__topic">{activeChannel.topic}</span>
@@ -2297,7 +3051,7 @@ export function App() {
               )}
             </>
           ) : (
-            <span className="topbar__title">Selecione um canal</span>
+            <span className="topbar__title">Selecione uma conversa ou canal</span>
           )}
           <div className="topbar__actions">
             <button className="topbar__btn" title="Notificações"><Icon name="notifications" size={24} /></button>
@@ -2455,51 +3209,93 @@ export function App() {
                 const nameColor = authorMember?.name_color
                   || (isOwner ? "#f0b232" : `hsl(${hueFromString(displayName)} 62% 72%)`);
                 const time = new Date(message.created_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+                const mentionsMe = isUserMentioned(message.content, currentUserId, currentUser);
                 return (
                   <article
                     key={message.id}
                     className={
                       "msg msg--compact" +
                       (groupStart ? " is-group-start" : "") +
+                      (mentionsMe ? " is-mentioned" : "") +
                       (message.failed ? " is-failed" : message.pending ? " is-pending" : "")
                     }
                   >
                     <span className="msg__ts">{time}</span>
                     <div className="msg__content">
-                      <span className="msg__author" style={{ color: nameColor }}>{displayName}{message.author?.profile_tag && <small className="msg__tag">{message.author.profile_badge_url && <img src={message.author.profile_badge_url} alt="" />}{message.author.profile_tag}</small>}</span>
-                      <span className="msg__body">
-                        {renderText(message.content)}
-                        {message.pending && <span className="msg__status">enviando…</span>}
-                        {message.failed && (
-                          <span className="msg__status">
-                            falhou
-                            <button onClick={() => retryMessage(message)}>tentar de novo</button>
-                            <button onClick={() => cancelMessage(message)}>cancelar</button>
-                          </span>
+                      <span
+                        className="msg__author"
+                        style={{ color: nameColor, cursor: "pointer" }}
+                        onClick={e => authorId && openProfile(authorId, e.currentTarget)}
+                        title={`Ver perfil de ${displayName}`}
+                      >
+                        {displayName}
+                        {message.author?.profile_tag && (
+                          <small className="msg__tag">
+                            {message.author.profile_badge_url && <img src={message.author.profile_badge_url} alt="" />}
+                            {message.author.profile_tag}
+                          </small>
                         )}
                       </span>
+                      {message.content && message.content.trim() !== "[anexo]" && (
+                        <span className="msg__body">
+                          {renderText(message.content, currentUserId, currentUser, members)}
+                          {message.pending && <span className="msg__status">enviando…</span>}
+                          {message.failed && (
+                            <span className="msg__status">
+                              falhou
+                              <button onClick={() => retryMessage(message)}>tentar de novo</button>
+                              <button onClick={() => cancelMessage(message)}>cancelar</button>
+                            </span>
+                          )}
+                        </span>
+                      )}
+                      {(!message.content || message.content.trim() === "[anexo]") && (message.pending || message.failed) && (
+                        <span className="msg__body">
+                          {message.pending && <span className="msg__status">enviando…</span>}
+                          {message.failed && (
+                            <span className="msg__status">
+                              falhou
+                              <button onClick={() => retryMessage(message)}>tentar de novo</button>
+                              <button onClick={() => cancelMessage(message)}>cancelar</button>
+                            </span>
+                          )}
+                        </span>
+                      )}
                       {message.attachments?.map(attachment => {
                         const isImage = (attachment.content_type ?? "").startsWith("image/");
-                        // The native layer inlines image attachments as data:
-                        // URIs (NetworkClient.HydrateMediaUrlsAsync). Show a
-                        // thumbnail when we have one; otherwise fall back to a
-                        // download chip.
-                        const inlined = isImage && (attachment.url ?? "").startsWith("data:");
-                        return inlined ? (
-                          <button
-                            className="msg__image"
-                            key={attachment.id}
-                            title={attachment.filename}
-                            onClick={() => send("attachment.open", { attachment_id: attachment.id, filename: attachment.filename })}
-                          >
-                            <img
-                              src={attachment.url ?? ""}
-                              alt={attachment.filename}
-                              loading="lazy"
-                              onLoad={() => { if (atBottomRef.current) pinToBottom(); }}
-                            />
-                          </button>
-                        ) : (
+                        const isVideo = (attachment.content_type ?? "").startsWith("video/");
+                        const inlined = (attachment.url ?? "").startsWith("data:");
+                        if (isImage && inlined) {
+                          return (
+                            <button
+                              className="msg__image"
+                              key={attachment.id}
+                              title={attachment.filename}
+                              onClick={() => send("attachment.open", { attachment_id: attachment.id, filename: attachment.filename })}
+                            >
+                              <img
+                                src={attachment.url ?? ""}
+                                alt={attachment.filename}
+                                loading="lazy"
+                                onLoad={() => { if (atBottomRef.current) pinToBottom(); }}
+                              />
+                            </button>
+                          );
+                        }
+                        if (isVideo && inlined) {
+                          return (
+                            <div className="msg__video-wrap" key={attachment.id}>
+                              <video
+                                src={attachment.url ?? ""}
+                                controls
+                                preload="metadata"
+                                className="msg__video"
+                                onLoadedData={() => { if (atBottomRef.current) pinToBottom(); }}
+                              />
+                            </div>
+                          );
+                        }
+                        return (
                           <button
                             className="attach"
                             key={attachment.id}
@@ -2510,15 +3306,7 @@ export function App() {
                           </button>
                         );
                       })}
-                      {message.link_preview && (
-                        <a className="link-preview" href={message.link_preview.url} target="_blank" rel="noreferrer noopener">
-                          {message.link_preview.image_url && <img src={message.link_preview.image_url} alt="" />}
-                          <span className="link-preview__body">
-                            {message.link_preview.site_name && <small>{message.link_preview.site_name}</small>}
-                            <strong>{message.link_preview.title ?? message.link_preview.url}</strong>
-                          </span>
-                        </a>
-                      )}
+                      {message.link_preview && <LinkPreviewCard preview={message.link_preview} />}
                       {message.embeds?.map((embed, i) => <MessageEmbedCard key={i} embed={embed} />)}
                     </div>
                     {isOwn && !message.pending && !message.failed && (
@@ -2534,7 +3322,68 @@ export function App() {
             </div>
 
             {activeChannel && (
-              <form className="composer" onSubmit={submitMessage}>
+              <form className="composer" onSubmit={submitMessage} onPaste={handlePaste}>
+                <input
+                  type="file"
+                  ref={fileInputRef}
+                  onChange={e => {
+                    const file = e.target.files?.[0];
+                    if (file) uploadFileBlob(file);
+                  }}
+                  style={{ display: "none" }}
+                />
+                {mentionOpen && mentionList && (
+                  <div className="mention-menu">
+                    <div className="mention-menu__head">MEMBROS</div>
+                    {mentionList.members.map((member, index) => {
+                      const isActive = index === mentionIndex;
+                      return (
+                        <button
+                          type="button"
+                          key={member.id}
+                          className={isActive ? "mention-menu__item is-active" : "mention-menu__item"}
+                          onMouseEnter={() => setMentionSel(index)}
+                          onMouseDown={event => { event.preventDefault(); applyMention(member); }}
+                        >
+                          <Avatar
+                            label={member.display_name}
+                            size={24}
+                            className="mention-menu__av"
+                            imageUrl={member.avatar_url}
+                          />
+                          <span
+                            className="mention-menu__name"
+                            style={member.name_color ? { color: member.name_color } : undefined}
+                          >
+                            {member.display_name}
+                          </span>
+                          <span className="mention-menu__user">@{member.username}</span>
+                        </button>
+                      );
+                    })}
+                    {mentionList.specials.length > 0 && (
+                      <>
+                        <div className="mention-menu__head" style={{ marginTop: "6px" }}>ESPECIAIS</div>
+                        {mentionList.specials.map((spec, specIdx) => {
+                          const overallIdx = mentionList.members.length + specIdx;
+                          const isActive = overallIdx === mentionIndex;
+                          return (
+                            <button
+                              type="button"
+                              key={spec.id}
+                              className={isActive ? "mention-menu__item is-active" : "mention-menu__item"}
+                              onMouseEnter={() => setMentionSel(overallIdx)}
+                              onMouseDown={event => { event.preventDefault(); applyMention(spec); }}
+                            >
+                              <span className="mention-menu__special-tag">@{spec.name}</span>
+                              <span className="mention-menu__special-desc">{spec.desc}</span>
+                            </button>
+                          );
+                        })}
+                      </>
+                    )}
+                  </div>
+                )}
                 {slashOpen && (
                   <div className="slash-menu">
                     <div className="slash-menu__head">
@@ -2558,11 +3407,47 @@ export function App() {
                     ))}
                   </div>
                 )}
-                {attachmentIds.length > 0 && (
-                  <div className="composer__pills">{attachmentIds.length} anexo(s) pronto(s)</div>
+                {uploading && (
+                  <div className="composer__uploading-bar">
+                    <div className="composer__uploading-spinner" />
+                    {uploadingFile?.previewUrl && (
+                      <img src={uploadingFile.previewUrl} alt="" className="composer__uploading-thumb" />
+                    )}
+                    <div className="composer__uploading-info">
+                      <span className="composer__uploading-title">
+                        Enviando {uploadingFile?.type.startsWith("video/") ? "vídeo" : uploadingFile?.type.startsWith("image/") ? "imagem" : "arquivo"}...
+                      </span>
+                      <span className="composer__uploading-name">{uploadingFile?.name}</span>
+                    </div>
+                  </div>
+                )}
+                {readyAttachments.length > 0 && !uploading && (
+                  <div className="composer__ready-attachments">
+                    {readyAttachments.map(att => (
+                      <div key={att.id} className="composer__ready-pill">
+                        {att.previewUrl ? (
+                          <img src={att.previewUrl} alt="" className="composer__ready-thumb" />
+                        ) : (
+                          <Icon name="add-media" size={14} />
+                        )}
+                        <span className="composer__ready-name">{att.name}</span>
+                        <button
+                          type="button"
+                          className="composer__ready-remove"
+                          onClick={() => {
+                            setAttachmentIds(ids => ids.filter(id => id !== att.id));
+                            setReadyAttachments(atts => atts.filter(a => a.id !== att.id));
+                          }}
+                          title="Remover anexo"
+                        >
+                          ✕
+                        </button>
+                      </div>
+                    ))}
+                  </div>
                 )}
                 <div className="composer__box">
-                  <button type="button" className="composer__add" disabled={uploading} onClick={pickAttachment} title="Anexar">
+                  <button type="button" className="composer__add" disabled={uploading} onClick={pickAttachment} title="Anexar arquivo">
                     <Icon name="add-media" size={16} />
                   </button>
                   <input
@@ -2570,7 +3455,12 @@ export function App() {
                     value={content}
                     onChange={event => setContent(event.target.value)}
                     onKeyDown={onComposerKeyDown}
-                    placeholder={`Conversar em #${activeChannel.name}`}
+                    onPaste={handlePaste}
+                    placeholder={
+                      navMode === "dm" && activeDmUserId
+                        ? `Conversar em @${members.find(m => m.id === activeDmUserId)?.display_name || "membro"}`
+                        : `Conversar em #${activeChannel.name}`
+                    }
                     maxLength={4000}
                   />
                   <div className="composer__icons">
@@ -2586,34 +3476,135 @@ export function App() {
         )}
         </section>
 
-        {/* ---- member list ---- */}
+        {/* ---- member list or DM Profile Panel ---- */}
         {showMembers && !(inThisVoice && theater) && (
-          <aside className="members">
-            <button
-              className={shareActivity ? "members__share is-on" : "members__share"}
-              onClick={() => setShareActivity(value => !value)}
-              title={shareActivity
-                ? "Sua atividade (música/jogo) está visível para a comunidade"
-                : "Sua atividade não está sendo compartilhada"}
-            >
-              <Icon name="activities" size={14} />
-              <span>{shareActivity ? "Compartilhando atividade" : "Atividade oculta"}</span>
-            </button>
-            <ActivityPanel members={members} activities={activities} apiBaseUrl={apiBaseUrl} />
-            <MemberList
-              members={members}
-              presence={presence}
-              botNowPlaying={(() => {
-                const musicStream = streams.find(stream => stream.kind === "music")
-                  ?? Object.values(voiceRoomStreams).flat().find(stream => stream.kind === "music");
-                return musicStream ? (musicStream.label ?? "tocando") : null;
-              })()}
-              onMemberContextMenu={(event, member) => openMenu(event, memberMenuItems(member.id))}
-            />
-          </aside>
+          navMode === "dm" && activeDmUserId ? (
+            (() => {
+              const targetMember = members.find(m => m.id === activeDmUserId);
+              const targetPresence = presence[activeDmUserId] ?? "offline";
+              const banner = getBannerPreset(targetMember?.banner_preset);
+              return (
+                <aside className="dm-profile-sidebar">
+                  <div className="dm-profile-card">
+                    <div className="dm-profile-banner" style={{ background: banner.cssBackground }} />
+                    <div className="dm-profile-avatar-wrap">
+                      <Avatar label={targetMember?.display_name || ""} size={80} imageUrl={targetMember?.avatar_url} />
+                      <span className={`presence-dot presence-dot--lg presence-dot--${targetPresence}`} />
+                    </div>
+                    <div className="dm-profile-body">
+                      <h3 className="dm-profile-name" style={targetMember?.name_color ? { color: targetMember.name_color } : undefined}>
+                        {targetMember?.display_name}
+                      </h3>
+                      <div className="dm-profile-handle">@{targetMember?.username}</div>
+                      {targetMember?.pronouns && (
+                        <div className="dm-profile-pronouns">{targetMember.pronouns}</div>
+                      )}
+
+                      <div className="dm-profile-divider" />
+
+                      {targetMember?.bio && (
+                        <div className="dm-profile-section">
+                          <div className="dm-profile-section-title">SOBRE MIM</div>
+                          <div className="dm-profile-bio">{targetMember.bio}</div>
+                        </div>
+                      )}
+
+                      <div className="dm-profile-section">
+                        <div className="dm-profile-section-title">MEMBRO DESDE</div>
+                        <div className="dm-profile-date">
+                          {targetMember?.created_at
+                            ? new Date(targetMember.created_at).toLocaleDateString("pt-BR", { day: "numeric", month: "short", year: "numeric" })
+                            : "28 de ago. de 2026"}
+                        </div>
+                      </div>
+
+                      <button
+                        type="button"
+                        className="dm-profile-full-btn"
+                        onClick={e => openProfile(activeDmUserId, e.currentTarget)}
+                      >
+                        Ver Perfil Completo
+                      </button>
+                    </div>
+                  </div>
+                </aside>
+              );
+            })()
+          ) : (
+            <aside className="members">
+              <button
+                className={shareActivity ? "members__share is-on" : "members__share"}
+                onClick={() => setShareActivity(value => !value)}
+                title={shareActivity
+                  ? "Sua atividade (música/jogo) está visível para a comunidade"
+                  : "Sua atividade não está sendo compartilhada"}
+              >
+                <Icon name="activities" size={14} />
+                <span>{shareActivity ? "Compartilhando atividade" : "Atividade oculta"}</span>
+              </button>
+              <ActivityPanel members={members} activities={activities} apiBaseUrl={apiBaseUrl} />
+              <MemberList
+                members={members}
+                presence={presence}
+                currentUserId={currentUserId}
+                bannerPreset={bannerPreset}
+                botNowPlaying={(() => {
+                  const musicStream = streams.find(stream => stream.kind === "music")
+                    ?? Object.values(voiceRoomStreams).flat().find(stream => stream.kind === "music");
+                  return musicStream ? (musicStream.label ?? "tocando") : null;
+                })()}
+                onMemberClick={(member, e) => openProfile(member.id, e.currentTarget)}
+                onMemberContextMenu={(event, member) => openMenu(event, memberMenuItems(member.id))}
+              />
+            </aside>
+          )
         )}
         </div>
       </div>
+
+      {newDmModalOpen && (
+        <div className="new-dm-overlay" onClick={() => setNewDmModalOpen(false)}>
+          <div className="new-dm-card" onClick={e => e.stopPropagation()}>
+            <div className="new-dm-head">
+              <h3>Nova Mensagem Direta</h3>
+              <button type="button" className="new-dm-close" onClick={() => setNewDmModalOpen(false)}>✕</button>
+            </div>
+            <div className="new-dm-search-wrap">
+              <input
+                autoFocus
+                placeholder="Digite o nome de usuário ou exibição"
+                value={newDmSearch}
+                onChange={e => setNewDmSearch(e.target.value)}
+              />
+            </div>
+            <div className="new-dm-list scroll-thin">
+              {members
+                .filter(m => m.id !== currentUserId && (
+                  m.display_name.toLowerCase().includes(newDmSearch.toLowerCase()) ||
+                  m.username.toLowerCase().includes(newDmSearch.toLowerCase())
+                ))
+                .map(m => (
+                  <button
+                    key={m.id}
+                    type="button"
+                    className="new-dm-item"
+                    onClick={() => {
+                      openDmWithUser(m.id);
+                      setNewDmModalOpen(false);
+                      setNewDmSearch("");
+                    }}
+                  >
+                    <Avatar label={m.display_name} size={36} imageUrl={m.avatar_url} />
+                    <div className="new-dm-item-info">
+                      <span className="new-dm-item-name" style={m.name_color ? { color: m.name_color } : undefined}>{m.display_name}</span>
+                      <span className="new-dm-item-user">@{m.username}</span>
+                    </div>
+                  </button>
+                ))}
+            </div>
+          </div>
+        </div>
+      )}
 
       {pickerOpen && (
         <ScreenPicker
@@ -2634,37 +3625,75 @@ function MemberList({
   members,
   presence,
   botNowPlaying,
+  onMemberClick,
   onMemberContextMenu,
+  currentUserId,
+  bannerPreset,
 }: {
   members: Member[];
   presence: Record<string, "online" | "busy" | "offline">;
   // Non-null when Tupi Música is currently playing (the track label); the bot
   // row itself is always shown — it's a permanent fixture like a Discord bot.
   botNowPlaying: string | null;
+  onMemberClick?: (member: Member, e: ReactMouseEvent<HTMLElement>) => void;
   onMemberContextMenu: (event: ReactMouseEvent, member: Member) => void;
+  currentUserId: string | null;
+  bannerPreset: string;
 }) {
   const online = members.filter(member => presence[member.id] === "online" || presence[member.id] === "busy");
   const offline = members.filter(member => !presence[member.id] || presence[member.id] === "offline");
-  const row = (member: Member, isOffline: boolean) => (
-    <div
-      key={member.id}
-      className={
-        "member" +
-        (isOffline ? " is-offline" : "") +
-        (presence[member.id] === "busy" ? " is-busy" : "") +
-        (member.role === "owner" ? " is-owner" : "")
-      }
-      onContextMenu={event => onMemberContextMenu(event, member)}
-    >
-      <Avatar label={member.display_name} size={32} className="member__avatar" imageUrl={member.avatar_url} />
-      <span className="member__name" style={member.name_color ? { color: member.name_color } : undefined}>{member.display_name}{member.profile_tag && <small className="member__tag">{member.profile_badge_url && <img src={member.profile_badge_url} alt="" />}{member.profile_tag}</small>}</span>
-      {member.role === "owner" && <CrownIcon className="member__crown" />}
-    </div>
-  );
+  const row = (member: Member, isOffline: boolean) => {
+    const memberBannerId = member.id === currentUserId ? bannerPreset : (member.banner_preset ?? null);
+    const banner = memberBannerId ? getBannerPreset(memberBannerId) : null;
+    return (
+      <div
+        key={member.id}
+        className={
+          "member" +
+          (isOffline ? " is-offline" : "") +
+          (presence[member.id] === "busy" ? " is-busy" : "") +
+          (member.role === "owner" ? " is-owner" : "") +
+          (banner ? " has-banner" : "")
+        }
+        style={banner ? ({ "--banner-accent": banner.accentColor } as React.CSSProperties) : undefined}
+        onClick={e => onMemberClick?.(member, e)}
+        onContextMenu={event => onMemberContextMenu(event, member)}
+        title={`Ver perfil de ${member.display_name}`}
+      >
+        {banner && (
+          <div
+            className="member__banner-bg"
+            style={{ background: banner.previewGradient }}
+          />
+        )}
+        <Avatar label={member.display_name} size={32} className="member__avatar" imageUrl={member.avatar_url} />
+        <span className="member__name" style={member.name_color ? { color: member.name_color } : undefined}>
+          {member.display_name}
+          {member.profile_tag && <small className="member__tag">{member.profile_badge_url && <img src={member.profile_badge_url} alt="" />}{member.profile_tag}</small>}
+        </span>
+        {member.role === "owner" && <CrownIcon className="member__crown" />}
+      </div>
+    );
+  };
   return (
     <>
       <div className="members__group">Online — {online.length + 1}</div>
-      <div className="member member--bot">
+      <div
+        className="member member--bot"
+        onClick={e => onMemberClick?.({
+          id: MUSIC_BOT_ID,
+          display_name: "Tupi Música",
+          username: "tupi-musica",
+          role: "bot",
+          profile_tag: "BOT",
+          name_color: "#5865f2",
+          banner_preset: "synthwave",
+          bio: "Bot de música oficial do Tupi. Toque qualquer música ou rádio usando os controles de voz.",
+          pronouns: "ele/bot",
+        }, e)}
+        style={{ cursor: "pointer" }}
+        title="Ver perfil de Tupi Música"
+      >
         <Avatar label="Tupi Música" size={32} className="member__avatar" imageUrl="/tupi-mascot.png" />
         <div className="member__lines">
           <span className="member__name">Tupi Música<small className="member__tag">BOT</small></span>

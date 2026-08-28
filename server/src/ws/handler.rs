@@ -252,7 +252,10 @@ fn music_bot_user() -> db::User {
         id: MUSIC_BOT_ID, username: "tupi-musica".into(), display_name: "Tupi Música".into(),
         password_hash: String::new(), avatar_color: Some("#5865f2".into()), avatar_storage_path: None,
         avatar_content_type: None, profile_tag: Some("BOT".into()), profile_badge_storage_path: None,
-        profile_badge_content_type: None, name_color: Some("#5865f2".into()), created_at: chrono::Utc::now(),
+        profile_badge_content_type: None, name_color: Some("#5865f2".into()),
+        bio: Some("Bot de música oficial do Tupi. Toque qualquer música ou rádio usando os controles de voz.".into()),
+        banner_preset: Some("synthwave".into()), pronouns: Some("ele/bot".into()),
+        created_at: chrono::Utc::now(),
     }
 }
 
@@ -494,6 +497,33 @@ async fn dispatch(state: &AppState, user_id: Uuid, text: &str, joined_calls: &mu
             let status = if data.status == "busy" { "busy" } else { "online" };
             state.hub.set_status(user_id, status).await;
             broadcast_presence_update(state, user_id, status).await;
+        }
+        "dm.open" => {
+            #[derive(serde::Deserialize)]
+            struct DmOpenData {
+                target_user_id: Uuid,
+                #[serde(default)]
+                req_id: Option<String>,
+            }
+            let data: DmOpenData = parse_or_reject!(DmOpenData);
+            if user_id != data.target_user_id {
+                if let Ok(Some((community_id,))) = sqlx::query_as::<_, (Uuid,)>("SELECT community_id FROM community_members WHERE user_id = $1 LIMIT 1").bind(user_id).fetch_optional(&state.pool).await {
+                    let topic = if user_id < data.target_user_id {
+                        format!("dm:{}:{}", user_id, data.target_user_id)
+                    } else {
+                        format!("dm:{}:{}", data.target_user_id, user_id)
+                    };
+                    let existing = sqlx::query_as::<_, crate::db::Channel>("SELECT * FROM channels WHERE community_id = $1 AND topic = $2 LIMIT 1").bind(community_id).bind(&topic).fetch_optional(&state.pool).await;
+                    let channel = match existing {
+                        Ok(Some(c)) => Some(c),
+                        Ok(None) => sqlx::query_as::<_, crate::db::Channel>("INSERT INTO channels (community_id, category_id, name, kind, topic, position) VALUES ($1, NULL, 'dm', 'text', $2, 9999) RETURNING *").bind(community_id).bind(&topic).fetch_one(&state.pool).await.ok(),
+                        Err(_) => None,
+                    };
+                    if let Some(ch) = channel {
+                        state.hub.send_to(user_id, OutboundEnvelope::new("dm.opened", serde_json::json!({ "channel": ch, "target_user_id": data.target_user_id, "req_id": data.req_id }))).await;
+                    }
+                }
+            }
         }
         "chat.typing" => {
             let data: ChatTyping = parse_or_reject!(ChatTyping);
@@ -750,7 +780,7 @@ async fn handle_chat_create(state: &AppState, user_id: Uuid, data: ChatMessageCr
                             id: m.id,
                             channel_id: m.channel_id,
                             author_id: m.author_id,
-                            content: m.content,
+                            content: m.content.clone(),
                             created_at: m.created_at,
                             edited_at: m.edited_at,
                             attachment_ids: data.attachment_ids,
@@ -758,6 +788,13 @@ async fn handle_chat_create(state: &AppState, user_id: Uuid, data: ChatMessageCr
                         in_reply_to: data.req_id,
                     },
                 )).await;
+            crate::link_preview::spawn_unfurl_task(
+                state.clone(),
+                m.id,
+                m.channel_id,
+                channel.community_id,
+                m.content,
+            );
         }
         Err(e) => {
             tracing::error!(error = %e, "failed to persist chat message");
@@ -800,11 +837,18 @@ async fn handle_chat_edit(state: &AppState, user_id: Uuid, data: ChatMessageEdit
                     "chat.message.edited",
                     ChatMessageEdited {
                         message_id: m.id,
-                        content: m.content,
+                        content: m.content.clone(),
                         edited_at: m.edited_at,
                         in_reply_to: data.req_id,
                     },
                 )).await;
+                crate::link_preview::spawn_unfurl_task(
+                    state.clone(),
+                    m.id,
+                    m.channel_id,
+                    channel.community_id,
+                    m.content,
+                );
             }
         }
         Ok(None) => {

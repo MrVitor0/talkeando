@@ -46,6 +46,7 @@ pub struct HistoryMessage {
 pub struct LinkPreview {
     pub url: String,
     pub title: Option<String>,
+    pub description: Option<String>,
     pub site_name: Option<String>,
     pub image_url: Option<String>,
 }
@@ -180,12 +181,12 @@ pub async fn history(
     .await?;
 
     let preview_rows = sqlx::query_as::<_, PreviewRow>(
-        "SELECT message_id, url, title, site_name, CASE WHEN image_storage_path IS NULL THEN NULL ELSE '/api/messages/' || message_id::text || '/preview-image' END AS image_url \
+        "SELECT message_id, url, title, description, site_name, CASE WHEN image_storage_path IS NOT NULL THEN '/api/messages/' || message_id::text || '/preview-image' ELSE image_url END AS image_url \
          FROM message_link_previews WHERE message_id = ANY($1)",
     ).bind(&message_ids).fetch_all(&state.pool).await?;
     let previews_by_message: std::collections::HashMap<Uuid, LinkPreview> = preview_rows.into_iter().map(|preview| (
         preview.message_id,
-        LinkPreview { url: preview.url, title: preview.title, site_name: preview.site_name, image_url: preview.image_url },
+        LinkPreview { url: preview.url, title: preview.title, description: preview.description, site_name: preview.site_name, image_url: preview.image_url },
     )).collect();
 
     let embed_rows = sqlx::query_as::<_, EmbedRow>(
@@ -239,6 +240,10 @@ pub async fn history(
             profile_tag: row.profile_tag,
             profile_badge_url: row.profile_badge_url,
             name_color: row.name_color,
+            bio: None,
+            banner_preset: None,
+            pronouns: None,
+            created_at: None,
         },
         content: row.content,
         created_at: row.created_at,
@@ -265,6 +270,7 @@ struct PreviewRow {
     message_id: Uuid,
     url: String,
     title: Option<String>,
+    description: Option<String>,
     site_name: Option<String>,
     image_url: Option<String>,
 }

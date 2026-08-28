@@ -352,7 +352,7 @@ async fn channel_structure(
     .fetch_all(&state.pool)
     .await?;
     let channels = sqlx::query_as::<_, Channel>(
-        "SELECT * FROM channels WHERE community_id = $1 ORDER BY position, id",
+        "SELECT * FROM channels WHERE community_id = $1 AND (topic IS NULL OR NOT topic LIKE 'dm:%') ORDER BY position, id",
     )
     .bind(community_id)
     .fetch_all(&state.pool)
@@ -418,4 +418,69 @@ fn validate_name(name: &str, field: &str) -> AppResult<()> {
         return Err(AppError::Validation(format!("{field} must be 1..=100 characters")));
     }
     Ok(())
+}
+
+/// Open or retrieve a 1:1 Direct Message channel with a member.
+pub async fn open_dm(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    Path(target_user_id): Path<Uuid>,
+) -> AppResult<Json<Channel>> {
+    if auth.user.id == target_user_id {
+        return Err(AppError::Validation("cannot open DM with yourself".into()));
+    }
+
+    let community_id: Option<(Uuid,)> = sqlx::query_as(
+        "SELECT community_id FROM community_members WHERE user_id = $1 ORDER BY joined_at LIMIT 1",
+    )
+    .bind(auth.user.id)
+    .fetch_optional(&state.pool)
+    .await?;
+
+    let Some((community_id,)) = community_id else {
+        return Err(AppError::Forbidden);
+    };
+
+    let target_exists: Option<(Uuid,)> = sqlx::query_as(
+        "SELECT id FROM users WHERE id = $1",
+    )
+    .bind(target_user_id)
+    .fetch_optional(&state.pool)
+    .await?;
+
+    if target_exists.is_none() {
+        return Err(AppError::NotFound);
+    }
+
+    let topic = if auth.user.id < target_user_id {
+        format!("dm:{}:{}", auth.user.id, target_user_id)
+    } else {
+        format!("dm:{}:{}", target_user_id, auth.user.id)
+    };
+
+    // Find existing DM channel
+    let existing = sqlx::query_as::<_, Channel>(
+        "SELECT * FROM channels WHERE community_id = $1 AND topic = $2 LIMIT 1",
+    )
+    .bind(community_id)
+    .bind(&topic)
+    .fetch_optional(&state.pool)
+    .await?;
+
+    if let Some(channel) = existing {
+        return Ok(Json(channel));
+    }
+
+    // Create DM channel
+    let channel = sqlx::query_as::<_, Channel>(
+        "INSERT INTO channels (community_id, category_id, name, kind, topic, position) \
+         VALUES ($1, NULL, 'dm', 'text', $2, 9999) \
+         RETURNING *",
+    )
+    .bind(community_id)
+    .bind(&topic)
+    .fetch_one(&state.pool)
+    .await?;
+
+    Ok(Json(channel))
 }

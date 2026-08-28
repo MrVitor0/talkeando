@@ -66,6 +66,10 @@ let currentChannelId: string | null = null;
 // hold peer connections purely as a *spectator* of someone's screen share in a
 // channel it never joined — see spectate()/stopSpectate().
 let joinedCall = false;
+// State updates cannot be signalled until call.join has been sent. Microphone
+// capture is asynchronous, so a PTT press during that window is kept locally
+// and folded into the eventual join payload instead of racing the server.
+let callStateSignalingReady = false;
 // channelId + streamId for each owner we are spectating (hover preview from
 // the sidebar), so stopSpectate can unsubscribe and tear the peer down.
 const spectatedStreams = new Map<string, { channelId: string; streamId: string }>();
@@ -660,6 +664,7 @@ export function ensureChannel(channelId: string) {
 export async function joinCall(channelId: string, muted: boolean, deafened: boolean) {
   currentChannelId = channelId;
   joinedCall = true;
+  callStateSignalingReady = false;
   localMuted = muted;
   localDeafened = deafened;
 
@@ -689,13 +694,20 @@ export async function joinCall(channelId: string, muted: boolean, deafened: bool
     localStream = null;
     rawMic = null;
   }
-  send("call.join", { channel_id: channelId, req_id: crypto.randomUUID(), muted, deafened });
+  send("call.join", {
+    channel_id: channelId,
+    req_id: crypto.randomUUID(),
+    muted: localMuted,
+    deafened: localDeafened,
+  });
+  callStateSignalingReady = true;
   startConnQualitySampling();
   startSpeakingSampling();
 }
 
 export async function leaveCall() {
   if (!currentChannelId) return;
+  callStateSignalingReady = false;
   stopConnQualitySampling();
   stopSpeakingSampling();
   send("call.leave", { channel_id: currentChannelId, req_id: crypto.randomUUID() });
@@ -759,9 +771,24 @@ export function isNoiseSuppressionOn() {
 }
 
 function applyLocalAudioState() {
-  if (!localStream) return;
   const shouldSend = !localMuted && !localDeafened;
-  for (const track of localStream.getAudioTracks()) track.enabled = shouldSend;
+  if (localStream) {
+    for (const track of localStream.getAudioTracks()) track.enabled = shouldSend;
+  }
+  if (rawMic) {
+    for (const track of rawMic.getAudioTracks()) track.enabled = shouldSend;
+  }
+  for (const pc of peers.values()) {
+    for (const sender of pc.getSenders()) {
+      if (sender.track?.kind === "audio") {
+        sender.track.enabled = shouldSend;
+      }
+    }
+  }
+  if (shouldSend) {
+    ensureSpeakingAudioCtx();
+    noiseSuppression.initialize();
+  }
 }
 
 export function setLocalAudioState(muted: boolean, deafened: boolean) {
@@ -769,7 +796,9 @@ export function setLocalAudioState(muted: boolean, deafened: boolean) {
   localDeafened = deafened;
   applyLocalAudioState();
   applyRemoteMuting();
-  if (currentChannelId) send("call.state.update", { channel_id: currentChannelId, muted, deafened, req_id: crypto.randomUUID() });
+  if (currentChannelId && callStateSignalingReady) {
+    send("call.state.update", { channel_id: currentChannelId, muted, deafened, req_id: crypto.randomUUID() });
+  }
 }
 
 function applyRemoteMuting() {
