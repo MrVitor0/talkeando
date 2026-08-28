@@ -133,10 +133,9 @@ async function startPlayback(query) {
   const ytArgs = [
     "--no-progress", "--no-warnings",
     "--geo-bypass",
-    "--extractor-args", "youtube:player_client=android,ios,web",
     "--js-runtimes", "deno",
     "--remote-components", "ejs:github",
-    "-f", "bestaudio/best", "-o", "-",
+    "-f", "251/140/bestaudio/best", "-o", "-",
   ];
   if (cookies) ytArgs.push("--cookies", cookies);
   ytArgs.push(...sources);
