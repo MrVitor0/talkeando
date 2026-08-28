@@ -212,6 +212,9 @@ async function createPeer(peerUserId: string): Promise<RTCPeerConnection> {
         audioEl.autoplay = true;
         audioEl.style.display = "none";
         document.body.appendChild(audioEl);
+        if (audioOutputDeviceId && "setSinkId" in audioEl) {
+          try { (audioEl as any).setSinkId(audioOutputDeviceId); } catch { }
+        }
         remoteAudioEls.set(peerUserId, audioEl);
       }
       audioEl.muted = !joinedCall || localDeafened || (peerAudioMuted.get(peerUserId) ?? false);
@@ -671,9 +674,7 @@ export async function joinCall(channelId: string, muted: boolean, deafened: bool
     // dependency — the baseline before any ML denoiser.
     rawMic = await navigator.mediaDevices.getUserMedia({
       audio: {
-        // Chromium's own APM: echo cancellation + AGC still help; leave its
-        // noise suppression on too (RNNoise runs after it and they stack
-        // fine — this is the pre-ML baseline).
+        deviceId: audioInputDeviceId ? { exact: audioInputDeviceId } : undefined,
         noiseSuppression: true,
         echoCancellation: true,
         autoGainControl: true,
@@ -1176,4 +1177,103 @@ export function getLocalScreenStream(): MediaStream | null {
 
 export function initializeNoiseSuppression() {
   noiseSuppression.initialize();
+}
+
+// --- Device Management --------------------------------------------------
+let audioInputDeviceId: string | null = (() => {
+  try { return localStorage.getItem("tk.audioInputDeviceId"); } catch { return null; }
+})();
+let audioOutputDeviceId: string | null = (() => {
+  try { return localStorage.getItem("tk.audioOutputDeviceId"); } catch { return null; }
+})();
+let inputVolume: number = (() => {
+  try { const v = localStorage.getItem("tk.inputVolume"); return v ? parseFloat(v) : 1; } catch { return 1; }
+})();
+let outputVolume: number = (() => {
+  try { const v = localStorage.getItem("tk.outputVolume"); return v ? parseFloat(v) : 1; } catch { return 1; }
+})();
+
+export function getAudioInputDeviceId() { return audioInputDeviceId; }
+export function getAudioOutputDeviceId() { return audioOutputDeviceId; }
+export function getInputVolume() { return inputVolume; }
+export function getOutputVolume() { return outputVolume; }
+
+export async function setAudioInputDevice(deviceId: string): Promise<void> {
+  audioInputDeviceId = deviceId;
+  try { localStorage.setItem("tk.audioInputDeviceId", deviceId); } catch {}
+  if (joinedCall && rawMic) {
+    try {
+      const nextMic = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          deviceId: deviceId ? { exact: deviceId } : undefined,
+          noiseSuppression: true,
+          echoCancellation: true,
+          autoGainControl: true,
+          channelCount: 1,
+        }
+      });
+      const oldRaw = rawMic;
+      rawMic = nextMic;
+      if (oldRaw) for (const track of oldRaw.getTracks()) track.stop();
+      const oldLocal = localStream;
+      localStream = await noiseSuppression.processMic(rawMic, noiseSuppressionOn);
+      if (oldLocal) for (const track of oldLocal.getTracks()) track.stop();
+      applyLocalAudioState();
+      const newTrack = localStream.getAudioTracks()[0];
+      if (newTrack) {
+        for (const pc of peers.values()) {
+          const sender = pc.getSenders().find(s => s.track?.kind === "audio");
+          if (sender) void sender.replaceTrack(newTrack);
+        }
+      }
+    } catch (e) {
+      console.error("[rtc] switch audio input device failed", e);
+    }
+  }
+}
+
+export async function setAudioOutputDevice(deviceId: string): Promise<void> {
+  audioOutputDeviceId = deviceId;
+  try { localStorage.setItem("tk.audioOutputDeviceId", deviceId); } catch {}
+  for (const audioEl of remoteAudioEls.values()) {
+    if ("setSinkId" in audioEl && typeof (audioEl as any).setSinkId === "function") {
+      try { await (audioEl as any).setSinkId(deviceId); } catch (e) { console.warn("[rtc] setSinkId failed", e); }
+    }
+  }
+}
+
+export function setInputVolumeLevel(volume: number) {
+  inputVolume = Math.max(0, Math.min(2, volume));
+  try { localStorage.setItem("tk.inputVolume", inputVolume.toString()); } catch {}
+}
+
+export function setOutputVolumeLevel(volume: number) {
+  outputVolume = Math.max(0, Math.min(2, volume));
+  try { localStorage.setItem("tk.outputVolume", outputVolume.toString()); } catch {}
+  for (const [peerUserId, audioEl] of remoteAudioEls) {
+    const isMuted = !joinedCall || localDeafened || (peerAudioMuted.get(peerUserId) ?? false);
+    const peerVol = peerVolume.get(peerUserId) ?? 1;
+    const combined = peerVol * outputVolume;
+    audioEl.volume = isMuted ? 0 : Math.min(1, Math.max(0, combined));
+    const graph = peerAudioGraphs.get(peerUserId);
+    if (graph) graph.gain.gain.value = isMuted ? 0 : Math.max(0, combined - 1);
+  }
+}
+
+export async function listAllMediaDevices(): Promise<{
+  audioInputs: MediaDeviceInfo[];
+  audioOutputs: MediaDeviceInfo[];
+  videoInputs: MediaDeviceInfo[];
+}> {
+  try {
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    return {
+      audioInputs: devices.filter(d => d.kind === "audioinput"),
+      audioOutputs: devices.filter(d => d.kind === "audiooutput"),
+      videoInputs: devices.filter(d => d.kind === "videoinput"),
+    };
+  } catch (e) {
+    console.error("[rtc] listAllMediaDevices failed", e);
+    return { audioInputs: [], audioOutputs: [], videoInputs: [] };
+  }
 }

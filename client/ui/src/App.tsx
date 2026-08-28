@@ -5,6 +5,7 @@ import { playSound, setSoundsMuted } from "./sounds";
 import { Icon, IconName } from "./Icon";
 import { HashIcon, SearchIcon, PencilIcon, TrashIcon, CrownIcon, FullscreenIcon, ContractIcon, PipIcon, DotsIcon, TheaterIcon } from "./Glyphs";
 import { ScreenPicker, QualityControls, CaptureSource, ShareOptions } from "./ScreenPicker";
+import { SettingsModal } from "./SettingsModal";
 import logoUrl from "../icons/logo.webp";
 
 type Channel = { id: string; name: string; kind: "text" | "voice"; topic?: string | null };
@@ -797,6 +798,7 @@ export function App() {
   const [updateProgress, setUpdateProgress] = useState<number | null>(null);
   const [updateReady, setUpdateReady] = useState(false);
   const [updateDismissed, setUpdateDismissed] = useState(false);
+  const [settingsOpen, setSettingsOpen] = useState(false);
   // `historyLoading` now means only "show the skeleton" — it is true just on
   // the *first* visit to a text channel this session. Re-entering a channel
   // we already hydrated restores its messages from `historyCacheRef`
@@ -1042,6 +1044,49 @@ export function App() {
       window.removeEventListener("click", resumeAudio);
     };
   }, []);
+
+  // Global Push-to-Talk (PTT) / Toggle Keyboard Listener
+  useEffect(() => {
+    let isPttActive = false;
+
+    const isInputFocused = () => {
+      const tag = document.activeElement?.tagName?.toLowerCase();
+      return tag === "input" || tag === "textarea" || (document.activeElement as HTMLElement)?.isContentEditable;
+    };
+
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (isInputFocused() || e.repeat) return;
+      const mode = (localStorage.getItem("tk.inputMode") as string) || "voice_activity";
+      const key = localStorage.getItem("tk.pttKey") || "KeyV";
+      if (mode === "push_to_talk" && e.code === key) {
+        if (!isPttActive) {
+          isPttActive = true;
+          updateAudioState(false, deafened, true);
+        }
+      } else if (mode === "toggle" && e.code === key) {
+        updateAudioState(!muted, deafened, true);
+      }
+    };
+
+    const handleKeyUp = (e: KeyboardEvent) => {
+      if (isInputFocused()) return;
+      const mode = (localStorage.getItem("tk.inputMode") as string) || "voice_activity";
+      const key = localStorage.getItem("tk.pttKey") || "KeyV";
+      if (mode === "push_to_talk" && e.code === key) {
+        if (isPttActive) {
+          isPttActive = false;
+          updateAudioState(true, deafened, true);
+        }
+      }
+    };
+
+    window.addEventListener("keydown", handleKeyDown);
+    window.addEventListener("keyup", handleKeyUp);
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+      window.removeEventListener("keyup", handleKeyUp);
+    };
+  }, [muted, deafened]);
 
   // Safety net: if the native host never answers session.restore (dead bridge,
   // offline), stop showing the splash after a few seconds and fall through to
@@ -1336,7 +1381,7 @@ export function App() {
       ?? textChannels[0];
     if (atrium) chooseChannel(atrium);
   }
-  function updateAudioState(nextMuted: boolean, nextDeafened: boolean) {
+  function updateAudioState(nextMuted: boolean, nextDeafened: boolean, silent: boolean = false) {
     const deafenChanged = nextDeafened !== deafened;
     const muteChanged = nextMuted !== muted;
     // Deafen implies mic muted: on the way into deafen, remember the mic
@@ -1345,16 +1390,18 @@ export function App() {
     else if (!nextDeafened && deafened) { nextMuted = preDeafenMutedRef.current; }
     // A headphone action can also mute/restore the microphone. Play one sound
     // for the action the user actually clicked, rather than both at once.
-    if (deafenChanged) {
-      if (!nextDeafened) {
-        setSoundsMuted(false);
+    if (!silent) {
+      if (deafenChanged) {
+        if (!nextDeafened) {
+          setSoundsMuted(false);
+        }
+        playSound(nextDeafened ? "headphoneMuted" : "headphoneUnmuted");
+        if (nextDeafened) {
+          setSoundsMuted(true);
+        }
       }
-      playSound(nextDeafened ? "headphoneMuted" : "headphoneUnmuted");
-      if (nextDeafened) {
-        setSoundsMuted(true);
-      }
+      else if (muteChanged) playSound(nextMuted ? "micMuted" : "micUnmuted");
     }
-    else if (muteChanged) playSound(nextMuted ? "micMuted" : "micUnmuted");
     setMuted(nextMuted); setDeafened(nextDeafened);
     if (call) rtc.setLocalAudioState(nextMuted, nextDeafened);
   }
@@ -1829,6 +1876,16 @@ export function App() {
   return (
     <main className="app" onContextMenu={event => event.preventDefault()}>
       {menu && <ContextMenu {...menu} onClose={() => setMenu(null)} />}
+      {settingsOpen && (
+        <SettingsModal
+          currentUser={currentUser}
+          onClose={() => setSettingsOpen(false)}
+          onLogout={() => {
+            setSettingsOpen(false);
+            send("auth.session.clear");
+          }}
+        />
+      )}
       {updateInfo && !updateDismissed && (
         <div className="update-banner">
           <div className="update-banner__content">
@@ -2161,7 +2218,7 @@ export function App() {
             <button className={deafened ? "userbar__btn is-on" : "userbar__btn"} onClick={() => updateAudioState(muted, !deafened)} title={deafened ? "Ativar áudio" : "Desativar áudio"}>
               <Icon name={deafened ? "headphone-muted" : "headphone"} size={20} />
             </button>
-            <button className="userbar__btn" onClick={() => send("auth.session.clear")} title="Sair">
+            <button className="userbar__btn" onClick={() => setSettingsOpen(true)} title="Configurações de Usuário">
               <Icon name="config" size={20} />
             </button>
           </div>

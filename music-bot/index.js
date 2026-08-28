@@ -141,7 +141,7 @@ async function startPlayback(query) {
   if (cookies) ytArgs.push("--cookies", cookies);
   ytArgs.push(...sources);
   const yt = spawn("yt-dlp", ytArgs, { stdio: ["ignore", "pipe", "pipe"] });
-  const ffmpeg = spawn("ffmpeg", ["-hide_banner", "-loglevel", "error", "-i", "pipe:0", "-f", "s16le", "-ar", "48000", "-ac", "2", "pipe:1"], { stdio: ["pipe", "pipe", "pipe"] });
+  const ffmpeg = spawn("ffmpeg", ["-hide_banner", "-loglevel", "error", "-re", "-i", "pipe:0", "-f", "s16le", "-ar", "48000", "-ac", "2", "pipe:1"], { stdio: ["pipe", "pipe", "pipe"] });
   yt.stdout.pipe(ffmpeg.stdin);
   // Surface both toolchains' errors — without this a blocked download or a
   // broken stream just produces silence with no explanation.
@@ -152,17 +152,30 @@ async function startPlayback(query) {
   current = { yt, ffmpeg, track, audio, label: query };
   idleSince = 0;
   let bytesOut = 0;
+  let pcmBuffer = Buffer.alloc(0);
+  const FRAME_SIZE_BYTES = 1920; // 10ms of 48kHz 16-bit stereo (480 frames * 2 channels * 2 bytes)
+  const SAMPLES_PER_CHUNK = 960;  // 480 frames * 2 channels
+
   ffmpeg.stdout.on("data", chunk => {
     if (bytesOut === 0) log(`first PCM chunk from ffmpeg (${chunk.length} bytes) — audio pipeline is producing sound`);
     bytesOut += chunk.length;
     if (paused || !current) return;
-    const frames = Math.floor(chunk.length / 4); if (!frames) return;
-    // Copy into a fresh, offset-0 buffer so the Int16 view is always aligned
-    // and the pooled stream buffer can't be recycled under us.
-    const owned = Buffer.allocUnsafe(frames * 4);
-    chunk.copy(owned, 0, 0, frames * 4);
-    const samples = new Int16Array(owned.buffer, owned.byteOffset, frames * 2);
-    audio.onData({ samples, sampleRate: 48000, bitsPerSample: 16, channelCount: 2, numberOfFrames: frames });
+
+    pcmBuffer = Buffer.concat([pcmBuffer, chunk]);
+    while (pcmBuffer.length >= FRAME_SIZE_BYTES) {
+      const owned = Buffer.allocUnsafe(FRAME_SIZE_BYTES);
+      pcmBuffer.copy(owned, 0, 0, FRAME_SIZE_BYTES);
+      pcmBuffer = pcmBuffer.slice(FRAME_SIZE_BYTES);
+
+      const samples = new Int16Array(owned.buffer, owned.byteOffset, SAMPLES_PER_CHUNK);
+      audio.onData({
+        samples,
+        sampleRate: 48000,
+        bitsPerSample: 16,
+        channelCount: 2,
+        numberOfFrames: 480,
+      });
+    }
   });
   // Track (or playlist) finished: drop the stream so "TOCANDO" clears, and
   // start the idle countdown — the watchdog leaves the channel if nothing
