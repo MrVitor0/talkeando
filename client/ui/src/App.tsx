@@ -869,6 +869,11 @@ export function App() {
   const [attachmentIds, setAttachmentIds] = useState<string[]>([]);
   const [readyAttachments, setReadyAttachments] = useState<Array<{ id: string; name: string; previewUrl?: string | null; type: string }>>([]);
   const [uploadingFile, setUploadingFile] = useState<{ name: string; previewUrl?: string | null; type: string } | null>(null);
+  const uploadingFileRef = useRef<{ name: string; previewUrl?: string | null; type: string } | null>(null);
+  uploadingFileRef.current = uploadingFile;
+  const pendingUploadPreviewsRef = useRef<Map<string, string>>(new Map());
+  const [isDraggingFiles, setIsDraggingFiles] = useState(false);
+  const dragCounterRef = useRef(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
   // Slash-command palette: highlighted row + the content value the user last
   // pressed Esc on (so it stays closed without wiping what they typed).
@@ -1337,11 +1342,16 @@ export function App() {
       if (event.op === "screen.sources") { setSources(event.data.sources ?? []); setSourcesLoading(false); }
       if (event.op === "attachment.uploaded") {
         const att = event.data;
+        const isImage = (att.content_type ?? "").startsWith("image/");
+        let preview = (att.url && (att.url.startsWith("data:") || att.url.startsWith("blob:") || att.url.startsWith("http"))) ? att.url : null;
+        if (isImage && !preview) {
+          preview = (att.filename && pendingUploadPreviewsRef.current.get(att.filename)) || uploadingFileRef.current?.previewUrl || null;
+        }
         setAttachmentIds(current => [...current, att.id]);
         setReadyAttachments(current => [...current, {
           id: att.id,
           name: att.filename || "anexo",
-          previewUrl: (att.content_type ?? "").startsWith("image/") ? (att.url || null) : null,
+          previewUrl: preview,
           type: att.content_type || "application/octet-stream"
         }]);
         setUploading(false);
@@ -1810,6 +1820,9 @@ export function App() {
     if (!activeChannel) return;
     const isImg = file.type.startsWith("image/");
     const preview = isImg ? URL.createObjectURL(file) : null;
+    if (preview && file.name) {
+      pendingUploadPreviewsRef.current.set(file.name, preview);
+    }
     setUploading(true);
     setUploadingFile({
       name: file.name || "arquivo",
@@ -1831,18 +1844,73 @@ export function App() {
     reader.readAsDataURL(file);
   }
 
+  function uploadFiles(files: FileList | File[]) {
+    if (!activeChannel || !files || files.length === 0) return;
+    const fileArray = Array.from(files);
+    fileArray.forEach(file => uploadFileBlob(file));
+  }
+
   function handlePaste(event: React.ClipboardEvent) {
     const items = event.clipboardData?.items;
-    if (!items || !activeChannel) return;
-    for (let i = 0; i < items.length; i++) {
-      const item = items[i];
-      if (item.kind === "file") {
-        const file = item.getAsFile();
-        if (file) {
-          event.preventDefault();
-          uploadFileBlob(file);
-          return;
+    const files = event.clipboardData?.files;
+    if (!activeChannel) return;
+    if (files && files.length > 0) {
+      event.preventDefault();
+      uploadFiles(files);
+      return;
+    }
+    if (items) {
+      for (let i = 0; i < items.length; i++) {
+        const item = items[i];
+        if (item.kind === "file") {
+          const file = item.getAsFile();
+          if (file) {
+            event.preventDefault();
+            uploadFileBlob(file);
+            return;
+          }
         }
+      }
+    }
+  }
+
+  function handleChatDragEnter(event: React.DragEvent) {
+    if (event.dataTransfer.types.includes("Files")) {
+      event.preventDefault();
+      event.stopPropagation();
+      dragCounterRef.current += 1;
+      setIsDraggingFiles(true);
+    }
+  }
+
+  function handleChatDragOver(event: React.DragEvent) {
+    if (event.dataTransfer.types.includes("Files")) {
+      event.preventDefault();
+      event.stopPropagation();
+      event.dataTransfer.dropEffect = "copy";
+      if (!isDraggingFiles) setIsDraggingFiles(true);
+    }
+  }
+
+  function handleChatDragLeave(event: React.DragEvent) {
+    if (event.dataTransfer.types.includes("Files")) {
+      event.preventDefault();
+      event.stopPropagation();
+      dragCounterRef.current = Math.max(0, dragCounterRef.current - 1);
+      if (dragCounterRef.current === 0) {
+        setIsDraggingFiles(false);
+      }
+    }
+  }
+
+  function handleChatDrop(event: React.DragEvent) {
+    if (event.dataTransfer.types.includes("Files")) {
+      event.preventDefault();
+      event.stopPropagation();
+      dragCounterRef.current = 0;
+      setIsDraggingFiles(false);
+      if (event.dataTransfer.files && event.dataTransfer.files.length > 0) {
+        uploadFiles(event.dataTransfer.files);
       }
     }
   }
@@ -1858,9 +1926,22 @@ export function App() {
     }
     const reqId = crypto.randomUUID();
     const text = content.trim();
+    const optimisticAttachments: Attachment[] = readyAttachments.map(a => ({
+      id: a.id,
+      filename: a.name,
+      content_type: a.type,
+      size_bytes: 0,
+      url: a.previewUrl ?? null,
+    }));
     setMessages(current => [...current, {
-      id: reqId, reqId, content: text, created_at: new Date().toISOString(), author_id: currentUserId ?? undefined,
-      pending: true, pendingAttachmentIds: attachmentIds,
+      id: reqId,
+      reqId,
+      content: text,
+      created_at: new Date().toISOString(),
+      author_id: currentUserId ?? undefined,
+      pending: true,
+      pendingAttachmentIds: attachmentIds,
+      attachments: optimisticAttachments.length > 0 ? optimisticAttachments : undefined,
     }]);
     sendOptimistic(reqId, activeChannel.id, text, attachmentIds);
     setContent("");
@@ -3181,7 +3262,24 @@ export function App() {
             </div>
           </div>
         ) : (
-          <div className="chat">
+          <div
+            className="chat"
+            onDragEnter={handleChatDragEnter}
+            onDragOver={handleChatDragOver}
+            onDragLeave={handleChatDragLeave}
+            onDrop={handleChatDrop}
+          >
+            {isDraggingFiles && activeChannel && (
+              <div className="chat-drop-overlay" onDragOver={handleChatDragOver} onDragLeave={handleChatDragLeave} onDrop={handleChatDrop}>
+                <div className="chat-drop-overlay__card">
+                  <div className="chat-drop-overlay__icon-glow">
+                    <Icon name="add-media" size={36} />
+                  </div>
+                  <h3 className="chat-drop-overlay__title">Solte para enviar arquivo</h3>
+                  <p className="chat-drop-overlay__desc">Enviar para #{activeChannel.name}</p>
+                </div>
+              </div>
+            )}
             <div className="messages" ref={messagesScrollRef}>
              <div className="messages__inner">
               {!activeChannel && <p className="empty">Escolha um canal de texto para começar.</p>}
@@ -3264,8 +3362,8 @@ export function App() {
                       {message.attachments?.map(attachment => {
                         const isImage = (attachment.content_type ?? "").startsWith("image/");
                         const isVideo = (attachment.content_type ?? "").startsWith("video/");
-                        const inlined = (attachment.url ?? "").startsWith("data:");
-                        if (isImage && inlined) {
+                        const hasValidUrl = !!attachment.url && (attachment.url.startsWith("data:") || attachment.url.startsWith("blob:") || attachment.url.startsWith("http"));
+                        if (isImage && hasValidUrl) {
                           return (
                             <button
                               className="msg__image"
@@ -3282,7 +3380,7 @@ export function App() {
                             </button>
                           );
                         }
-                        if (isVideo && inlined) {
+                        if (isVideo && hasValidUrl) {
                           return (
                             <div className="msg__video-wrap" key={attachment.id}>
                               <video
@@ -3322,13 +3420,14 @@ export function App() {
             </div>
 
             {activeChannel && (
-              <form className="composer" onSubmit={submitMessage} onPaste={handlePaste}>
+              <form className={"composer" + (isDraggingFiles ? " is-drag-over" : "")} onSubmit={submitMessage} onPaste={handlePaste}>
                 <input
                   type="file"
                   ref={fileInputRef}
+                  multiple
                   onChange={e => {
-                    const file = e.target.files?.[0];
-                    if (file) uploadFileBlob(file);
+                    const files = e.target.files;
+                    if (files && files.length > 0) uploadFiles(files);
                   }}
                   style={{ display: "none" }}
                 />

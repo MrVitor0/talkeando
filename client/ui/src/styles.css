@@ -1569,6 +1569,89 @@ a:hover {
   to { opacity: 1; transform: translateY(0); }
 }
 
+/* ---- Drag and Drop File Upload Overlay ---- */
+.chat {
+  position: relative;
+}
+
+.chat-drop-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 50;
+  background: rgba(18, 19, 22, 0.85);
+  backdrop-filter: blur(8px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  pointer-events: all;
+  animation: drop-fade-in 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.chat-drop-overlay__card {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+  padding: 36px 48px;
+  border-radius: 20px;
+  background: radial-gradient(circle at center, rgba(88, 101, 242, 0.15), rgba(30, 31, 34, 0.85));
+  border: 2px dashed #5865f2;
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.6), 0 0 30px rgba(88, 101, 242, 0.25);
+  animation: drop-pop-in 0.25s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+  max-width: 90%;
+}
+
+.chat-drop-overlay__icon-glow {
+  width: 72px;
+  height: 72px;
+  border-radius: 50%;
+  background: linear-gradient(135deg, #5865f2, #7983f5);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #fff;
+  margin-bottom: 16px;
+  box-shadow: 0 8px 24px rgba(88, 101, 242, 0.45);
+  animation: drop-pulse 1.6s ease-in-out infinite alternate;
+}
+
+.chat-drop-overlay__title {
+  font-size: 20px;
+  font-weight: 700;
+  color: #fff;
+  margin: 0 0 6px 0;
+  letter-spacing: -0.2px;
+}
+
+.chat-drop-overlay__desc {
+  font-size: 14px;
+  color: var(--text-muted, #949ba4);
+  margin: 0;
+}
+
+.composer.is-drag-over {
+  border-color: #5865f2 !important;
+  box-shadow: 0 0 16px rgba(88, 101, 242, 0.35);
+  transform: scale(1.005);
+}
+
+@keyframes drop-fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+@keyframes drop-pop-in {
+  from { opacity: 0; transform: scale(0.92) translateY(10px); }
+  to { opacity: 1; transform: scale(1) translateY(0); }
+}
+
+@keyframes drop-pulse {
+  from { transform: scale(1); box-shadow: 0 8px 20px rgba(88, 101, 242, 0.4); }
+  to { transform: scale(1.08); box-shadow: 0 12px 30px rgba(88, 101, 242, 0.7); }
+}
+
 /* ---- Autocomplete Menus (Mentions & Slash Commands) ---- */
 .mention-menu,
 .slash-menu {

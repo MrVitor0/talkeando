@@ -86,7 +86,7 @@ struct EmbedRow {
     footer_icon_url: Option<String>,
 }
 
-#[derive(Serialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct MessageAttachment {
     pub id: Uuid,
     pub filename: String,

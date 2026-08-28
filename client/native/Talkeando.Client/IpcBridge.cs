@@ -408,6 +408,16 @@ public sealed class IpcBridge : IDisposable
             }
             catch (Exception exception) { DebugLog.Write($"member.updated hydrate failed: {exception.Message}"); }
         }
+        if (op == "chat.message.created")
+        {
+            try
+            {
+                var hydrated = await _network.HydrateMediaUrlsAsync(data);
+                Publish(op, hydrated);
+                return;
+            }
+            catch (Exception exception) { DebugLog.Write($"chat.message.created media inline failed: {exception.Message}"); }
+        }
         Publish(op, data);
     }
 

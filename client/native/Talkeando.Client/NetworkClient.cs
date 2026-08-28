@@ -169,7 +169,7 @@ public sealed class NetworkClient
         AddAuthorization(request);
         using var response = await _http.SendAsync(request);
         using var result = await ReadJsonAsync(response);
-        return result.RootElement.Clone();
+        return await HydrateMediaUrlsAsync(result.RootElement);
     }
 
     public async Task<JsonElement> UploadAttachmentBytesAsync(Guid channelId, byte[] bytes, string filename, string contentType)
@@ -182,7 +182,7 @@ public sealed class NetworkClient
         AddAuthorization(request);
         using var response = await _http.SendAsync(request);
         using var result = await ReadJsonAsync(response);
-        return result.RootElement.Clone();
+        return await HydrateMediaUrlsAsync(result.RootElement);
     }
 
     /// PROFILE-FR: rename yourself. The server fans a `member.updated` event
@@ -469,7 +469,7 @@ public sealed class NetworkClient
     // cannot authenticate against the API. Convert the few private avatars
     // and preview thumbnails returned in bootstrap/history into data URLs at
     // the native boundary instead.
-    private async Task<JsonElement> HydrateMediaUrlsAsync(JsonElement payload)
+    public async Task<JsonElement> HydrateMediaUrlsAsync(JsonElement payload)
     {
         var root = JsonNode.Parse(payload.GetRawText());
         if (root is null) return payload;
@@ -616,9 +616,11 @@ public sealed class NetworkClient
 
     private static string GuessContentType(string filePath) => Path.GetExtension(filePath).ToLowerInvariant() switch
     {
-        ".png" => "image/png", ".jpg" or ".jpeg" => "image/jpeg", ".gif" => "image/gif",
-        ".webp" => "image/webp", ".mp4" => "video/mp4", ".mp3" => "audio/mpeg",
-        ".ogg" => "audio/ogg", ".wav" => "audio/wav", ".pdf" => "application/pdf",
-        ".txt" => "text/plain", ".zip" => "application/zip", _ => "application/octet-stream",
+        ".png" => "image/png", ".jpg" or ".jpeg" or ".jfif" => "image/jpeg", ".gif" => "image/gif",
+        ".webp" => "image/webp", ".svg" => "image/svg+xml", ".bmp" => "image/bmp",
+        ".mp4" => "video/mp4", ".webm" => "video/webm", ".mov" => "video/quicktime", ".avi" or ".mkv" => "video/x-msvideo",
+        ".mp3" => "audio/mpeg", ".ogg" => "audio/ogg", ".wav" => "audio/wav", ".aac" => "audio/aac", ".flac" => "audio/flac",
+        ".pdf" => "application/pdf", ".txt" => "text/plain", ".md" => "text/markdown", ".csv" => "text/csv", ".json" => "application/json",
+        ".zip" => "application/zip", _ => "application/octet-stream",
     };
 }

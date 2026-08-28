@@ -17,9 +17,11 @@ use crate::{
 };
 
 const ALLOWED_CONTENT_TYPES: &[&str] = &[
-    "image/png", "image/jpeg", "image/gif", "image/webp",
-    "video/mp4", "audio/mpeg", "audio/ogg", "audio/wav",
-    "application/pdf", "text/plain", "application/zip",
+    "image/png", "image/jpeg", "image/jpg", "image/pjpeg", "image/gif", "image/webp", "image/svg+xml", "image/bmp",
+    "video/mp4", "video/webm", "video/quicktime", "video/x-msvideo", "video/mpeg", "video/ogg",
+    "audio/mpeg", "audio/mp3", "audio/ogg", "audio/wav", "audio/webm", "audio/aac", "audio/flac", "audio/mp4",
+    "application/pdf", "text/plain", "text/markdown", "text/csv", "application/json",
+    "application/zip", "application/x-zip-compressed", "application/octet-stream",
 ];
 
 #[derive(Serialize)]

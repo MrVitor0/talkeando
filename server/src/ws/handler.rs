@@ -670,12 +670,12 @@ async fn handle_chat_create(state: &AppState, user_id: Uuid, data: ChatMessageCr
         state.hub.send_to(user_id, OutboundEnvelope::error("validation_error", "messages can only be sent to text channels", data.req_id.as_deref())).await;
         return;
     }
-    if data.content.trim().is_empty() || data.content.len() > 4000 {
+    if (data.content.trim().is_empty() && data.attachment_ids.is_empty()) || data.content.len() > 4000 {
         state
             .hub
             .send_to(
                 user_id,
-                OutboundEnvelope::error("validation_error", "message must be 1..=4000 chars", data.req_id.as_deref()),
+                OutboundEnvelope::error("validation_error", "message must be 1..=4000 chars or contain attachments", data.req_id.as_deref()),
             )
             .await;
         return;
@@ -727,6 +727,26 @@ async fn handle_chat_create(state: &AppState, user_id: Uuid, data: ChatMessageCr
     match row {
         Ok(m) if !m.is_new_insert => {
             let _ = tx.rollback().await;
+            let resolved_attachments = if data.attachment_ids.is_empty() {
+                vec![]
+            } else {
+                sqlx::query_as::<_, (Uuid, String, String, i64)>(
+                    "SELECT id, filename, content_type, size_bytes FROM attachments WHERE id = ANY($1)",
+                )
+                .bind(&data.attachment_ids)
+                .fetch_all(&state.pool)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(id, filename, content_type, size_bytes)| crate::routes::messages::MessageAttachment {
+                    id,
+                    filename,
+                    content_type,
+                    size_bytes,
+                    url: format!("/api/attachments/{id}"),
+                })
+                .collect()
+            };
             state.hub.send_to(user_id, OutboundEnvelope::new(
                 "chat.message.created",
                 ChatMessageCreated {
@@ -738,12 +758,14 @@ async fn handle_chat_create(state: &AppState, user_id: Uuid, data: ChatMessageCr
                         created_at: m.created_at,
                         edited_at: m.edited_at,
                         attachment_ids: data.attachment_ids,
+                        attachments: resolved_attachments,
                     },
                     in_reply_to: data.req_id,
                 },
             )).await;
         }
         Ok(m) => {
+            let mut resolved_attachments = Vec::new();
             if !data.attachment_ids.is_empty() {
                 let associated = sqlx::query(
                     "UPDATE attachments SET message_id = $1 WHERE id = ANY($2) AND uploader_id = $3 AND message_id IS NULL",
@@ -754,7 +776,24 @@ async fn handle_chat_create(state: &AppState, user_id: Uuid, data: ChatMessageCr
                 .execute(&mut *tx)
                 .await;
                 match associated {
-                    Ok(result) if result.rows_affected() == data.attachment_ids.len() as u64 => {}
+                    Ok(result) if result.rows_affected() == data.attachment_ids.len() as u64 => {
+                        resolved_attachments = sqlx::query_as::<_, (Uuid, String, String, i64)>(
+                            "SELECT id, filename, content_type, size_bytes FROM attachments WHERE id = ANY($1)",
+                        )
+                        .bind(&data.attachment_ids)
+                        .fetch_all(&mut *tx)
+                        .await
+                        .unwrap_or_default()
+                        .into_iter()
+                        .map(|(id, filename, content_type, size_bytes)| crate::routes::messages::MessageAttachment {
+                            id,
+                            filename,
+                            content_type,
+                            size_bytes,
+                            url: format!("/api/attachments/{id}"),
+                        })
+                        .collect();
+                    }
                     Ok(_) => {
                         let _ = tx.rollback().await;
                         state.hub.send_to(user_id, OutboundEnvelope::error("validation_error", "one or more attachments are unavailable", data.req_id.as_deref())).await;
@@ -784,6 +823,7 @@ async fn handle_chat_create(state: &AppState, user_id: Uuid, data: ChatMessageCr
                             created_at: m.created_at,
                             edited_at: m.edited_at,
                             attachment_ids: data.attachment_ids,
+                            attachments: resolved_attachments,
                         },
                         in_reply_to: data.req_id,
                     },

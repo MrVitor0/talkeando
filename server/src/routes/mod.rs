@@ -4,7 +4,7 @@ mod attachments;
 mod channels;
 mod communities;
 mod invites;
-mod messages;
+pub mod messages;
 mod media;
 mod profile;
 mod turn;
