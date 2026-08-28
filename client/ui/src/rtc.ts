@@ -40,6 +40,14 @@ const remoteAudioStreams = new Map<string, MediaStream>();
 // Per-participant local mute (the "Silenciar" control on a tile). Kept
 // separate from deafen so unmuting a peer doesn't un-deafen everything.
 const peerAudioMuted = new Map<string, boolean>();
+// Per-participant local playback volume — the "Volume do usuário" slider in a
+// member's right-click menu. 1 = default, 0 = silent, up to 2 = +100% boost.
+// Applied through a per-peer WebAudio GainNode because an <audio> element's
+// own `.volume` clamps at 1 and can't boost a too-quiet talker.
+const peerVolume = new Map<string, number>();
+type PeerAudioGraph = { source: MediaStreamAudioSourceNode; gain: GainNode; dest: MediaStreamAudioDestinationNode };
+const peerAudioGraphs = new Map<string, PeerAudioGraph>();
+let remoteAudioCtx: AudioContext | null = null;
 const pendingTurnRequests = new Map<string, (creds: TurnCredentials) => void>();
 const remoteVideoListeners = new Set<RemoteStreamListener>();
 
@@ -187,19 +195,23 @@ async function createPeer(peerUserId: string): Promise<RTCPeerConnection> {
       let audioStream = remoteAudioStreams.get(peerUserId);
       if (!audioStream) { audioStream = new MediaStream(); remoteAudioStreams.set(peerUserId, audioStream); }
       audioStream.addTrack(event.track);
-      event.track.onended = () => { try { audioStream!.removeTrack(event.track); } catch { /* gone */ } };
+      event.track.onended = () => {
+        try { audioStream!.removeTrack(event.track); } catch { /* gone */ }
+        wirePeerAudioGraph(peerUserId);
+      };
       let audioEl = remoteAudioEls.get(peerUserId);
       if (!audioEl) {
         audioEl = new Audio();
         audioEl.autoplay = true;
-        audioEl.srcObject = audioStream;
         remoteAudioEls.set(peerUserId, audioEl);
       }
       // A pure spectator (previewing a screen share without joining the call)
       // should never hear the call — mute every remote audio track while not
       // an actual participant.
       audioEl.muted = !joinedCall || localDeafened || (peerAudioMuted.get(peerUserId) ?? false);
-      void audioEl.play().catch(error => console.error("[rtc] remote audio play() failed", error));
+      // Feed the sink through the per-peer gain graph (this also (re)assigns
+      // srcObject and calls play()) so the "Volume do usuário" slider works.
+      wirePeerAudioGraph(peerUserId);
     } else if (event.track.kind === "video") {
       const stream = event.streams[0] ?? new MediaStream([event.track]);
       // The msid rides along on event.streams[0].id and equals the sender's
@@ -399,6 +411,12 @@ function closePeer(peerUserId: string) {
   if (timer) { clearTimeout(timer); iceRestartTimers.delete(peerUserId); }
   const audioEl = remoteAudioEls.get(peerUserId);
   if (audioEl) { audioEl.srcObject = null; remoteAudioEls.delete(peerUserId); }
+  const graph = peerAudioGraphs.get(peerUserId);
+  if (graph) {
+    try { graph.source.disconnect(); graph.gain.disconnect(); } catch { /* already gone */ }
+    peerAudioGraphs.delete(peerUserId);
+  }
+  // Keep peerVolume[peerUserId] so a rejoin restores the level the user set.
   remoteAudioStreams.delete(peerUserId);
   emitRemoteStream(peerUserId, null);
 }
@@ -689,6 +707,8 @@ export async function leaveCall() {
   if (localStream) { for (const track of localStream.getTracks()) track.stop(); localStream = null; }
   if (rawMic) { for (const track of rawMic.getTracks()) track.stop(); rawMic = null; }
   void noiseSuppression.teardown();
+  peerAudioGraphs.clear();
+  if (remoteAudioCtx) { void remoteAudioCtx.close().catch(() => { /* already closed */ }); remoteAudioCtx = null; }
   joinedCall = false;
   currentChannelId = null;
 }
@@ -750,6 +770,48 @@ function applyRemoteMuting() {
 export function setPeerAudioMuted(peerUserId: string, isMuted: boolean) {
   peerAudioMuted.set(peerUserId, isMuted);
   applyRemoteMuting();
+}
+
+function ensureRemoteAudioCtx(): AudioContext {
+  if (!remoteAudioCtx) remoteAudioCtx = new AudioContext();
+  if (remoteAudioCtx.state === "suspended") void remoteAudioCtx.resume().catch(() => { /* needs a gesture */ });
+  return remoteAudioCtx;
+}
+
+/// (Re)build the gain graph that feeds one peer's <audio> sink. Must run
+/// whenever that peer's set of audio tracks changes (mic arrives, screen-share
+/// audio starts or stops) because a MediaStreamAudioSourceNode is a snapshot
+/// of the stream taken at creation time.
+function wirePeerAudioGraph(peerUserId: string) {
+  const audioEl = remoteAudioEls.get(peerUserId);
+  const audioStream = remoteAudioStreams.get(peerUserId);
+  if (!audioEl || !audioStream || audioStream.getAudioTracks().length === 0) return;
+  const ctx = ensureRemoteAudioCtx();
+  const previous = peerAudioGraphs.get(peerUserId);
+  if (previous) {
+    try { previous.source.disconnect(); previous.gain.disconnect(); } catch { /* already gone */ }
+  }
+  const source = ctx.createMediaStreamSource(audioStream);
+  const gain = ctx.createGain();
+  gain.gain.value = peerVolume.get(peerUserId) ?? 1;
+  const dest = ctx.createMediaStreamDestination();
+  source.connect(gain).connect(dest);
+  peerAudioGraphs.set(peerUserId, { source, gain, dest });
+  audioEl.srcObject = dest.stream;
+  void audioEl.play().catch(error => console.error("[rtc] remote audio play() failed", error));
+}
+
+/// Local-only playback volume for one participant. 1 = default, 0 = silent,
+/// 2 = +100% boost. Nothing leaves this client.
+export function setPeerVolume(peerUserId: string, volume: number) {
+  const clamped = Math.max(0, Math.min(2, volume));
+  peerVolume.set(peerUserId, clamped);
+  const graph = peerAudioGraphs.get(peerUserId);
+  if (graph) graph.gain.gain.value = clamped;
+}
+
+export function getPeerVolume(peerUserId: string): number {
+  return peerVolume.get(peerUserId) ?? 1;
 }
 
 /// SCREEN-FR-001/SUB-FR-001: capture starts immediately (via the native

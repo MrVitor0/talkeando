@@ -1,7 +1,7 @@
 {
   "source": "discord.com.har",
   "har_file": "discord-new.har",
-  "generated_at": "2026-08-28T01:41:21.036Z",
+  "generated_at": "2026-08-28T02:03:07.273Z",
   "channels": {
     "1353746785260015647": "monitor-de-noticias",
     "590274170131185749": "átrio-principal",
@@ -21,6 +21,7 @@
       "username": "d_1078654536853508169",
       "display_name": "Badezir",
       "avatar_url": "https://cdn.discordapp.com/avatars/1078654536853508169/22f73ff0b6c7bac63b126344c60153be.png?size=128",
+      "profile_tag": null
     },
     {
       "id": "c91894d1-327a-5311-b349-fc2831f725fb",

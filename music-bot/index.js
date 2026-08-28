@@ -2,7 +2,13 @@
 // PCM into node-webrtc's RTCAudioSource, then one PeerConnection per caller
 // carries Opus directly across the existing mesh.
 const WebSocket = require("ws");
-const wrtc = require("wrtc");
+// `wrtc` (node-webrtc) has been unmaintained since 2020 and has no working
+// prebuilt binaries for Node >= 16 — on node:18 it crashes the process the
+// first time an RTCPeerConnection / RTCAudioSource is created, which showed
+// up as the bot going offline mid-handshake ("target is not connected") and
+// no audio ever arriving. `@roamhq/wrtc` is the maintained community fork
+// with the same API surface (including `nonstandard.RTCAudioSource`).
+const wrtc = require("@roamhq/wrtc");
 const { spawn } = require("child_process");
 const crypto = require("crypto");
 

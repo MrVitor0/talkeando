@@ -1,4 +1,6 @@
-FROM node:18-bookworm-slim
+# @roamhq/wrtc publishes prebuilt binaries for Node 18/20/22; 20 LTS is the
+# safe middle. (The old node:18 + unmaintained `wrtc` combo crash-looped.)
+FROM node:20-bookworm-slim
 # Debian Bookworm marks its system Python as externally managed (PEP 668), so
 # yt-dlp must live in its own virtual environment instead of `pip3 install`
 # into the OS package set.
@@ -9,7 +11,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg python3-
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY package.json ./
-RUN npm install -g @mapbox/node-pre-gyp
 RUN npm install --omit=dev
 COPY index.js ./
 USER node

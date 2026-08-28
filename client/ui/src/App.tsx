@@ -11,9 +11,20 @@ type Channel = { id: string; name: string; kind: "text" | "voice"; topic?: strin
 type ChannelCategory = { id: string; name: string; position: number; channels: Channel[] };
 type Member = { id: string; display_name: string; username: string; role: string; avatar_url?: string | null; profile_tag?: string | null; profile_badge_url?: string | null };
 type Attachment = { id: string; filename: string; content_type: string; size_bytes: number; url?: string | null };
+// Rich embed imported from Discord (bot polls, "now playing", changelog cards).
+// Image URLs are already rewritten to our own `/api/message-embeds/...` route
+// by the server — see routes/messages.rs and discord_import::import_json.
+type MessageEmbed = {
+  title?: string | null; description?: string | null; url?: string | null; color?: number | null;
+  author_name?: string | null; author_url?: string | null; provider_name?: string | null;
+  footer_text?: string | null; footer_icon_url?: string | null;
+  image_url?: string | null; thumbnail_url?: string | null;
+  fields?: { name: string; value: string; inline?: boolean }[] | null;
+};
 type Message = {
   id: string; content: string; created_at: string; author?: { display_name: string; avatar_url?: string | null; profile_tag?: string | null; profile_badge_url?: string | null }; author_id?: string; attachments?: Attachment[];
   link_preview?: { url: string; title?: string | null; site_name?: string | null; image_url?: string | null } | null;
+  embeds?: MessageEmbed[];
   // Optimistic-send bookkeeping (never sent to the server, purely local UI
   // state) — see submitMessage/retryMessage. `reqId` is the same id echoed
   // back by the server as `in_reply_to` (CHAT-FR idempotent send).
@@ -25,6 +36,19 @@ type Message = {
 // the server's idempotency key (channel_id, author_id, req_id) resolves a
 // duplicate send to the original row instead of inserting a second message.
 const SEND_TIMEOUT_MS = 8000;
+
+// Slash-command palette (Discord-style autocomplete). All of these are Tupi
+// Música commands — see submitMessage's `/(play|pause|...)` parser and the
+// server's handle_music_command.
+type SlashCommand = { name: string; args?: string; desc: string };
+const SLASH_COMMANDS: SlashCommand[] = [
+  { name: "play", args: "<link ou nome>", desc: "Toca uma música ou playlist — link do YouTube/Spotify ou busca por nome." },
+  { name: "pause", desc: "Pausa a música atual." },
+  { name: "resume", desc: "Retoma a música pausada." },
+  { name: "skip", desc: "Pula para a próxima faixa." },
+  { name: "stop", desc: "Para a música e tira o Tupi Música do canal de voz." },
+  { name: "queue", desc: "Mostra a fila atual." },
+];
 type Participant = { user_id: string; muted: boolean; deafened: boolean; is_bot?: boolean };
 type StreamInfo = { stream_id: string; owner: string; kind: string; label?: string | null; msid?: string | null };
 // Remote video tracks for one peer, tagged with the sender's MediaStream.id
@@ -69,6 +93,64 @@ function renderText(text: string) {
     /^https?:\/\//.test(part)
       ? <a key={index} href={part} target="_blank" rel="noreferrer noopener">{part}</a>
       : <span key={index}>{part}</span>
+  );
+}
+
+// Renders a Discord-style rich embed (imported history only — there is no
+// composer path that creates these). Mirrors the .link-preview visual
+// language: coloured left edge, muted card background, everything optional.
+function MessageEmbedCard({ embed }: { embed: MessageEmbed }) {
+  const accent =
+    typeof embed.color === "number" && embed.color >= 0
+      ? "#" + embed.color.toString(16).padStart(6, "0")
+      : "var(--link)";
+  const fields = (embed.fields ?? []).filter(f => f && (f.name || f.value));
+  return (
+    <div className="msg-embed" style={{ borderLeftColor: accent }}>
+      <div className="msg-embed__main">
+        {embed.author_name && (
+          <div className="msg-embed__author">
+            {embed.author_url
+              ? <a href={embed.author_url} target="_blank" rel="noreferrer noopener">{embed.author_name}</a>
+              : embed.author_name}
+          </div>
+        )}
+        {embed.title && (
+          <div className="msg-embed__title">
+            {embed.url
+              ? <a href={embed.url} target="_blank" rel="noreferrer noopener">{embed.title}</a>
+              : embed.title}
+          </div>
+        )}
+        {embed.description && <div className="msg-embed__desc">{renderText(embed.description)}</div>}
+        {fields.length > 0 && (
+          <div className="msg-embed__fields">
+            {fields.map((f, i) => (
+              <div key={i} className={f.inline ? "msg-embed__field is-inline" : "msg-embed__field"}>
+                {f.name && <div className="msg-embed__field-name">{f.name}</div>}
+                {f.value && <div className="msg-embed__field-value">{renderText(f.value)}</div>}
+              </div>
+            ))}
+          </div>
+        )}
+        {embed.image_url && (
+          <a className="msg-embed__image" href={embed.image_url} target="_blank" rel="noreferrer noopener">
+            <img src={embed.image_url} alt="" loading="lazy" />
+          </a>
+        )}
+        {(embed.footer_text || embed.provider_name) && (
+          <div className="msg-embed__footer">
+            {embed.footer_icon_url && <img src={embed.footer_icon_url} alt="" />}
+            <span>{embed.footer_text || embed.provider_name}</span>
+          </div>
+        )}
+      </div>
+      {embed.thumbnail_url && (
+        <a className="msg-embed__thumb" href={embed.thumbnail_url} target="_blank" rel="noreferrer noopener">
+          <img src={embed.thumbnail_url} alt="" loading="lazy" />
+        </a>
+      )}
+    </div>
   );
 }
 
@@ -374,7 +456,21 @@ function ChatSkeleton({ rows }: { rows: number }) {
 /* MainWindow.xaml.cs AreDefaultContextMenusEnabled=false)             */
 /* ------------------------------------------------------------------ */
 
-type MenuItem = { label: string; onClick: () => void; danger?: boolean };
+type MenuAction = { label: string; onClick: () => void; danger?: boolean };
+// A live slider embedded in the menu (e.g. per-user local volume). The menu
+// stays open while it's dragged.
+type MenuSlider = {
+  kind: "slider";
+  label: string;
+  value: number;
+  min: number;
+  max: number;
+  step: number;
+  resetTo?: number;
+  format?: (value: number) => string;
+  onChange: (value: number) => void;
+};
+type MenuItem = MenuAction | MenuSlider;
 type MenuState = { x: number; y: number; items: MenuItem[] };
 
 function ContextMenu({ x, y, items, onClose }: MenuState & { onClose: () => void }) {
@@ -414,15 +510,43 @@ function ContextMenu({ x, y, items, onClose }: MenuState & { onClose: () => void
 
   return (
     <div ref={ref} className="ctx-menu" style={{ left: pos.left, top: pos.top }} onClick={event => event.stopPropagation()}>
-      {items.map((item, index) => (
-        <button
-          key={index}
-          className={item.danger ? "ctx-menu__item is-danger" : "ctx-menu__item"}
-          onClick={() => { onClose(); item.onClick(); }}
-        >
-          {item.label}
-        </button>
-      ))}
+      {items.map((item, index) =>
+        "kind" in item
+          ? <MenuSliderRow key={index} item={item} />
+          : (
+            <button
+              key={index}
+              className={item.danger ? "ctx-menu__item is-danger" : "ctx-menu__item"}
+              onClick={() => { onClose(); item.onClick(); }}
+            >
+              {item.label}
+            </button>
+          )
+      )}
+    </div>
+  );
+}
+
+function MenuSliderRow({ item }: { item: MenuSlider }) {
+  // Own the value locally so dragging stays smooth even though the parent
+  // menu holds a one-shot snapshot of `items`.
+  const [value, setValue] = useState(item.value);
+  const apply = (next: number) => { setValue(next); item.onChange(next); };
+  return (
+    <div className="ctx-menu__slider">
+      <div className="ctx-menu__slider-head">
+        <span>{item.label}</span>
+        <span className="ctx-menu__slider-val">{item.format ? item.format(value) : value}</span>
+      </div>
+      <input
+        type="range"
+        min={item.min}
+        max={item.max}
+        step={item.step}
+        value={value}
+        onChange={event => apply(Number(event.target.value))}
+        onDoubleClick={() => { if (item.resetTo !== undefined) apply(item.resetTo); }}
+      />
     </div>
   );
 }
@@ -608,6 +732,8 @@ export function App() {
   const [focusedUser, setFocusedUser] = useState<string | null>(null);
   const [theater, setTheater] = useState(false);
   const [mutedPeers, setMutedPeers] = useState<Record<string, boolean>>({});
+  // Local-only per-user playback volume (0..2, 1 = default). Not sent anywhere.
+  const [peerVolumes, setPeerVolumes] = useState<Record<string, number>>({});
   const [noiseSup, setNoiseSup] = useState(() => {
     try { return localStorage.getItem("tk.noiseSuppression") !== "off"; } catch { return true; }
   });
@@ -1273,7 +1399,23 @@ export function App() {
       ];
     }
     const member = members.find(entry => entry.id === userId);
-    return member ? [{ label: "Renomear usuário", onClick: () => renameOtherMember(member) }] : [];
+    const items: MenuItem[] = [];
+    // In a call together → let me tune this person's volume, just for me.
+    if (call && call.participants.some(participant => participant.user_id === userId && !participant.is_bot)) {
+      items.push({
+        kind: "slider",
+        label: "Volume do usuário",
+        value: Math.round((peerVolumes[userId] ?? 1) * 100),
+        min: 0,
+        max: 200,
+        step: 5,
+        resetTo: 100,
+        format: percent => `${percent}%`,
+        onChange: percent => changePeerVolume(userId, percent / 100),
+      });
+    }
+    if (member) items.push({ label: "Renomear usuário", onClick: () => renameOtherMember(member) });
+    return items;
   }
   const channelMenuItems = (channel: Channel): MenuItem[] => [
     { label: "Renomear canal", onClick: () => renameChannel(channel) },
@@ -1294,6 +1436,11 @@ export function App() {
       rtc.setPeerAudioMuted(userId, next);
       return { ...current, [userId]: next };
     });
+  }
+  function changePeerVolume(userId: string, volume: number) {
+    const clamped = Math.max(0, Math.min(2, volume));
+    rtc.setPeerVolume(userId, clamped);
+    setPeerVolumes(current => ({ ...current, [userId]: clamped }));
   }
   function toggleNoiseSuppression() {
     setNoiseSup(value => !value);
@@ -1516,18 +1663,21 @@ export function App() {
                 </button>
                 {voiceRoster.length > 0 && (
                   <div className="voice-members">
-                    {voiceRoster.filter(entry => !entry.is_bot).map(entry => {
+                    {voiceRoster.map(entry => {
+                      const isBot = !!entry.is_bot;
                       const isSelf = entry.user_id === currentUserId;
-                      const name = isSelf ? selfName : memberName(entry.user_id);
-                      const micMuted = isSelf && here ? muted : entry.muted;
-                      const audioOff = isSelf && here ? deafened : entry.deafened;
+                      const name = isBot ? "Tupi Música" : (isSelf ? selfName : memberName(entry.user_id));
+                      const micMuted = !isBot && (isSelf && here ? muted : entry.muted);
+                      const audioOff = !isBot && (isSelf && here ? deafened : entry.deafened);
                       // The stream to preview: from the joined call's list when
                       // we're here, otherwise from the community roster (a
                       // spectator subscribe drives the RTC path).
-                      const share = here
-                        ? streams.find(s => s.owner === entry.user_id && s.kind === "screen")
-                        : (voiceRoomStreams[channel.id] ?? []).find(s => s.owner === entry.user_id && s.kind === "screen");
-                      const isLive = entry.sharing || !!share;
+                      const roomStreams = here ? streams : (voiceRoomStreams[channel.id] ?? []);
+                      const share = isBot ? undefined : roomStreams.find(s => s.owner === entry.user_id && s.kind === "screen");
+                      const hasCamera = !isBot && ((isSelf && here && !!myCameraStreamId)
+                        || roomStreams.some(s => s.owner === entry.user_id && s.kind === "camera"));
+                      const botPlaying = isBot && (entry.sharing || roomStreams.some(s => s.owner === entry.user_id && s.kind === "music"));
+                      const isLive = !isBot && (entry.sharing || !!share);
                       const canPeek = !!share && !isSelf;
                       // The floating peek preview is purely a hover affordance:
                       // once you're actually watching, the main stage carries
@@ -1552,14 +1702,15 @@ export function App() {
                         <div
                           className={
                             "voice-member"
+                            + (isBot ? " voice-member--bot" : "")
                             + (isLive ? " is-live" : "")
-                            + (speakingUsers.has(entry.user_id) ? " is-speaking" : "")
-                            + (canMoveMembers ? " is-draggable" : "")
+                            + (!isBot && speakingUsers.has(entry.user_id) ? " is-speaking" : "")
+                            + (canMoveMembers && !isBot ? " is-draggable" : "")
                           }
                           key={entry.user_id}
                           ref={node => { if (node) voiceRowRefs.current[entry.user_id] = node; }}
-                          draggable={canMoveMembers || undefined}
-                          onDragStart={canMoveMembers ? (event => {
+                          draggable={(canMoveMembers && !isBot) || undefined}
+                          onDragStart={canMoveMembers && !isBot ? (event => {
                             event.dataTransfer.setData("application/x-tk-member", entry.user_id);
                             event.dataTransfer.setData("application/x-tk-member-src", channel.id);
                             event.dataTransfer.effectAllowed = "move";
@@ -1573,7 +1724,9 @@ export function App() {
                           <span className="voice-member__name">{name}</span>
                           {micMuted && <Icon name="mic-muted" size={15} className="voice-member__flag" />}
                           {audioOff && <Icon name="headphone-muted" size={15} className="voice-member__flag" />}
+                          {hasCamera && <Icon name="camera" size={15} className="voice-member__flag voice-member__flag--cam" title="Câmera ligada" />}
                           {isLive && <span className="voice-member__live-badge">AO VIVO</span>}
+                          {botPlaying && <span className="voice-member__live-badge voice-member__live-badge--bot">🎵 TOCANDO</span>}
                           {here && !isSelf && watching[entry.user_id] && (
                             <button
                               className="voice-member__watch"
@@ -1597,16 +1750,6 @@ export function App() {
                     })}
                   </div>
                 )}
-                {(here ? streams : (voiceRoomStreams[channel.id] ?? [])).filter(stream => stream.kind === "music").map(stream => (
-                  <div className="voice-members voice-members--bots" key={`bot-${stream.stream_id}`}>
-                    <div className="voice-members__label">BOTS</div>
-                    <div className="voice-member voice-member--bot">
-                      <Avatar label="Tupi Música" size={24} className="voice-member__av" />
-                      <span className="voice-member__name">Tupi Música</span>
-                      <span className="voice-member__live-badge">🎵 TOCANDO</span>
-                    </div>
-                  </div>
-                ))}
               </div>
             );
             })}
@@ -1632,9 +1775,6 @@ export function App() {
                 <Icon name="hangout-call" size={18} />
               </button>
             </div>
-            {(myMusicStreamId || streams.some(stream => stream.kind === "music")) && (
-              <div className="voice-panel__music">🎵 Tupi Música <span>{streams.find(stream => stream.kind === "music")?.label ?? "tocando"}</span></div>
-            )}
             <div className="voice-panel__grid">
               <button
                 className={noiseSup ? "vp-btn is-on" : "vp-btn"}
@@ -1932,6 +2072,7 @@ export function App() {
                           </span>
                         </a>
                       )}
+                      {message.embeds?.map((embed, i) => <MessageEmbedCard key={i} embed={embed} />)}
                     </div>
                     {isOwn && !message.pending && !message.failed && (
                       <div className="msg__actions">
@@ -1990,6 +2131,11 @@ export function App() {
             <MemberList
               members={members}
               presence={presence}
+              botNowPlaying={(() => {
+                const musicStream = streams.find(stream => stream.kind === "music")
+                  ?? Object.values(voiceRoomStreams).flat().find(stream => stream.kind === "music");
+                return musicStream ? (musicStream.label ?? "tocando") : null;
+              })()}
               onMemberContextMenu={(event, member) => openMenu(event, memberMenuItems(member.id))}
             />
           </aside>
@@ -2013,10 +2159,14 @@ export function App() {
 function MemberList({
   members,
   presence,
+  botNowPlaying,
   onMemberContextMenu,
 }: {
   members: Member[];
   presence: Record<string, "online" | "busy" | "offline">;
+  // Non-null when Tupi Música is currently playing (the track label); the bot
+  // row itself is always shown — it's a permanent fixture like a Discord bot.
+  botNowPlaying: string | null;
   onMemberContextMenu: (event: ReactMouseEvent, member: Member) => void;
 }) {
   const online = members.filter(member => presence[member.id] !== "offline");
@@ -2039,7 +2189,12 @@ function MemberList({
   );
   return (
     <>
-      {online.length > 0 && <div className="members__group">Online — {online.length}</div>}
+      <div className="members__group">Online — {online.length + 1}</div>
+      <div className="member member--bot">
+        <Avatar label="Tupi Música" size={32} className="member__avatar" />
+        <span className="member__name">Tupi Música<small className="member__tag">BOT</small></span>
+        {botNowPlaying && <span className="member__status">🎵 {botNowPlaying}</span>}
+      </div>
       {online.map(member => row(member, false))}
       {offline.length > 0 && <div className="members__group">Offline — {offline.length}</div>}
       {offline.map(member => row(member, true))}

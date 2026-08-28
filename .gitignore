@@ -17,6 +17,9 @@ client/ui/dist/
 *.env
 !*.env.example
 
+# Discord import: generated artifact with message content + expiring CDN URLs
+scripts/discord-import/*.json
+
 # OS / editor
 .vs/
 .vscode/

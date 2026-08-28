@@ -478,6 +478,11 @@ a:hover {
   flex: none;
   color: var(--red);
 }
+/* Camera-on is a positive/neutral state, not an alert — use a soft green
+   instead of the muted-red the audio flags use. */
+.voice-member__flag--cam {
+  color: var(--green, #23a55a);
+}
 .voice-member__live-badge {
   flex: none;
   padding: 1px 5px;
@@ -2711,6 +2716,39 @@ a:hover {
   background: var(--red);
   color: #fff;
 }
+.ctx-menu__slider {
+  padding: 8px 10px 10px;
+}
+.ctx-menu__slider-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-bottom: 6px;
+  font-size: 14px;
+  font-weight: 500;
+  color: var(--interactive-normal);
+}
+.ctx-menu__slider-val {
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-muted);
+}
+.ctx-menu__slider input[type="range"] {
+  display: block;
+  width: 100%;
+  height: 4px;
+  margin: 4px 0;
+  border-radius: 2px;
+  cursor: pointer;
+  accent-color: var(--brand);
+}
+/* Divider when the slider sits above the plain action rows. */
+.ctx-menu__slider + .ctx-menu__item {
+  margin-top: 4px;
+  border-top: 1px solid rgba(255, 255, 255, 0.06);
+  padding-top: 10px;
+  border-radius: 0 0 4px 4px;
+}
 
 /* category chevron points right while collapsed; children are hidden by the
    render (App.tsx filters them out) apart from the active/connected channel */
@@ -2906,4 +2944,76 @@ a:hover {
 @media (prefers-reduced-motion: reduce) {
   .splash__ring, .splash__ring--2, .splash__orbit, .splash__glow,
   .splash__logo, .splash__bar span { animation: none; }
+}
+
+/* ---- imported Discord rich embeds ------------------------------- */
+.msg-embed {
+  display: flex;
+  gap: 12px;
+  width: min(480px, 100%);
+  margin-top: 7px;
+  padding: 10px 14px 12px 12px;
+  border-radius: 6px;
+  border-left: 4px solid var(--link);
+  background: var(--bg-embed, #242529);
+  color: var(--text-normal);
+}
+.msg-embed__main { flex: 1; min-width: 0; display: grid; gap: 6px; align-content: start; }
+.msg-embed__author { font-size: 13px; font-weight: 600; color: var(--text-normal); }
+.msg-embed__author a { color: inherit; text-decoration: none; }
+.msg-embed__author a:hover { text-decoration: underline; }
+.msg-embed__title { font-size: 15px; font-weight: 600; }
+.msg-embed__title a { color: var(--link); text-decoration: none; }
+.msg-embed__title a:hover { text-decoration: underline; }
+.msg-embed__desc {
+  font-size: 14px;
+  line-height: 1.35rem;
+  color: var(--text-muted);
+  white-space: pre-wrap;
+  word-wrap: break-word;
+  overflow: hidden;
+  display: -webkit-box;
+  -webkit-line-clamp: 12;
+  -webkit-box-orient: vertical;
+}
+.msg-embed__desc a { color: var(--link); }
+.msg-embed__fields { display: flex; flex-wrap: wrap; gap: 8px 16px; margin-top: 2px; }
+.msg-embed__field { min-width: 100%; }
+.msg-embed__field.is-inline { min-width: 0; flex: 1 1 30%; }
+.msg-embed__field-name { font-size: 13px; font-weight: 600; color: var(--text-normal); margin-bottom: 2px; }
+.msg-embed__field-value { font-size: 13px; color: var(--text-muted); white-space: pre-wrap; word-wrap: break-word; }
+.msg-embed__image { display: block; margin-top: 4px; border-radius: 4px; overflow: hidden; line-height: 0; }
+.msg-embed__image img { display: block; max-width: 100%; max-height: 320px; width: auto; height: auto; object-fit: contain; }
+.msg-embed__image:hover { opacity: 0.92; }
+.msg-embed__footer { display: flex; align-items: center; gap: 6px; margin-top: 2px; font-size: 12px; color: var(--text-faint); }
+.msg-embed__footer img { width: 18px; height: 18px; border-radius: 50%; object-fit: cover; }
+.msg-embed__thumb { flex: none; width: 80px; height: 80px; border-radius: 4px; overflow: hidden; line-height: 0; }
+.msg-embed__thumb img { width: 100%; height: 100%; object-fit: cover; }
+.msg-embed__thumb:hover { opacity: 0.92; }
+
+/* ---- Tupi Música bot row in the member roster ---- */
+.member--bot {
+  flex-wrap: wrap;
+}
+.member--bot .member__avatar::after {
+  background: var(--brand); /* bot dot, not the green "online" */
+}
+.member--bot .member__tag {
+  background: var(--brand);
+  color: #fff;
+}
+.member--bot .member__status {
+  flex-basis: 100%;
+  margin-left: 44px; /* 32px avatar + 12px gap → aligns under the name */
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--green);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Tupi Música "TOCANDO" badge — purple (brand), vs the red "AO VIVO" */
+.voice-member__live-badge--bot {
+  background: var(--brand);
 }
