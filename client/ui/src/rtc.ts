@@ -208,16 +208,13 @@ async function createPeer(peerUserId: string): Promise<RTCPeerConnection> {
       };
       let audioEl = remoteAudioEls.get(peerUserId);
       if (!audioEl) {
-        audioEl = new Audio();
+        audioEl = document.createElement("audio");
         audioEl.autoplay = true;
+        audioEl.style.display = "none";
+        document.body.appendChild(audioEl);
         remoteAudioEls.set(peerUserId, audioEl);
       }
-      // A pure spectator (previewing a screen share without joining the call)
-      // should never hear the call — mute every remote audio track while not
-      // an actual participant.
       audioEl.muted = !joinedCall || localDeafened || (peerAudioMuted.get(peerUserId) ?? false);
-      // Feed the sink through the per-peer gain graph (this also (re)assigns
-      // srcObject and calls play()) so the "Volume do usuário" slider works.
       wirePeerAudioGraph(peerUserId);
     } else if (event.track.kind === "video") {
       const stream = event.streams[0] ?? new MediaStream([event.track]);
@@ -417,7 +414,7 @@ function closePeer(peerUserId: string) {
   const timer = iceRestartTimers.get(peerUserId);
   if (timer) { clearTimeout(timer); iceRestartTimers.delete(peerUserId); }
   const audioEl = remoteAudioEls.get(peerUserId);
-  if (audioEl) { audioEl.srcObject = null; remoteAudioEls.delete(peerUserId); }
+  if (audioEl) { audioEl.srcObject = null; audioEl.remove(); remoteAudioEls.delete(peerUserId); }
   const graph = peerAudioGraphs.get(peerUserId);
   if (graph) {
     try { graph.source.disconnect(); graph.gain.disconnect(); } catch { /* already gone */ }
@@ -806,19 +803,32 @@ function wirePeerAudioGraph(peerUserId: string) {
   const audioEl = remoteAudioEls.get(peerUserId);
   const audioStream = remoteAudioStreams.get(peerUserId);
   if (!audioEl || !audioStream || audioStream.getAudioTracks().length === 0) return;
-  const ctx = ensureRemoteAudioCtx();
-  const previous = peerAudioGraphs.get(peerUserId);
-  if (previous) {
-    try { previous.source.disconnect(); previous.gain.disconnect(); } catch { /* already gone */ }
-  }
-  const source = ctx.createMediaStreamSource(audioStream);
-  const gain = ctx.createGain();
-  gain.gain.value = peerVolume.get(peerUserId) ?? 1;
-  const dest = ctx.createMediaStreamDestination();
-  source.connect(gain).connect(dest);
-  peerAudioGraphs.set(peerUserId, { source, gain, dest });
-  audioEl.srcObject = dest.stream;
+  const isMuted = !joinedCall || localDeafened || (peerAudioMuted.get(peerUserId) ?? false);
+  const vol = peerVolume.get(peerUserId) ?? 1;
+
+  audioEl.srcObject = audioStream;
+  audioEl.muted = isMuted;
+  audioEl.volume = isMuted ? 0 : Math.min(1, Math.max(0, vol));
   void audioEl.play().catch(error => console.error("[rtc] remote audio play() failed", error));
+
+  try {
+    const ctx = ensureRemoteAudioCtx();
+    const previous = peerAudioGraphs.get(peerUserId);
+    if (previous) {
+      try { previous.source.disconnect(); previous.gain.disconnect(); } catch { /* already gone */ }
+    }
+    if (vol > 1 && !isMuted) {
+      const source = ctx.createMediaStreamSource(audioStream);
+      const gain = ctx.createGain();
+      gain.gain.value = vol - 1;
+      source.connect(gain).connect(ctx.destination);
+      peerAudioGraphs.set(peerUserId, { source, gain, dest: null as any });
+    } else {
+      peerAudioGraphs.delete(peerUserId);
+    }
+  } catch (e) {
+    console.warn("[rtc] WebAudio graph optional boost failed:", e);
+  }
 }
 
 /// Local-only playback volume for one participant. 1 = default, 0 = silent,
@@ -826,8 +836,10 @@ function wirePeerAudioGraph(peerUserId: string) {
 export function setPeerVolume(peerUserId: string, volume: number) {
   const clamped = Math.max(0, Math.min(2, volume));
   peerVolume.set(peerUserId, clamped);
+  const audioEl = remoteAudioEls.get(peerUserId);
+  if (audioEl) audioEl.volume = Math.min(1, clamped);
   const graph = peerAudioGraphs.get(peerUserId);
-  if (graph) graph.gain.gain.value = clamped;
+  if (graph) graph.gain.gain.value = Math.max(0, clamped - 1);
 }
 
 export function getPeerVolume(peerUserId: string): number {

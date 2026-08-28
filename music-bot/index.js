@@ -116,7 +116,11 @@ const COOKIES_WORK = "/tmp/yt-cookies.txt";
 function cookiesFile() {
   try {
     if (fs.statSync(COOKIES_SRC).size === 0) return null;
-    fs.copyFileSync(COOKIES_SRC, COOKIES_WORK);
+    let content = fs.readFileSync(COOKIES_SRC, "utf8");
+    if (!content.startsWith("# Netscape HTTP Cookie File")) {
+      content = "# Netscape HTTP Cookie File\n" + content;
+    }
+    fs.writeFileSync(COOKIES_WORK, content, "utf8");
     return COOKIES_WORK;
   } catch { return null; }
 }
@@ -128,9 +132,8 @@ async function startPlayback(query) {
   log(`startPlayback: ${JSON.stringify(sources)} (cookies: ${cookies ? "yes" : "NONE — YouTube will block this"})`);
   const ytArgs = [
     "--no-progress", "--no-warnings",
-    // Modern YouTube needs a JS runtime + the EJS challenge-solver script to
-    // descramble the `n` throttling param and signatures. Deno is baked into
-    // the image; `--remote-components` opts in to fetching the solver.
+    "--geo-bypass",
+    "--extractor-args", "youtube:player_client=android,ios,web",
     "--js-runtimes", "deno",
     "--remote-components", "ejs:github",
     "-f", "bestaudio/best", "-o", "-",
