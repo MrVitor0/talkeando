@@ -129,15 +129,37 @@ function cookiesFile() {
   } catch { return null; }
 }
 
+function searchYouTube(query, cookies) {
+  return new Promise((resolve) => {
+    const args = ["--no-warnings", "--get-id", `ytsearch1:${query}`];
+    if (cookies) args.push("--cookies", cookies);
+    const p = spawn("yt-dlp", args);
+    let out = "";
+    p.stdout.on("data", d => { out += d.toString(); });
+    p.on("close", code => {
+      const id = out.trim().split("\n")[0];
+      if (code === 0 && id && !id.includes(" ")) {
+        resolve(`https://www.youtube.com/watch?v=${id}`);
+      } else {
+        resolve(`ytsearch1:${query}`);
+      }
+    });
+  });
+}
+
 async function startPlayback(query) {
   stopPlayback();
-  const sources = await resolveSources(query);
   const cookies = cookiesFile();
-  log(`startPlayback: ${JSON.stringify(sources)} (cookies: ${cookies ? "yes" : "NONE — YouTube will block this"})`);
+  let sources = await resolveSources(query);
+  if (!/^https?:\/\//.test(sources[0])) {
+    const resolvedUrl = await searchYouTube(query, cookies);
+    sources = [resolvedUrl];
+  }
+  log(`startPlayback target URL: ${sources[0]} (cookies: ${cookies ? "yes" : "NONE"})`);
+
   const ytArgs = [
     "--no-progress", "--no-warnings",
     "--geo-bypass",
-    "--extractor-args", "youtube:player_skip=visionos",
     "--js-runtimes", "deno",
     "--remote-components", "ejs:github",
     "-f", "251/140/bestaudio/best",
