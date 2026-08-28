@@ -1,230 +1,149 @@
-# Tupi
+# 🦜 Talkeando (Tupi)
 
-Tupi é um app privado para comunidades pequenas: conversa por texto, voz e
-compartilhamento de tela. Backend em Rust, cliente Windows nativo em C#/WPF +
-WebView2 e interface em React.
-See `SDD/` for the full design; `SDD/31-implementation-status.md` for
-exactly what's implemented vs. still pending.
+> **High-Performance, Self-Hosted Real-Time Voice, Video & Text Community Platform**
 
-**This file did not exist until now** — everything below has been run for
-real this session, but nobody has yet followed these exact steps start to
-finish in one uninterrupted pass. If a step doesn't work as written, that's
-a real gap, not a formality; say what broke.
+[![Rust](https://img.shields.io/badge/backend-Rust%20%7C%20Axum-orange.svg)](https://www.rust-lang.org/)
+[![React](https://img.shields.io/badge/frontend-React%20%7C%20TypeScript-blue.svg)](https://reactjs.org/)
+[![.NET](https://img.shields.io/badge/desktop-.NET%206%20WPF-purple.svg)](https://dotnet.microsoft.com/)
+[![WebRTC](https://img.shields.io/badge/media-WebRTC%20Mesh-green.svg)](https://webrtc.org/)
+[![License](https://img.shields.io/badge/license-MIT-informational.svg)](LICENSE)
 
-## Prerequisites
+Talkeando is a modern, privacy-focused, Discord-inspired community platform designed for high fidelity, ultra-low latency communication. It combines a blazing fast Rust backend, an interactive React frontend, and a native Windows desktop client with native game capture, AI noise reduction, push-to-talk, and an integrated YouTube music bot.
 
-Already confirmed present on this machine:
-- Rust (`cargo`) — backend
-- .NET 6 SDK — native client (targets `net6.0-windows10.0.19041.0`)
-- Node.js + npm — React UI
-- Docker — for a local Postgres (and optionally coturn)
+---
 
-## 1. Start Postgres
+## ✨ Features
+
+- 🎙️ **Ultra-Low Latency Voice Chat**: Peer-to-peer WebRTC audio mesh with RNNoise ML noise suppression and automatic gain control.
+- ⌨️ **Push-to-Talk (PTT) & Voice Modes**: Switch between Voice Activity, Push-to-Talk (with custom keybindings and silent operation), or Toggle mode.
+- 🖥️ **Fullscreen Game & Screen Sharing**: High-FPS screen capture (including borderless/fullscreen games) with dedicated system loopback audio.
+- 📹 **Live Webcams & Video Stages**: Synchronized video tiles with camera previews and device selectors.
+- 🎵 **Integrated YouTube Music Bot**: Stream high-quality 48kHz audio directly into voice channels via chat commands (`/play`, `/pause`, `/resume`, `/stop`).
+- ⚙️ **Audio & Video Settings**: Seamless in-app input/output device switching (`setSinkId`), per-user volume boost, and live microphone testing.
+- 💬 **Rich Text Channels & Media**: Markdown support, Discord-compatible emojis, rich embeds, and instant file attachments.
+- 🔄 **In-App Auto-Updates**: Seamless background download and one-click silent installer restart.
+- 🛡️ **Secure Session Storage**: Uses Windows DPAPI to securely store session tokens locally on the client.
+
+---
+
+## 🏗️ Architecture
 
 ```
+talkeando/
+├── client/
+│   ├── native/
+│   │   ├── Talkeando.Client/       # .NET 6 WPF native shell & WebView2 host
+│   │   └── Talkeando.Client.Tests/ # Unit tests (DPAPI, IPC, updater)
+│   └── ui/                         # React 18 + TypeScript + Vite UI bundle
+├── server/                         # Rust (Axum, Tokio, SQLx, WebSocket signaling)
+├── music-bot/                      # Node.js + yt-dlp + ffmpeg + wrtc music streaming bot
+├── infra/                          # Docker Compose definitions (PostgreSQL, coturn, production)
+├── scripts/                        # Development helpers, build scripts & Discord importer
+└── SDD/                            # System Design Documents and Architecture Decisions (ADRs)
+```
+
+---
+
+## 🚀 Quick Start (Local Development)
+
+### Prerequisites
+
+Ensure you have the following installed on your machine:
+- **Rust** (`cargo` 1.75+)
+- **.NET 6 SDK** (or later)
+- **Node.js** (v18+) & **npm**
+- **Docker** & **Docker Compose** (for PostgreSQL)
+
+---
+
+### 1. Start PostgreSQL Database
+
+```bash
 cd infra
 docker compose up -d postgres
 ```
+*Postgres is mapped to port `5434` to avoid collisions with local default instances.*
 
-This uses the credentials already in `docker-compose.yml`
-(`talkeando`/`talkeando`, database `talkeando`), exposed on host port
-**5434** (not Postgres's usual 5432 — picked to avoid colliding with a
-Postgres someone might already have running locally for something else,
-which was in fact the case on the machine this was written on). If 5434 is
-also taken, change the port mapping in `infra/docker-compose.yml` and
-`server/.env`'s `DATABASE_URL` together.
+---
 
-## 2. Configure and start the backend
+### 2. Configure & Launch the Backend
 
-```
+```bash
 cd server
 cp .env.example .env
 ```
 
-Edit `.env` if you want, but the defaults work for local testing as-is
-(`DATABASE_URL` already points at the compose Postgres above). Then:
-
-```
-cargo run --bin talkeando-server -- bootstrap-owner --username alice --password alicepass123 --display-name Alice
+Bootstrap the initial owner account and community:
+```bash
+cargo run --bin talkeando-server -- bootstrap-owner --username admin --password adminpass123 --display-name Admin
 ```
 
-This creates the one community this instance serves, a `general` text
-channel, a `voice` channel, and the owner account (`alice`/`alicepass123`).
-It also prints the community id — you won't need it for anything below.
-**Run this exactly once** — it refuses to run again once a community
-exists.
-
-Now start the server for real (this also runs pending migrations
-automatically):
-
-```
+Start the API and WebSocket server:
+```bash
 cargo run --bin talkeando-server
 ```
+*The server listens on `http://127.0.0.1:8080` by default.*
 
-Leave this running. It listens on `127.0.0.1:8080` by default
-(`BIND_ADDR` in `.env`).
+---
 
-To create a second account (e.g. "bob") to actually test voice/chat/screen
-share between two people, first mint an invite as alice:
+### 3. Build the Web UI
 
-```
-curl -X POST http://127.0.0.1:8080/api/auth/login -H "Content-Type: application/json" -d "{\"username\":\"alice\",\"password\":\"alicepass123\"}"
-```
-
-Copy the `token` from the response, then:
-
-```
-curl -X POST http://127.0.0.1:8080/api/invites -H "Authorization: Bearer <token>" -H "Content-Type: application/json" -d "{}"
-```
-
-That returns a `code` — that's the invite code bob's client will use to
-register.
-
-## 3. Build the React UI
-
-```
+```bash
 cd client/ui
 npm install
 npm run build
 ```
 
-This produces `client/ui/dist/`, which the native client project embeds
-directly (`Talkeando.Client.csproj` copies `../../ui/dist/**` into its own
-output as `ui/`). **Rebuild this after every UI change** — the native
-client does not run a dev server, it loads the built `index.html` from
-disk.
+---
 
-## 4. Build and run the native client
+### 4. Run the Native Desktop Client
 
-```
+```bash
 cd client/native/Talkeando.Client
-dotnet build
 dotnet run
 ```
 
-No environment variables needed for local testing — `NetworkClient`
-defaults to `http://localhost:8080/api` and `ws://localhost:8080/ws` when
-`TALKEANDO_API_BASE_URL`/`TALKEANDO_WS_URL` aren't set (see
-`client/.env.example` for how to point at a different backend).
+---
 
-Log in as `alice`/`alicepass123`.
+## 🧪 Running Tests
 
-## 5. Testing with two accounts on one machine
-
-### The shortcut: `dev.cmd`
-
-From the repo root:
-
-```
-dev
-```
-
-(or `.\dev.cmd`, or `powershell -File scripts\dev.ps1`). It creates
-`server/.env` if missing, builds and `bootstrap-owner`s the server
-(idempotent), starts it in its own window, mints an invite and registers
-`bob` if he doesn't exist yet, builds the React UI, then opens **two
-client windows**, one with `TALKEANDO_PROFILE=alice` and one with `=bob`.
-Log the alice window in as `alice`/`alicepass123` and the bob window as
-`bob`/`bobpass123`.
-
-**Database:** `dev.cmd` reads `server/.env`'s `DATABASE_URL`. The
-checked-in default is the shared/managed database — no Docker needed, and
-`bootstrap-owner`/migrations run against it directly. Only if you point
-`DATABASE_URL` back at `@localhost:5434` does the script start (and need)
-the compose Postgres. The Rust server also forces `search_path = public`
-on every connection so migrations work through a managed Postgres pooler
-(Neon etc.). `cargo test` is unaffected — it uses its own
-`TEST_DATABASE_ADMIN_URL` (local by default), never `DATABASE_URL`.
-
-The stack binds **port 8090**, not 8080 — 8090 is far less likely to
-collide with another dev server, and `dev.cmd` rewrites `server/.env`'s
-`BIND_ADDR` and points both client windows there automatically. The
-by-hand steps below still use 8080 (the `.env.example` default); change
-`BIND_ADDR` yourself if 8080 is taken.
-
-Flags:
-
-- `dev -Reset` — wipe the local per-profile session/WebView2 folders (and,
-  when on the local DB, `docker compose down -v`).
-- `dev -SkipUiBuild` — skip `npm run build` (no `client/ui/src` changes
-  since last run).
-- `dev -NoClients` — bring the backend up and ensure both accounts, but
-  don't open the client windows.
-
-The rest of this section is what that script automates, done by hand.
-
-### By hand
-
-You don't need two physical machines to exercise most of this — but you do
-need to set `TALKEANDO_PROFILE` per instance, or the two windows will fight
-over one shared session file (found the hard way: a second login silently
-overwrote the first window's saved token, and REST calls could pick up the
-wrong user's bearer token mid-session — see `SDD/27-decisions.md` ADR-006).
-
-Terminal 1:
-```
-set TALKEANDO_PROFILE=alice
-dotnet run
-```
-Terminal 2 (a second terminal window, same folder):
-```
-set TALKEANDO_PROFILE=bob
-dotnet run
-```
-(PowerShell: use `$env:TALKEANDO_PROFILE="alice"` instead of `set`.)
-
-Each window's title bar shows its profile name. Log into one as the owner
-and register the other with the invite code from step 2 ("Tenho um
-convite" on the login screen). Both processes talk to the same local
-backend; a voice call or screen share between them is a real P2P
-connection over loopback — this validates signaling, mute/deafen, the
-publish/subscribe screen-share gating, and the UI end to end.
-
-What this single-machine setup does **not** validate: TURN relay (needs a
-real NAT/restrictive-network scenario), and anything specifically about
-running on two separate physical Windows installs (driver quirks, a
-machine with no microphone, etc.) — see
-`SDD/31-implementation-status.md` for exactly what's still pending
-real-hardware validation.
-
-## Running the automated tests
-
-Backend (spins up its own throwaway Postgres database per test against
-whatever Postgres you point it at — safe to run against the same instance
-from step 1):
-
-```
+### Backend Unit & Integration Tests
+```bash
 cd server
 cargo test
 ```
 
-Native client (no server or Postgres needed — these are pure logic/DPAPI
-tests, see `SDD/testing/unit.md` for exactly what is and isn't covered):
-
-```
+### Native Client Tests
+```bash
 cd client/native/Talkeando.Client.Tests
 dotnet test
 ```
 
-## Troubleshooting
+---
 
-- **`bootstrap-owner` says a community already exists**: it already ran
-  successfully; don't run it again. Use the invite-code flow (step 2) for
-  more accounts.
-- **Client can't reach the server**: confirm `cargo run --bin
-  talkeando-server` (step 2) is still running in another terminal, and
-  that nothing else is bound to port 8080.
-- **UI looks stale after a change**: you edited `client/ui/src/*` but
-  forgot `npm run build` — the native client only reads the built
-  `dist/`, never live source.
+## 📦 Production Deployment
 
-## More detail
+Production deployments are orchestrated via Docker Compose:
 
-- `SDD/31-implementation-status.md` — current state, what's verified vs.
-  not, what's genuinely still missing for v1.
-- `SDD/27-decisions.md` — architecture decisions made (and corrected) with
-  the reasoning, including a few real deviations from the original plan
-  (e.g. G722 instead of Opus, GDI capture instead of Windows.Graphics.Capture)
-  found by actually trying to build against the real libraries.
-- `SDD/testing/integration.md` and `SDD/testing/unit.md` — what the
-  automated tests actually cover.
+```bash
+cd infra
+docker compose -f docker-compose.production.yml up -d --build
+```
+
+Services included:
+- `tupi-server`: Production Rust backend binary.
+- `tupi-music-bot`: Containerized music bot with `yt-dlp` and `ffmpeg`.
+- `coturn`: TURN/STUN server for WebRTC NAT traversal.
+
+---
+
+## 🤝 Contributing
+
+Contributions, issues, and feature requests are welcome!
+Feel free to open an issue or submit a pull request.
+
+---
+
+## 📄 License
+
+This project is licensed under the [MIT License](LICENSE).
