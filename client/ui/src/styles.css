@@ -507,18 +507,6 @@ a:hover {
   background: var(--red-hover);
 }
 
-.voice-panel__music {
-  margin: 7px 0 2px;
-  padding: 6px 8px;
-  border-radius: 5px;
-  color: #c9cdfb;
-  background: rgba(88, 101, 242, .16);
-  font-size: 12px;
-  overflow: hidden;
-  white-space: nowrap;
-  text-overflow: ellipsis;
-}
-.voice-panel__music span { color: #aeb4c4; }
 .voice-member__preview {
   position: fixed;
   aspect-ratio: 16 / 9;
@@ -3016,4 +3004,66 @@ a:hover {
 /* Tupi Música "TOCANDO" badge — purple (brand), vs the red "AO VIVO" */
 .voice-member__live-badge--bot {
   background: var(--brand);
+}
+
+/* ==========================================================================
+   Slash-command palette (composer autocomplete)
+   ========================================================================== */
+.composer { position: relative; }
+.slash-menu {
+  position: absolute;
+  left: 16px;
+  right: 16px;
+  bottom: 100%;
+  margin-bottom: 8px;
+  background: var(--bg-floating);
+  border: 1px solid rgba(0, 0, 0, 0.45);
+  border-radius: 8px;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.5);
+  overflow: hidden;
+  z-index: 40;
+}
+.slash-menu__head {
+  padding: 8px 14px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  color: var(--text-muted);
+  background: rgba(0, 0, 0, 0.2);
+}
+.slash-menu__item {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  grid-template-rows: auto auto;
+  column-gap: 12px;
+  width: 100%;
+  padding: 8px 14px;
+  text-align: left;
+  border-left: 2px solid transparent;
+}
+.slash-menu__item.is-active {
+  background: var(--bg-hover);
+  border-left-color: var(--brand);
+}
+.slash-menu__name {
+  grid-column: 1;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--header-primary);
+}
+.slash-menu__args { color: var(--text-faint); font-weight: 500; }
+.slash-menu__desc {
+  grid-column: 1;
+  font-size: 13px;
+  color: var(--text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.slash-menu__src {
+  grid-column: 2;
+  grid-row: 1 / span 2;
+  align-self: center;
+  font-size: 12px;
+  color: var(--text-faint);
 }

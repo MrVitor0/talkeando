@@ -1,4 +1,4 @@
-import { FormEvent, MouseEvent as ReactMouseEvent, RefObject, useEffect, useMemo, useRef, useState } from "react";
+import { FormEvent, KeyboardEvent as ReactKeyboardEvent, MouseEvent as ReactMouseEvent, RefObject, useEffect, useMemo, useRef, useState } from "react";
 import { send, subscribe } from "./ipc";
 import * as rtc from "./rtc";
 import { playSound, setSoundsMuted } from "./sounds";
@@ -663,6 +663,11 @@ export function App() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [content, setContent] = useState("");
   const [attachmentIds, setAttachmentIds] = useState<string[]>([]);
+  // Slash-command palette: highlighted row + the content value the user last
+  // pressed Esc on (so it stays closed without wiping what they typed).
+  const [slashSel, setSlashSel] = useState(0);
+  const [slashDismiss, setSlashDismiss] = useState("");
+  const composerRef = useRef<HTMLInputElement>(null);
   const [uploading, setUploading] = useState(false);
   const [showMembers, setShowMembers] = useState(true);
   const [menu, setMenu] = useState<MenuState | null>(null);
@@ -1113,6 +1118,29 @@ export function App() {
       setMessages(current => current.map(message => message.reqId === reqId ? { ...message, pending: false, failed: true } : message));
     }, SEND_TIMEOUT_MS);
   }
+  // Slash palette is open only while typing the command *name* ("/", "/pl",
+  // "/play") — once a space is typed the user is on the arguments and it hides.
+  const slashPrefix = content.match(/^\/([a-z]*)$/i);
+  const slashMatches = slashPrefix
+    ? SLASH_COMMANDS.filter(command => command.name.startsWith(slashPrefix[1].toLowerCase()))
+    : [];
+  const slashOpen = slashMatches.length > 0 && content !== slashDismiss;
+  const slashIndex = Math.max(0, Math.min(slashSel, slashMatches.length - 1));
+  useEffect(() => { setSlashSel(0); }, [slashPrefix?.[1]]);
+  function applySlash(command: SlashCommand) {
+    setContent(`/${command.name} `);
+    setSlashSel(0);
+    setSlashDismiss("");
+    composerRef.current?.focus();
+  }
+  function onComposerKeyDown(event: ReactKeyboardEvent<HTMLInputElement>) {
+    if (!slashOpen) return;
+    if (event.key === "ArrowDown") { event.preventDefault(); setSlashSel(value => (value + 1) % slashMatches.length); }
+    else if (event.key === "ArrowUp") { event.preventDefault(); setSlashSel(value => (value - 1 + slashMatches.length) % slashMatches.length); }
+    else if (event.key === "Enter" || event.key === "Tab") { event.preventDefault(); applySlash(slashMatches[slashIndex]); }
+    else if (event.key === "Escape") { event.preventDefault(); setSlashDismiss(content); }
+  }
+
   function submitMessage(event: FormEvent) {
     event.preventDefault();
     if (!activeChannel || (!content.trim() && attachmentIds.length === 0)) return;
@@ -2088,6 +2116,29 @@ export function App() {
 
             {activeChannel && (
               <form className="composer" onSubmit={submitMessage}>
+                {slashOpen && (
+                  <div className="slash-menu">
+                    <div className="slash-menu__head">
+                      {call ? "COMANDOS — Tupi Música" : "⚠️ Entre num canal de voz para usar"}
+                    </div>
+                    {slashMatches.map((command, index) => (
+                      <button
+                        type="button"
+                        key={command.name}
+                        className={index === slashIndex ? "slash-menu__item is-active" : "slash-menu__item"}
+                        onMouseEnter={() => setSlashSel(index)}
+                        onMouseDown={event => { event.preventDefault(); applySlash(command); }}
+                      >
+                        <span className="slash-menu__name">
+                          /{command.name}
+                          {command.args && <span className="slash-menu__args"> {command.args}</span>}
+                        </span>
+                        <span className="slash-menu__desc">{command.desc}</span>
+                        <span className="slash-menu__src">Tupi Música</span>
+                      </button>
+                    ))}
+                  </div>
+                )}
                 {attachmentIds.length > 0 && (
                   <div className="composer__pills">{attachmentIds.length} anexo(s) pronto(s)</div>
                 )}
@@ -2096,8 +2147,10 @@ export function App() {
                     <Icon name="add-media" size={16} />
                   </button>
                   <input
+                    ref={composerRef}
                     value={content}
                     onChange={event => setContent(event.target.value)}
+                    onKeyDown={onComposerKeyDown}
                     placeholder={`Conversar em #${activeChannel.name}`}
                     maxLength={4000}
                   />
