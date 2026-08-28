@@ -130,17 +130,46 @@ public sealed class UpdateChecker
             throw new FileNotFoundException("Arquivo de instalação não encontrado.");
 
         DebugLog.Write($"Applying update from: {path}");
-        Process.Start(new ProcessStartInfo
-        {
-            FileName = path,
-            Arguments = "/SILENT /SUPPRESSMSGBOXES",
-            UseShellExecute = true
-        });
 
-        System.Windows.Application.Current.Dispatcher.Invoke(() =>
+        try
         {
-            System.Windows.Application.Current.Shutdown();
-        });
+            var currentProcess = Process.GetCurrentProcess();
+            var currentPid = currentProcess.Id;
+            var currentExe = currentProcess.MainModule?.FileName;
+
+            // Create a reliable detached runner script to wait for Tupi to exit, install, and relaunch
+            var batchScript = "@echo off\r\n" +
+                $"timeout /t 1 /nobreak > nul\r\n" +
+                $"taskkill /PID {currentPid} /F > nul 2>&1\r\n" +
+                $"start /wait \"\" \"{path}\" /SILENT /SUPPRESSMSGBOXES\r\n";
+
+            if (!string.IsNullOrEmpty(currentExe) && File.Exists(currentExe))
+            {
+                batchScript += $"start \"\" \"{currentExe}\"\r\n";
+            }
+
+            var batchPath = Path.Combine(Path.GetTempPath(), $"tupi-update-{Guid.NewGuid():N}.bat");
+            File.WriteAllText(batchPath, batchScript);
+
+            Process.Start(new ProcessStartInfo
+            {
+                FileName = "cmd.exe",
+                Arguments = $"/c \"{batchPath}\"",
+                CreateNoWindow = true,
+                UseShellExecute = true
+            });
+        }
+        catch (Exception ex)
+        {
+            DebugLog.Write($"Failed to launch batch updater: {ex.Message}. Falling back to direct setup launch.");
+            Process.Start(new ProcessStartInfo
+            {
+                FileName = path,
+                UseShellExecute = true
+            });
+        }
+
+        Environment.Exit(0);
     }
 
     private static string CleanVersionString(string raw)

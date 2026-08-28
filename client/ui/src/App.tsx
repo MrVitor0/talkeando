@@ -797,6 +797,7 @@ export function App() {
   } | null>(null);
   const [updateProgress, setUpdateProgress] = useState<number | null>(null);
   const [updateReady, setUpdateReady] = useState(false);
+  const [updateReadyPath, setUpdateReadyPath] = useState<string | null>(null);
   const [updateDismissed, setUpdateDismissed] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   // `historyLoading` now means only "show the skeleton" — it is true just on
@@ -1008,6 +1009,7 @@ export function App() {
       if (event.op === "update.ready") {
         setUpdateProgress(null);
         setUpdateReady(true);
+        setUpdateReadyPath(event.data?.file_path ?? null);
       }
       if (event.op === "update.error") {
         setUpdateProgress(null);
@@ -1916,35 +1918,58 @@ export function App() {
         />
       )}
       {updateInfo && !updateDismissed && (
-        <div className="update-banner">
-          <div className="update-banner__content">
-            <span className="update-banner__badge">UPDATE</span>
-            <span className="update-banner__text">
-              Nova versão disponível: <strong>{updateInfo.latest_version}</strong>
-            </span>
-          </div>
-          <div className="update-banner__actions">
-            {updateProgress !== null ? (
-              <div className="update-banner__progress-wrap">
-                <div className="update-banner__progress-bar" style={{ width: `${Math.max(updateProgress, 5)}%` }} />
-                <span className="update-banner__progress-text">
-                  {updateProgress >= 0 ? `Baixando ${updateProgress}%` : "Baixando..."}
-                </span>
+        <div className="update-modal-overlay">
+          <div className="update-modal-card">
+            <button className="update-modal-close" onClick={() => setUpdateDismissed(true)} title="Fechar">✕</button>
+            <div className="update-modal-badge">ATUALIZAÇÃO DISPONÍVEL</div>
+            <h2 className="update-modal-title">Nova Versão do Tupi</h2>
+            <div className="update-modal-version-row">
+              <span className="update-modal-ver-pill">Atual: {updateInfo.current_version}</span>
+              <span className="update-modal-arrow">➔</span>
+              <span className="update-modal-ver-pill is-latest">{updateInfo.latest_version}</span>
+            </div>
+
+            {updateInfo.release_notes && (
+              <div className="update-modal-notes">
+                <div className="update-modal-notes-title">Novidades:</div>
+                <div className="update-modal-notes-content">
+                  {updateInfo.release_notes}
+                </div>
               </div>
-            ) : updateReady ? (
-              <button className="update-banner__btn update-banner__btn--ready" onClick={() => send("update.apply", {})}>
-                Reiniciar e Atualizar
-              </button>
-            ) : (
-              <>
-                <button className="update-banner__btn update-banner__btn--download" onClick={() => { setUpdateProgress(0); send("update.download", { download_url: updateInfo.download_url }); }}>
-                  Atualizar Agora
-                </button>
-                <button className="update-banner__btn update-banner__btn--dismiss" onClick={() => setUpdateDismissed(true)}>
-                  Depois
-                </button>
-              </>
             )}
+
+            <div className="update-modal-actions">
+              {updateProgress !== null ? (
+                <div className="update-modal-progress-wrap">
+                  <div className="update-modal-progress-bar" style={{ width: `${Math.max(updateProgress, 5)}%` }} />
+                  <span className="update-modal-progress-text">
+                    {updateProgress >= 0 ? `Baixando atualização... ${updateProgress}%` : "Baixando atualização..."}
+                  </span>
+                </div>
+              ) : updateReady ? (
+                <button
+                  className="update-modal-btn is-ready"
+                  onClick={() => send("update.apply", { file_path: updateReadyPath })}
+                >
+                  Reiniciar e Atualizar Agora
+                </button>
+              ) : (
+                <div className="update-modal-btn-group">
+                  <button className="update-modal-btn is-dismiss" onClick={() => setUpdateDismissed(true)}>
+                    Depois
+                  </button>
+                  <button
+                    className="update-modal-btn is-primary"
+                    onClick={() => {
+                      setUpdateProgress(0);
+                      send("update.download", { download_url: updateInfo.download_url });
+                    }}
+                  >
+                    Baixar e Instalar
+                  </button>
+                </div>
+              )}
+            </div>
           </div>
         </div>
       )}
