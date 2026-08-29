@@ -44,9 +44,8 @@ const peerAudioMuted = new Map<string, boolean>();
 // member's right-click menu. 1 = default, 0 = silent, up to 2 = +100% boost.
 // Applied through a per-peer WebAudio GainNode because an <audio> element's
 // own `.volume` clamps at 1 and can't boost a too-quiet talker.
-const peerVolume = new Map<string, number>();
-type PeerAudioGraph = { source: MediaStreamAudioSourceNode; gain: GainNode };
-const peerAudioGraphs = new Map<string, PeerAudioGraph>();
+const PEER_VOLUME_STORAGE_KEY = "tk.peerVolumes";
+const peerVolume = new Map<string, number>(Object.entries(readStoredPeerVolumes()));
 let remoteAudioCtx: AudioContext | null = null;
 const pendingTurnRequests = new Map<string, (creds: TurnCredentials) => void>();
 const remoteVideoListeners = new Set<RemoteStreamListener>();
@@ -422,11 +421,6 @@ function closePeer(peerUserId: string) {
   if (timer) { clearTimeout(timer); iceRestartTimers.delete(peerUserId); }
   const audioEl = remoteAudioEls.get(peerUserId);
   if (audioEl) { audioEl.srcObject = null; audioEl.remove(); remoteAudioEls.delete(peerUserId); }
-  const graph = peerAudioGraphs.get(peerUserId);
-  if (graph) {
-    try { graph.source.disconnect(); graph.gain.disconnect(); } catch { /* already gone */ }
-    peerAudioGraphs.delete(peerUserId);
-  }
   // Keep peerVolume[peerUserId] so a rejoin restores the level the user set.
   remoteAudioStreams.delete(peerUserId);
   emitRemoteStream(peerUserId, null);
@@ -731,7 +725,6 @@ export async function leaveCall() {
   if (localStream) { for (const track of localStream.getTracks()) track.stop(); localStream = null; }
   if (rawMic) { for (const track of rawMic.getTracks()) track.stop(); rawMic = null; }
   void noiseSuppression.teardown();
-  peerAudioGraphs.clear();
   if (remoteAudioCtx) { void remoteAudioCtx.close().catch(() => { /* already closed */ }); remoteAudioCtx = null; }
   joinedCall = false;
   currentChannelId = null;
@@ -820,72 +813,42 @@ export function ensureSpeakingAudioCtx(): AudioContext {
 /// whenever that peer's set of audio tracks changes (mic arrives, screen-share
 /// audio starts or stops) because a MediaStreamAudioSourceNode is a snapshot
 /// of the stream taken at creation time.
-function disposePeerAudioGraph(peerUserId: string) {
-  const graph = peerAudioGraphs.get(peerUserId);
-  if (!graph) return;
-  try { graph.source.disconnect(); graph.gain.disconnect(); } catch { /* already closed */ }
-  peerAudioGraphs.delete(peerUserId);
-}
-
 /**
  * Uses the element for normal attenuation (0..100%) and switches exclusively
  * to WebAudio only for a true boost. The old implementation left both paths
  * audible above 100%, which could duplicate the same remote track.
  */
-function applyPeerAudioOutput(peerUserId: string, rebuildGraph = false) {
+function applyPeerAudioOutput(peerUserId: string) {
   const audioEl = remoteAudioEls.get(peerUserId);
   const audioStream = remoteAudioStreams.get(peerUserId);
   if (!audioEl || !audioStream || audioStream.getAudioTracks().length === 0) return;
   const isMuted = !joinedCall || localDeafened || (peerAudioMuted.get(peerUserId) ?? false);
-  const volume = (peerVolume.get(peerUserId) ?? 1) * outputVolume;
-  const needsBoostGraph = !isMuted && volume > 1;
+  const volume = clampUnit((peerVolume.get(peerUserId) ?? 1) * outputVolume);
 
   audioEl.srcObject = audioStream;
   void audioEl.play().catch(error => console.error("[rtc] remote audio play() failed", error));
 
-  if (!needsBoostGraph) {
-    disposePeerAudioGraph(peerUserId);
-    audioEl.muted = isMuted;
-    audioEl.volume = isMuted ? 0 : Math.min(1, Math.max(0, volume));
-    return;
-  }
-
-  // The element must be muted while the WebAudio graph is active; otherwise
-  // it would play the same MediaStream a second time alongside the gain node.
-  audioEl.muted = true;
-  audioEl.volume = 0;
-  try {
-    const existing = peerAudioGraphs.get(peerUserId);
-    if (existing && !rebuildGraph) {
-      existing.gain.gain.value = volume;
-    } else {
-      disposePeerAudioGraph(peerUserId);
-      const ctx = ensureRemoteAudioCtx();
-      const source = ctx.createMediaStreamSource(audioStream);
-      const gain = ctx.createGain();
-      gain.gain.value = volume;
-      source.connect(gain).connect(ctx.destination);
-      peerAudioGraphs.set(peerUserId, { source, gain });
-    }
-  } catch (e) {
-    console.warn("[rtc] WebAudio graph optional boost failed:", e);
-    audioEl.muted = isMuted;
-    audioEl.volume = isMuted ? 0 : 1;
-  }
+  audioEl.muted = isMuted;
+  audioEl.volume = isMuted ? 0 : volume;
 }
 
-function wirePeerAudioGraph(peerUserId: string) { applyPeerAudioOutput(peerUserId, true); }
+function wirePeerAudioGraph(peerUserId: string) { applyPeerAudioOutput(peerUserId); }
 
 /// Local-only playback volume for one participant. 1 = default, 0 = silent,
 /// 2 = +100% boost. Nothing leaves this client.
 export function setPeerVolume(peerUserId: string, volume: number) {
-  const clamped = Math.max(0, Math.min(2, volume));
+  const clamped = clampUnit(volume);
   peerVolume.set(peerUserId, clamped);
+  persistPeerVolumes();
   applyPeerAudioOutput(peerUserId);
 }
 
 export function getPeerVolume(peerUserId: string): number {
   return peerVolume.get(peerUserId) ?? 1;
+}
+
+export function getPeerVolumes(): Record<string, number> {
+  return Object.fromEntries(peerVolume);
 }
 
 /// SCREEN-FR-001/SUB-FR-001: capture starts immediately (via the native
@@ -1224,10 +1187,10 @@ let audioOutputDeviceId: string | null = (() => {
   try { return localStorage.getItem("tk.audioOutputDeviceId"); } catch { return null; }
 })();
 let inputVolume: number = (() => {
-  try { const v = localStorage.getItem("tk.inputVolume"); return v ? parseFloat(v) : 1; } catch { return 1; }
+  try { const v = localStorage.getItem("tk.inputVolume"); return v ? clampUnit(parseFloat(v)) : 1; } catch { return 1; }
 })();
 let outputVolume: number = (() => {
-  try { const v = localStorage.getItem("tk.outputVolume"); return v ? parseFloat(v) : 1; } catch { return 1; }
+  try { const v = localStorage.getItem("tk.outputVolume"); return v ? clampUnit(parseFloat(v)) : 1; } catch { return 1; }
 })();
 
 export function getAudioInputDeviceId() { return audioInputDeviceId; }
@@ -1280,14 +1243,32 @@ export async function setAudioOutputDevice(deviceId: string): Promise<void> {
 }
 
 export function setInputVolumeLevel(volume: number) {
-  inputVolume = Math.max(0, Math.min(2, volume));
+  inputVolume = clampUnit(volume);
   try { localStorage.setItem("tk.inputVolume", inputVolume.toString()); } catch {}
 }
 
 export function setOutputVolumeLevel(volume: number) {
-  outputVolume = Math.max(0, Math.min(2, volume));
+  outputVolume = clampUnit(volume);
   try { localStorage.setItem("tk.outputVolume", outputVolume.toString()); } catch {}
   for (const peerUserId of remoteAudioEls.keys()) applyPeerAudioOutput(peerUserId);
+}
+
+function clampUnit(value: number): number {
+  return Number.isFinite(value) ? Math.max(0, Math.min(1, value)) : 1;
+}
+
+function readStoredPeerVolumes(): Record<string, number> {
+  try {
+    const value = JSON.parse(localStorage.getItem(PEER_VOLUME_STORAGE_KEY) || "{}");
+    if (!value || typeof value !== "object") return {};
+    return Object.fromEntries(Object.entries(value)
+      .filter(([userId, volume]) => Boolean(userId) && typeof volume === "number")
+      .map(([userId, volume]) => [userId, clampUnit(volume as number)]));
+  } catch { return {}; }
+}
+
+function persistPeerVolumes() {
+  try { localStorage.setItem(PEER_VOLUME_STORAGE_KEY, JSON.stringify(Object.fromEntries(peerVolume))); } catch { /* private mode */ }
 }
 
 export async function listAllMediaDevices(): Promise<{

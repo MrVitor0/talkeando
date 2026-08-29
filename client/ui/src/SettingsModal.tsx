@@ -413,6 +413,7 @@ export function SettingsModal({
                       type="range"
                       min="0"
                       max="100"
+                      step="1"
                       value={inputVol}
                       onChange={e => handleInputVolChange(parseInt(e.target.value, 10))}
                       className="settings-slider"
@@ -428,6 +429,7 @@ export function SettingsModal({
                       type="range"
                       min="0"
                       max="100"
+                      step="1"
                       value={outputVol}
                       onChange={e => handleOutputVolChange(parseInt(e.target.value, 10))}
                       className="settings-slider"

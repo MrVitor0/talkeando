@@ -60,10 +60,73 @@ jobs:
           TEST_DATABASE_ADMIN_URL: postgres://talkeando:talkeando@localhost:5434/postgres
         run: cargo test --locked
 
+  provider-integration:
+    name: Verify real music providers
+    runs-on: ubuntu-latest
+    environment: production
+    needs: validate
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate integration secrets
+        env:
+          SPOTIFY_CLIENT_ID: ${{ secrets.SPOTIFY_CLIENT_ID }}
+          SPOTIFY_CLIENT_SECRET: ${{ secrets.SPOTIFY_CLIENT_SECRET }}
+          SPOTIFY_REFRESH_TOKEN: ${{ secrets.SPOTIFY_REFRESH_TOKEN }}
+          YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
+          YT_DLP_COOKIES_B64: ${{ secrets.YT_DLP_COOKIES_B64 }}
+        run: |
+          test -n "$SPOTIFY_CLIENT_ID" || { echo "Missing SPOTIFY_CLIENT_ID"; exit 1; }
+          test -n "$SPOTIFY_CLIENT_SECRET" || { echo "Missing SPOTIFY_CLIENT_SECRET"; exit 1; }
+          test -n "$SPOTIFY_REFRESH_TOKEN" || { echo "Missing SPOTIFY_REFRESH_TOKEN"; exit 1; }
+          test -n "$YOUTUBE_API_KEY" || { echo "Missing YOUTUBE_API_KEY"; exit 1; }
+          test -n "$YT_DLP_COOKIES_B64" || { echo "Missing YT_DLP_COOKIES_B64"; exit 1; }
+
+      - name: Prepare YouTube cookie jar
+        env:
+          YT_DLP_COOKIES_B64: ${{ secrets.YT_DLP_COOKIES_B64 }}
+        run: |
+          install -d -m 700 .ci/cookies
+          printf '%s' "$YT_DLP_COOKIES_B64" | base64 --decode > .ci/cookies/yt.txt
+          test -s .ci/cookies/yt.txt
+          head -c 8192 .ci/cookies/yt.txt | grep -qiE "cookie|youtube\.com"
+
+      - name: Start Proof-of-Origin provider
+        run: |
+          docker network create tupi-music-integration
+          docker run -d --rm --name tupi-bgutil-provider --network tupi-music-integration brainicism/bgutil-ytdlp-pot-provider:latest
+          sleep 3
+
+      - name: Build bot integration image
+        run: docker build --tag tupi-music-provider-smoke ./music-bot
+
+      - name: Exercise real playlists and YouTube extraction
+        env:
+          SPOTIFY_CLIENT_ID: ${{ secrets.SPOTIFY_CLIENT_ID }}
+          SPOTIFY_CLIENT_SECRET: ${{ secrets.SPOTIFY_CLIENT_SECRET }}
+          SPOTIFY_REFRESH_TOKEN: ${{ secrets.SPOTIFY_REFRESH_TOKEN }}
+          YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
+        run: |
+          docker run --rm \
+            --network tupi-music-integration \
+            --volume "${{ github.workspace }}/.ci/cookies:/cookies:ro" \
+            --env SPOTIFY_CLIENT_ID \
+            --env SPOTIFY_CLIENT_SECRET \
+            --env SPOTIFY_REFRESH_TOKEN \
+            --env YOUTUBE_API_KEY \
+            --env YT_DLP_COOKIES=/cookies/yt.txt \
+            --env YT_POT_PROVIDER_URL=http://tupi-bgutil-provider:4416 \
+            tupi-music-provider-smoke node scripts/provider-integration-smoke.js
+
+      - name: Print PoToken provider logs on failure
+        if: failure()
+        run: docker logs tupi-bgutil-provider || true
+
   deploy:
     name: Lightsail São Paulo
     runs-on: ubuntu-latest
-    needs: validate
+    needs: [validate, provider-integration]
     environment: production
 
     steps:

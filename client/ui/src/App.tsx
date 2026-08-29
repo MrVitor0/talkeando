@@ -1098,7 +1098,7 @@ export function App() {
   const [theater, setTheater] = useState(false);
   const [mutedPeers, setMutedPeers] = useState<Record<string, boolean>>({});
   // Local-only per-user playback volume (0..2, 1 = default). Not sent anywhere.
-  const [peerVolumes, setPeerVolumes] = useState<Record<string, number>>({});
+  const [peerVolumes, setPeerVolumes] = useState<Record<string, number>>(() => rtc.getPeerVolumes());
   const [noiseSup, setNoiseSup] = useState(() => {
     try { return localStorage.getItem("tk.noiseSuppression") !== "off"; } catch { return true; }
   });
@@ -2495,8 +2495,8 @@ export function App() {
         label: callmate.is_bot ? "Volume da música" : "Volume do usuário",
         value: Math.round((peerVolumes[userId] ?? 1) * 100),
         min: 0,
-        max: 200,
-        step: 5,
+        max: 100,
+        step: 1,
         resetTo: 100,
         format: percent => `${percent}%`,
         onChange: percent => changePeerVolume(userId, percent / 100),
@@ -2546,7 +2546,7 @@ export function App() {
     });
   }
   function changePeerVolume(userId: string, volume: number) {
-    const clamped = Math.max(0, Math.min(2, volume));
+    const clamped = Math.max(0, Math.min(1, volume));
     rtc.setPeerVolume(userId, clamped);
     setPeerVolumes(current => ({ ...current, [userId]: clamped }));
   }
