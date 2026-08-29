@@ -24,12 +24,15 @@ Cadastre no environment `production` do repositório:
 
 - `SPOTIFY_CLIENT_ID` — obrigatório para links do Spotify.
 - `SPOTIFY_CLIENT_SECRET` — obrigatório para links do Spotify.
-- `YOUTUBE_API_KEY` — obrigatório para expandir playlists do YouTube pela Data API v3.
+- `YOUTUBE_API_KEY` — obrigatório: resolve links/playlists do YouTube em título + artista pela Data API v3 (descoberta apenas).
 - `AUDIUS_API_KEY` — opcional; deixe ausente se estiver usando o acesso público legado.
+- `SPOTIFY_REFRESH_TOKEN` — opcional; só para playlists privadas/colaborativas. Playlists públicas funcionam sem ele.
 
-`YT_DLP_COOKIES_B64` continua opcional e pertence somente ao último fallback do
-YouTube. Ele não substitui `YOUTUBE_API_KEY`, pois cookies são usados para abrir
-o áudio e a chave da Data API é usada apenas para ler playlists.
+O YouTube é só descoberta: o áudio sai de SoundCloud/Audius, então não há
+`YT_DLP_COOKIES_B64`, sidecar de Proof-of-Origin (`bgutil-provider`) nem
+checagem de IP de datacenter. Para reativar o player YouTube como último
+recurso, defina `PROVIDER_CHAIN=cache,library,soundcloud,audius,youtube` no
+ambiente do bot (sem cookies, o YouTube costuma bloquear).
 
 ## Antes de empacotar o cliente beta
 

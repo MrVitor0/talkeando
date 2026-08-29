@@ -30,19 +30,35 @@ falhar, a interface volta automaticamente ao ícone do provider.
 
 O texto informado pelo usuário é convertido primeiro em um intent independente
 de fonte. Para cada faixa, o bot tenta a cadeia configurada em
-`PROVIDER_CHAIN`; o padrão é `cache,library,soundcloud,audius,youtube`.
+`PROVIDER_CHAIN`; o padrão é `cache,library,soundcloud,audius`.
 `cache` e `library` são reservados para implementação futura. Uma falha no
-SoundCloud afeta somente a faixa atual: o bot tenta Audius e, por último, o
-fallback existente do YouTube.
+SoundCloud afeta somente a faixa atual: o bot tenta Audius em seguida.
 
-URLs de vídeo do YouTube usam o oEmbed público para obter título e autor, sem
-executar `yt-dlp`. Playlists usam `playlistItems.list` quando
-`YOUTUBE_API_KEY` estiver definida. Sem a chave, o link degrada para uma única
-busca textual; o bot nunca chama o endpoint caro `search.list`.
+**YouTube é só descoberta.** Um link ou playlist do YouTube vira título +
+artista pela Data API (`YOUTUBE_API_KEY`) e o áudio sai de SoundCloud/Audius —
+não há cookies, nem sidecar de Proof-of-Origin, nem checagem de IP de
+datacenter para perder. O player do YouTube via `yt-dlp` continua no código,
+mas fora da cadeia padrão: acrescente `,youtube` ao `PROVIDER_CHAIN` para
+reativá-lo como último recurso (sem cookies, costuma ser bloqueado).
 
-Spotify é opcional. Faixas e álbuns requerem `SPOTIFY_CLIENT_ID` e `SPOTIFY_CLIENT_SECRET`; playlists também exigem `SPOTIFY_REFRESH_TOKEN`, pois a API atual exige OAuth de usuário para listar os itens. No painel Spotify, cadastre `http://127.0.0.1:8787/spotify/callback` como Redirect URI e execute `node music-bot/scripts/spotify-authorize.js` com as credenciais no ambiente; o script mostra o valor a salvar exclusivamente no GitHub Secret `SPOTIFY_REFRESH_TOKEN`.
+URLs de vídeo do YouTube usam a Data API (ou o oEmbed público como fallback)
+para obter título e autor, sem executar `yt-dlp`. Playlists usam
+`playlistItems.list` quando `YOUTUBE_API_KEY` estiver definida. Sem a chave, o
+link degrada para uma única busca textual; o bot nunca chama o endpoint caro
+`search.list`.
 
-Depois de um deploy, execute manualmente o workflow **Music provider integration smoke** no GitHub Actions. Ele roda no container da VPS e valida, sem expor credenciais, as três playlists Spotify e os quatro vídeos/duas playlists YouTube de referência, incluindo a extração real pelo `yt-dlp`.
+Spotify é opcional e **não precisa de `SPOTIFY_REFRESH_TOKEN`**. Faixas,
+álbuns e playlists **públicas** de usuário funcionam só com `SPOTIFY_CLIENT_ID`
+e `SPOTIFY_CLIENT_SECRET` (fluxo client credentials). Playlists **privadas ou
+colaborativas** e as playlists editoriais/algorítmicas do próprio Spotify (ids
+que começam com `37i9`) retornam erro pela API independentemente do token; o
+bot responde com "Essa playlist é privada ou não pode ser usada". Se você
+realmente precisa de playlists privadas, gere um `SPOTIFY_REFRESH_TOKEN` com
+`node music-bot/scripts/spotify-authorize.js` (cadastre
+`http://127.0.0.1:8787/spotify/callback` como Redirect URI no painel Spotify) e
+salve só como GitHub Secret.
+
+Depois de um deploy, execute manualmente o workflow **Music provider integration smoke** no GitHub Actions. Ele roda no container da VPS e valida, sem expor credenciais: uma playlist pública do Spotify expande em faixas, uma playlist editorial `37i9…` é rejeitada com a mensagem certa, os metadados de vídeo/playlist da YouTube Data API resolvem, e SoundCloud + Audius realmente entregam bytes de áudio.
 Faixas, álbuns e playlists preservam título, artistas, duração e ISRC durante a
 resolução. `AUDIUS_API_KEY` também é opcional e permite usar uma credencial dos
 planos atuais da API Audius quando necessário.
@@ -55,6 +71,7 @@ exemplo, `0.10`) no ambiente do bot se a comunidade preferir mais baixo;
 Exemplos válidos para a ordem dos providers:
 
 ```env
-PROVIDER_CHAIN=cache,library,soundcloud,audius,youtube
-PROVIDER_CHAIN=["soundcloud","audius","youtube"]
+PROVIDER_CHAIN=cache,library,soundcloud,audius
+PROVIDER_CHAIN=["soundcloud","audius"]
+PROVIDER_CHAIN=cache,library,soundcloud,audius,youtube   # reativa o player YouTube
 ```

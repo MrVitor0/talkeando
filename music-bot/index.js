@@ -4,7 +4,6 @@
 // single long-lived track which every caller's PeerConnection carries, so
 // changing songs never renegotiates and never stacks extra senders.
 const WebSocket = require("ws");
-const fs = require("fs");
 // `wrtc` (node-webrtc) has been unmaintained since 2020 and has no working
 // prebuilt binaries for Node >= 16 — on node:18 it crashes the process the
 // first time an RTCPeerConnection / RTCAudioSource is created, which showed
@@ -24,7 +23,7 @@ const { SpotifyIntentResolver } = require("./src/intents/spotify-intent-resolver
 const { YouTubeIntentResolver } = require("./src/intents/youtube-intent-resolver");
 const { TextIntentResolver } = require("./src/intents/text-intent-resolver");
 const { TrackScorer } = require("./src/matching/track-scorer");
-const { ProviderChain } = require("./src/providers/provider-chain");
+const { ProviderChain, parseProviderOrder } = require("./src/providers/provider-chain");
 const { NullProvider } = require("./src/providers/null-provider");
 const { SoundCloudProvider } = require("./src/providers/soundcloud-provider");
 const { AudiusProvider } = require("./src/providers/audius-provider");
@@ -224,54 +223,20 @@ function emitFrame() {
   }
 }
 
-// ------------------------------------------------------------------- cookies
-// YouTube blocks datacenter IPs outright ("Sign in to confirm you're not a
-// bot") — no player_client bypasses it any more, only real cookies. Drop a
-// Netscape cookies.txt at YT_DLP_COOKIES (default /cookies/yt.txt, mounted
-// read-only by docker-compose) and the bot uses it automatically.
-const COOKIES_SRC = process.env.YT_DLP_COOKIES || "/cookies/yt.txt";
-const COOKIES_WORK = "/tmp/yt-cookies.txt";
-function cookiesFile() {
-  try {
-    const srcStat = fs.existsSync(COOKIES_SRC) ? fs.statSync(COOKIES_SRC) : null;
-    const workStat = fs.existsSync(COOKIES_WORK) ? fs.statSync(COOKIES_WORK) : null;
-    const haveSrc = srcStat && srcStat.size > 0;
-    const haveWork = workStat && workStat.size > 0;
-    // yt-dlp rotates __Secure-*PSIDTS / SIDCC and rewrites the jar on exit, so
-    // it needs a writable copy — but that copy must not outrank a cookies.txt
-    // you just dropped on the host, or refreshing cookies silently does
-    // nothing. Newest mtime wins.
-    if (haveSrc && (!haveWork || srcStat.mtimeMs > workStat.mtimeMs)) {
-      let content = fs.readFileSync(COOKIES_SRC, "utf8");
-      if (!content.startsWith("# Netscape HTTP Cookie File")) content = "# Netscape HTTP Cookie File\n" + content;
-      fs.writeFileSync(COOKIES_WORK, content, "utf8");
-      log(`refreshed the cookie jar from ${COOKIES_SRC}`);
-      return COOKIES_WORK;
-    }
-    return haveWork ? COOKIES_WORK : null;
-  } catch (error) { log(`cookie jar unusable: ${error.message}`); return null; }
-}
-
 // -------------------------------------------------------------------- yt-dlp
-// Client sets tried in order. `visionos` only ever offers the muxed 360p
-// format 18 and then 403s on the media URL, so it is excluded up front; the
-// rest are fallbacks for when YouTube breaks the preferred one. (The old
-// `player_skip=visionos` was a no-op — player_skip takes stages, not clients,
-// and `--no-warnings` hid yt-dlp saying so.)
+// yt-dlp is only used for SoundCloud search now (see YtDlpClient). YouTube is
+// discovery-only — its Data API resolves a link/playlist to title + artist and
+// SoundCloud/Audius do the playback — so there is no cookie jar, no Proof-of-
+// Origin sidecar, and no datacenter-IP bot check to lose to. `ytArgs` and the
+// client-set fallback stay here for the opt-in `PROVIDER_CHAIN=...,youtube`
+// last-resort player; without cookies it will usually be blocked, which is the
+// accepted trade-off for dropping the cookie treadmill.
 const CLIENT_SETS = [
   process.env.YT_PLAYER_CLIENTS || "default,-visionos",
   "tv,web_embedded",
   "web_safari,mweb",
 ];
 const AUDIO_FORMAT = process.env.YT_AUDIO_FORMAT || "bestaudio[acodec=opus]/bestaudio/best";
-// bgutil-ytdlp-pot-provider sidecar (docker-compose service `bgutil-provider`,
-// pip package installed in the Dockerfile). It hands yt-dlp a real
-// Proof-of-Origin token, which is what actually satisfies YouTube's bot check
-// from this VPS's datacenter IP — account cookies alone were being
-// invalidated within hours regardless of freshness ("Sign in to confirm
-// you're not a bot" / LOGIN_REQUIRED even right after a clean export). Unset
-// to fall back to cookie-only auth (will likely get blocked again).
-const POT_PROVIDER_URL = process.env.YT_POT_PROVIDER_URL || "";
 
 function ytArgs({ clients, playlist = false }) {
   const args = [
@@ -288,11 +253,7 @@ function ytArgs({ clients, playlist = false }) {
     "--remote-components", "ejs:github",
     "--extractor-args", `youtube:player_client=${clients}`,
   ];
-  if (POT_PROVIDER_URL) args.push("--extractor-args", `youtubepot-bgutilhttp:base_url=${POT_PROVIDER_URL}`);
   if (!playlist) args.push("--no-playlist");
-  const cookies = cookiesFile();
-  if (cookies) args.push("--cookies", cookies);
-  else log("no cookie jar available — YouTube will almost certainly block this");
   return args;
 }
 
@@ -344,13 +305,7 @@ const providers = [
 const providerChain = new ProviderChain({ providers, order: providerOrder(), logger: sourceLog });
 
 function providerOrder() {
-  const configured = process.env.PROVIDER_CHAIN;
-  if (!configured) return ["cache", "library", "soundcloud", "audius", "youtube"];
-  try {
-    const parsed = JSON.parse(configured);
-    if (Array.isArray(parsed)) return parsed.map(String).map(value => value.trim().toLowerCase()).filter(Boolean);
-  } catch { /* comma-separated form below */ }
-  return configured.split(",").map(value => value.trim().toLowerCase()).filter(Boolean);
+  return parseProviderOrder(process.env.PROVIDER_CHAIN);
 }
 
 async function expandQuery(query) { return intentResolver.resolve(query); }
@@ -813,14 +768,5 @@ process.on("unhandledRejection", reason => log(`unhandledRejection: ${reason && 
 process.on("uncaughtException", error => log(`uncaughtException: ${error && error.stack ? error.stack : error}`));
 
 void runYtDlp(["--version"], { timeoutMs: 10000 }).then(({ out }) => log(`yt-dlp ${out.trim() || "version unknown"}`));
-// Confirm the PO Token provider is actually reachable at boot rather than
-// discovering it silently fell back to cookie-only auth the next time
-// YouTube starts rejecting everything again.
-if (POT_PROVIDER_URL) {
-  runYtDlp(["-v", ...ytArgs({ clients: CLIENT_SETS[0] }), "--skip-download", "--simulate", "https://www.youtube.com/watch?v=jNQXAC9IVRw"], { timeoutMs: 20000 })
-    .then(({ err }) => {
-      const active = /PO Token Providers:\s*bgutil/i.test(err);
-      log(active ? "PO Token provider is active" : `PO Token provider NOT detected in yt-dlp output — check ${POT_PROVIDER_URL} is reachable`);
-    });
-}
+log(`provider chain: ${providerOrder().join(" -> ")}`);
 connect();

@@ -17,23 +17,12 @@ services:
     volumes:
       - attachments_data:/var/lib/tupi/attachments
 
-  # Generates a real Proof-of-Origin token for yt-dlp so YouTube's bot check
-  # passes from this VPS's datacenter IP. Without it, YouTube keeps
-  # invalidating even freshly-exported account cookies within hours
-  # ("Sign in to confirm you're not a bot" despite valid cookies) — cookies
-  # alone stopped being enough. No host port needed; music-bot reaches it by
-  # service name over the compose network.
-  bgutil-provider:
-    image: brainicism/bgutil-ytdlp-pot-provider:latest
-    restart: unless-stopped
-
   music-bot:
     build:
       context: ../music-bot
     restart: unless-stopped
     depends_on:
       - tupi-server
-      - bgutil-provider
     env_file:
       - ./music-bot.env
     environment:
@@ -43,15 +32,12 @@ services:
       MUSIC_BOT_TOKEN: ${MUSIC_BOT_TOKEN:-}
       TURN_SHARED_SECRET: ${TURN_SHARED_SECRET:?set in production env}
       TURN_URIS: ${TURN_URIS:?set in production env}
-      PROVIDER_CHAIN: ${PROVIDER_CHAIN:-cache,library,soundcloud,audius,youtube}
-      YT_POT_PROVIDER_URL: http://bgutil-provider:4416
+      # YouTube is discovery-only (Data API resolves title/artist; SoundCloud +
+      # Audius play). Append ",youtube" to opt back into the cookieless
+      # last-resort YouTube player.
+      PROVIDER_CHAIN: ${PROVIDER_CHAIN:-cache,library,soundcloud,audius}
     volumes:
-      # Drop a Netscape cookies.txt exported from a logged-in YouTube session
-      # at ./cookies/yt.txt on the host — required, YouTube blocks this IP
-      # without it. `mkdir -p infra/cookies` so the mount source always exists.
-      - ./cookies:/cookies:ro
-      # Persist yt-dlp's cache (the fetched EJS challenge-solver script and
-      # player JS) so a redeploy doesn't re-download it on the first /play.
+      # Persist yt-dlp's cache so a redeploy doesn't re-fetch it on first use.
       - ytdlp_cache:/home/node/.cache/yt-dlp
 
   caddy:

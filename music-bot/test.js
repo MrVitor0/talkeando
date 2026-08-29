@@ -128,8 +128,11 @@ Module._load = function (request, parent, isMain) {
 };
 
 process.env.MUSIC_BOT_TOKEN = "test";
-process.env.YT_DLP_COOKIES = path.join(os.tmpdir(), "music-bot-test-cookies.txt");
-fs.writeFileSync(process.env.YT_DLP_COOKIES, "# Netscape HTTP Cookie File\n");
+// The streaming / pause / skip / stop harness below exercises the opt-in
+// YouTube last-resort player. Production defaults to discovery-only
+// (cache,library,soundcloud,audius) — see the parseProviderOrder regression
+// check in sourceResolutionChecks().
+process.env.PROVIDER_CHAIN = "cache,library,soundcloud,audius,youtube";
 
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const failures = [];
@@ -194,7 +197,7 @@ async function main() {
   const stream = spawned.filter(s => s.cmd === "yt-dlp" && s.args.includes("-o")).pop();
   check("no --geo-bypass", !stream.args.includes("--geo-bypass"));
   check("excludes the visionos client", stream.args.join(" ").includes("player_client="));
-  check("passes the cookie jar", stream.args.includes("--cookies"));
+  check("runs YouTube without a cookie jar (discovery-only, no PoToken)", !stream.args.includes("--cookies") && !stream.args.join(" ").includes("youtubepot"));
   check("asks for an audio-only format", stream.args[stream.args.indexOf("-f") + 1].startsWith("bestaudio"));
 
   // ---- pause/resume must hold the audio, not drop it on the floor.
@@ -293,6 +296,13 @@ async function sourceResolutionChecks() {
   const third = await chain.resolve(intent, { afterIndex: second.providerIndex });
   check("failover advances soundcloud -> audius -> youtube", [first.provider, second.provider, third.provider].join(",") === "soundcloud,audius,youtube");
 
+  const { parseProviderOrder } = require("./src/providers/provider-chain");
+  check("default provider chain is discovery-only (no YouTube playback)",
+    !parseProviderOrder(undefined).includes("youtube")
+    && parseProviderOrder("cache,library,soundcloud,audius").join(",") === "cache,library,soundcloud,audius"
+    && parseProviderOrder("soundcloud,audius,youtube").includes("youtube")
+    && parseProviderOrder('["soundcloud","youtube"]').join(",") === "soundcloud,youtube");
+
   const spotifyFixture = fixture("spotify-playlist.json");
   const spotify = new SpotifyIntentResolver({ client: { async getCollection() { return spotifyFixture.items.map(value => value.item); } } });
   const spotifyRequest = await spotify.resolve("https://open.spotify.com/playlist/playlist123");
@@ -306,6 +316,17 @@ async function sourceResolutionChecks() {
   } } });
   const spotifyRichRequest = await spotifyRich.resolve("https://open.spotify.com/playlist/playlist123");
   check("Spotify preserves collection and album artwork", spotifyRichRequest.collection.title === "Playlist A" && spotifyRichRequest.intents[0].imageUrl === "https://img.test/album-a.jpg");
+
+  const { SpotifyClient } = require("./src/infrastructure/spotify-client");
+  const blockedSpotify = new SpotifyClient({ clientId: "id", clientSecret: "secret", http: { async json(url) {
+    if (url.includes("accounts.spotify.com/api/token")) return { access_token: "t", expires_in: 3600 };
+    const error = new Error("HTTP 404 for api.spotify.com"); error.status = 404; throw error;
+  } } });
+  check("public playlists need no SPOTIFY_REFRESH_TOKEN", blockedSpotify.configured && !blockedSpotify.hasUserAuthorization);
+  let blockedMessage = null;
+  try { await blockedSpotify.getCollection("playlist", "37i9dQZEVXbjtrVpztYEcP"); }
+  catch (error) { blockedMessage = error.message; }
+  check("editorial/private Spotify playlist yields an actionable message", /privada ou n[aã]o pode ser usada/i.test(blockedMessage || ""), blockedMessage);
 
   const youtube = new YouTubeIntentResolver({ client: { apiKey: "", async oEmbed() { throw new Error("offline"); } } });
   const degraded = await youtube.resolve("https://www.youtube.com/playlist?list=PL123");

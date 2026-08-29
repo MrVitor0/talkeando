@@ -35,10 +35,22 @@ class SpotifyClient {
     return this.get(`https://api.spotify.com/v1/tracks/${id}`);
   }
 
+  /// Public playlist search (client_credentials is enough). Used by the
+  /// integration smoke to pick a live user playlist instead of a brittle
+  /// hardcoded id. Returns `{ id, name, owner }` rows.
+  async searchPlaylists(query, limit = 10) {
+    const params = new URLSearchParams({ q: query, type: "playlist", limit: String(Math.min(50, Math.max(1, limit))) });
+    const body = await this.get(`https://api.spotify.com/v1/search?${params}`);
+    return (body.playlists?.items || [])
+      .filter(Boolean)
+      .map(item => ({ id: item.id, name: item.name || null, owner: item.owner || null }));
+  }
+
   async getCollection(kind, id) {
-    if (kind === "playlist" && !this.hasUserAuthorization) {
-      throw new Error("Playlists do Spotify exigem uma conta autorizada. Configure o secret SPOTIFY_REFRESH_TOKEN para este bot.");
-    }
+    // Public user playlists read fine with an app-only (client_credentials)
+    // token — no SPOTIFY_REFRESH_TOKEN needed. Private/collaborative playlists
+    // and Spotify's own editorial/algorithmic playlists (ids starting "37i9")
+    // return 403/404 no matter the token; those surface as a clean message.
     let resource = null;
     try { resource = await this.get(`https://api.spotify.com/v1/${kind === "album" ? "albums" : "playlists"}/${id}`); }
     catch { /* Track pagination below remains useful when optional collection metadata is unavailable. */ }
@@ -52,9 +64,11 @@ class SpotifyClient {
       try {
         page = await this.get(next);
       } catch (error) {
-        if (kind !== "playlist" || !firstPage || !next.includes("/items?")) throw error;
+        const canRetryOlderEndpoint = kind === "playlist" && firstPage && next.includes("/items?");
+        if (!canRetryOlderEndpoint) throw playlistAccessError(kind, error);
         next = `https://api.spotify.com/v1/playlists/${id}/tracks?limit=50`;
-        page = await this.get(next);
+        try { page = await this.get(next); }
+        catch (retryError) { throw playlistAccessError(kind, retryError); }
       }
       for (const value of page.items || []) {
         const track = kind === "album" ? value : (value.item || value.track);
@@ -96,6 +110,18 @@ class SpotifyClient {
     const token = await this.authenticate();
     return this.http.json(url, { headers: { authorization: `Bearer ${token}` } });
   }
+}
+
+/// A 401/403/404 reading playlist tracks means the playlist is private,
+/// collaborative, or one of Spotify's own editorial/algorithmic playlists
+/// (the API blocks those for third-party apps). Turn it into a message the
+/// user can act on; leave anything else (rate limit, network) untouched.
+function playlistAccessError(kind, error) {
+  const status = error && error.status;
+  if (kind === "playlist" && [401, 403, 404].includes(status)) {
+    return new Error("Essa playlist é privada ou não pode ser usada. Playlists editoriais do Spotify (as que começam com \"37i9\") não são acessíveis pela API — use uma playlist pública de usuário.");
+  }
+  return error;
 }
 
 module.exports = { SpotifyClient };

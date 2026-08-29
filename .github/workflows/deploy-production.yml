@@ -73,55 +73,31 @@ jobs:
         env:
           SPOTIFY_CLIENT_ID: ${{ secrets.SPOTIFY_CLIENT_ID }}
           SPOTIFY_CLIENT_SECRET: ${{ secrets.SPOTIFY_CLIENT_SECRET }}
-          SPOTIFY_REFRESH_TOKEN: ${{ secrets.SPOTIFY_REFRESH_TOKEN }}
           YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
-          YT_DLP_COOKIES_B64: ${{ secrets.YT_DLP_COOKIES_B64 }}
         run: |
           test -n "$SPOTIFY_CLIENT_ID" || { echo "Missing SPOTIFY_CLIENT_ID"; exit 1; }
           test -n "$SPOTIFY_CLIENT_SECRET" || { echo "Missing SPOTIFY_CLIENT_SECRET"; exit 1; }
-          test -n "$SPOTIFY_REFRESH_TOKEN" || { echo "Missing SPOTIFY_REFRESH_TOKEN"; exit 1; }
           test -n "$YOUTUBE_API_KEY" || { echo "Missing YOUTUBE_API_KEY"; exit 1; }
-          test -n "$YT_DLP_COOKIES_B64" || { echo "Missing YT_DLP_COOKIES_B64"; exit 1; }
-
-      - name: Prepare YouTube cookie jar
-        env:
-          YT_DLP_COOKIES_B64: ${{ secrets.YT_DLP_COOKIES_B64 }}
-        run: |
-          install -d -m 700 .ci/cookies
-          printf '%s' "$YT_DLP_COOKIES_B64" | base64 --decode > .ci/cookies/yt.txt
-          test -s .ci/cookies/yt.txt
-          head -c 8192 .ci/cookies/yt.txt | grep -qiE "cookie|youtube\.com"
-
-      - name: Start Proof-of-Origin provider
-        run: |
-          docker network create tupi-music-integration
-          docker run -d --rm --name tupi-bgutil-provider --network tupi-music-integration brainicism/bgutil-ytdlp-pot-provider:latest
-          sleep 3
 
       - name: Build bot integration image
         run: docker build --tag tupi-music-provider-smoke ./music-bot
 
-      - name: Exercise real playlists and YouTube extraction
+      # Discovery-only: Spotify + YouTube Data API resolve metadata; SoundCloud
+      # and Audius stream the audio. No cookies, no Proof-of-Origin sidecar, no
+      # datacenter-IP bot check — every request here works from the Actions IP.
+      - name: Exercise real providers (Spotify + YouTube API, SoundCloud + Audius audio)
         env:
           SPOTIFY_CLIENT_ID: ${{ secrets.SPOTIFY_CLIENT_ID }}
           SPOTIFY_CLIENT_SECRET: ${{ secrets.SPOTIFY_CLIENT_SECRET }}
-          SPOTIFY_REFRESH_TOKEN: ${{ secrets.SPOTIFY_REFRESH_TOKEN }}
           YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
+          AUDIUS_API_KEY: ${{ secrets.AUDIUS_API_KEY }}
         run: |
           docker run --rm \
-            --network tupi-music-integration \
-            --volume "${{ github.workspace }}/.ci/cookies:/cookies:ro" \
             --env SPOTIFY_CLIENT_ID \
             --env SPOTIFY_CLIENT_SECRET \
-            --env SPOTIFY_REFRESH_TOKEN \
             --env YOUTUBE_API_KEY \
-            --env YT_DLP_COOKIES=/cookies/yt.txt \
-            --env YT_POT_PROVIDER_URL=http://tupi-bgutil-provider:4416 \
+            --env AUDIUS_API_KEY \
             tupi-music-provider-smoke node scripts/provider-integration-smoke.js
-
-      - name: Print PoToken provider logs on failure
-        if: failure()
-        run: docker logs tupi-bgutil-provider || true
 
   deploy:
     name: Lightsail São Paulo
@@ -152,7 +128,6 @@ jobs:
           DEPLOY_HOST: ${{ secrets.LIGHTSAIL_HOST }}
           SPOTIFY_CLIENT_ID: ${{ secrets.SPOTIFY_CLIENT_ID }}
           SPOTIFY_CLIENT_SECRET: ${{ secrets.SPOTIFY_CLIENT_SECRET }}
-          SPOTIFY_REFRESH_TOKEN: ${{ secrets.SPOTIFY_REFRESH_TOKEN }}
           YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
           AUDIUS_API_KEY: ${{ secrets.AUDIUS_API_KEY }}
         run: |
@@ -162,7 +137,6 @@ jobs:
           {
             printf 'SPOTIFY_CLIENT_ID=%s\n' "$SPOTIFY_CLIENT_ID"
             printf 'SPOTIFY_CLIENT_SECRET=%s\n' "$SPOTIFY_CLIENT_SECRET"
-            printf 'SPOTIFY_REFRESH_TOKEN=%s\n' "$SPOTIFY_REFRESH_TOKEN"
             printf 'YOUTUBE_API_KEY=%s\n' "$YOUTUBE_API_KEY"
             printf 'AUDIUS_API_KEY=%s\n' "$AUDIUS_API_KEY"
           } | ssh -i ~/.ssh/talkeando-production "ubuntu@$DEPLOY_HOST" '
@@ -175,33 +149,6 @@ jobs:
               grep -q "^YOUTUBE_API_KEY=." /opt/talkeando/infra/music-bot.env.new
               mv /opt/talkeando/infra/music-bot.env.new /opt/talkeando/infra/music-bot.env
               echo "music-bot provider credentials deployed"
-            '
-
-      # YouTube blocks this datacenter IP outright — the music bot only works
-      # with cookies from a (throwaway) logged-in account. Store the Netscape
-      # cookies.txt as base64 in the YT_DLP_COOKIES_B64 secret; it is written
-      # to the host at the path the compose `./cookies:/cookies:ro` mount
-      # expects. Refresh it any time by updating the secret and re-running the
-      # workflow (workflow_dispatch). Absent secret => step is a no-op.
-      - name: Deploy music-bot YouTube cookies
-        env:
-          DEPLOY_HOST: ${{ secrets.LIGHTSAIL_HOST }}
-          YT_DLP_COOKIES_B64: ${{ secrets.YT_DLP_COOKIES_B64 }}
-        run: |
-          if [ -z "${YT_DLP_COOKIES_B64:-}" ]; then
-            echo "YT_DLP_COOKIES_B64 not set — skipping (music bot will fail on YouTube)."
-            exit 0
-          fi
-          printf '%s' "$YT_DLP_COOKIES_B64" | base64 --decode \
-          | ssh -i ~/.ssh/talkeando-production "ubuntu@$DEPLOY_HOST" '
-              set -eu
-              mkdir -p /opt/talkeando/infra/cookies
-              umask 077
-              cat > /opt/talkeando/infra/cookies/yt.txt.new
-              head -c 8192 /opt/talkeando/infra/cookies/yt.txt.new | grep -qiE "cookie|youtube\.com" \
-                || { echo "decoded content does not look like a cookies.txt — aborting"; rm -f /opt/talkeando/infra/cookies/yt.txt.new; exit 1; }
-              mv /opt/talkeando/infra/cookies/yt.txt.new /opt/talkeando/infra/cookies/yt.txt
-              echo "cookies deployed: $(wc -l < /opt/talkeando/infra/cookies/yt.txt) lines"
             '
 
       - name: Upload and apply release

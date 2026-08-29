@@ -1,6 +1,9 @@
 const { normalizeText, tokenSetRatio } = require("./text-normalizer");
 
-const VARIANT_PATTERN = /\b(remix|nightcore|sped\s*up|slowed|cover|karaoke|8d)\b/i;
+// Re-works of a track that are NOT what someone asking for the original wants.
+// Only penalised when the candidate has one of these and the request does not,
+// so "Song (Radio Edit)" still matches a request that also says "radio edit".
+const VARIANT_PATTERN = /\b(remix|nightcore|sped\s*up|slowed|cover|karaoke|8d|edit|bootleg|mashup|flip|rework|vip\s*mix)\b/i;
 
 class TrackScorer {
   constructor({ durationToleranceMs = 7000, similarityCutoff = 0.6, scoreCutoff = 0.6 } = {}) {
