@@ -1,0 +1,35 @@
+name: Music provider integration smoke
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: Production provider smoke
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Configure restricted SSH access
+        env:
+          DEPLOY_HOST: ${{ secrets.LIGHTSAIL_HOST }}
+          DEPLOY_KEY_B64: ${{ secrets.LIGHTSAIL_SSH_KEY_B64 }}
+        run: |
+          test -n "$DEPLOY_HOST"
+          test -n "$DEPLOY_KEY_B64"
+          install -d -m 700 ~/.ssh
+          printf '%s' "$DEPLOY_KEY_B64" | base64 --decode > ~/.ssh/talkeando-production
+          chmod 600 ~/.ssh/talkeando-production
+          ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
+
+      - name: Exercise deployed provider credentials and audio extraction
+        env:
+          DEPLOY_HOST: ${{ secrets.LIGHTSAIL_HOST }}
+        run: |
+          ssh -i ~/.ssh/talkeando-production "ubuntu@$DEPLOY_HOST" '
+            set -eu
+            cd /opt/talkeando/infra
+            docker compose -f docker-compose.production.yml exec -T music-bot node scripts/provider-integration-smoke.js
+          '

@@ -19,9 +19,51 @@ permissions:
   contents: read
 
 jobs:
+  validate:
+    name: Test server and music bot
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: talkeando
+          POSTGRES_PASSWORD: talkeando
+          POSTGRES_DB: postgres
+        ports:
+          - 5434:5432
+        options: >-
+          --health-cmd "pg_isready -U talkeando -d postgres"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Test music bot
+        working-directory: music-bot
+        run: npm test
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server
+
+      - name: Test server
+        working-directory: server
+        env:
+          TEST_DATABASE_ADMIN_URL: postgres://talkeando:talkeando@localhost:5434/postgres
+        run: cargo test --locked
+
   deploy:
     name: Lightsail São Paulo
     runs-on: ubuntu-latest
+    needs: validate
     environment: production
 
     steps:
@@ -47,6 +89,7 @@ jobs:
           DEPLOY_HOST: ${{ secrets.LIGHTSAIL_HOST }}
           SPOTIFY_CLIENT_ID: ${{ secrets.SPOTIFY_CLIENT_ID }}
           SPOTIFY_CLIENT_SECRET: ${{ secrets.SPOTIFY_CLIENT_SECRET }}
+          SPOTIFY_REFRESH_TOKEN: ${{ secrets.SPOTIFY_REFRESH_TOKEN }}
           YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
           AUDIUS_API_KEY: ${{ secrets.AUDIUS_API_KEY }}
         run: |
@@ -56,6 +99,7 @@ jobs:
           {
             printf 'SPOTIFY_CLIENT_ID=%s\n' "$SPOTIFY_CLIENT_ID"
             printf 'SPOTIFY_CLIENT_SECRET=%s\n' "$SPOTIFY_CLIENT_SECRET"
+            printf 'SPOTIFY_REFRESH_TOKEN=%s\n' "$SPOTIFY_REFRESH_TOKEN"
             printf 'YOUTUBE_API_KEY=%s\n' "$YOUTUBE_API_KEY"
             printf 'AUDIUS_API_KEY=%s\n' "$AUDIUS_API_KEY"
           } | ssh -i ~/.ssh/talkeando-production "ubuntu@$DEPLOY_HOST" '

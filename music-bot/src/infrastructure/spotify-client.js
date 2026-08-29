@@ -1,8 +1,9 @@
 class SpotifyClient {
-  constructor({ http, clientId, clientSecret, maxTracks = 500 }) {
+  constructor({ http, clientId, clientSecret, refreshToken = "", maxTracks = 500 }) {
     this.http = http;
     this.clientId = clientId;
     this.clientSecret = clientSecret;
+    this.refreshToken = refreshToken;
     this.maxTracks = maxTracks;
     this.accessToken = null;
     this.expiresAt = 0;
@@ -10,14 +11,19 @@ class SpotifyClient {
 
   get configured() { return Boolean(this.clientId && this.clientSecret); }
 
+  get hasUserAuthorization() { return Boolean(this.refreshToken); }
+
   async authenticate() {
     if (!this.configured) throw new Error("Spotify ainda não está configurado; use uma busca ou URL do YouTube.");
     if (this.accessToken && Date.now() < this.expiresAt) return this.accessToken;
     const basic = Buffer.from(`${this.clientId}:${this.clientSecret}`).toString("base64");
+    const form = this.refreshToken
+      ? new URLSearchParams({ grant_type: "refresh_token", refresh_token: this.refreshToken })
+      : new URLSearchParams({ grant_type: "client_credentials" });
     const body = await this.http.json("https://accounts.spotify.com/api/token", {
       method: "POST",
       headers: { authorization: `Basic ${basic}`, "content-type": "application/x-www-form-urlencoded" },
-      body: "grant_type=client_credentials",
+      body: form.toString(),
     });
     if (!body.access_token) throw new Error("não foi possível autenticar na API do Spotify");
     this.accessToken = body.access_token;
@@ -30,6 +36,9 @@ class SpotifyClient {
   }
 
   async getCollection(kind, id) {
+    if (kind === "playlist" && !this.hasUserAuthorization) {
+      throw new Error("Playlists do Spotify exigem uma conta autorizada. Configure o secret SPOTIFY_REFRESH_TOKEN para este bot.");
+    }
     let resource = null;
     try { resource = await this.get(`https://api.spotify.com/v1/${kind === "album" ? "albums" : "playlists"}/${id}`); }
     catch { /* Track pagination below remains useful when optional collection metadata is unavailable. */ }

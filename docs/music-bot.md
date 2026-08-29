@@ -40,10 +40,17 @@ executar `yt-dlp`. Playlists usam `playlistItems.list` quando
 `YOUTUBE_API_KEY` estiver definida. Sem a chave, o link degrada para uma única
 busca textual; o bot nunca chama o endpoint caro `search.list`.
 
-Spotify é opcional e requer `SPOTIFY_CLIENT_ID` e `SPOTIFY_CLIENT_SECRET`.
+Spotify é opcional. Faixas e álbuns requerem `SPOTIFY_CLIENT_ID` e `SPOTIFY_CLIENT_SECRET`; playlists também exigem `SPOTIFY_REFRESH_TOKEN`, pois a API atual exige OAuth de usuário para listar os itens. No painel Spotify, cadastre `http://127.0.0.1:8787/spotify/callback` como Redirect URI e execute `node music-bot/scripts/spotify-authorize.js` com as credenciais no ambiente; o script mostra o valor a salvar exclusivamente no GitHub Secret `SPOTIFY_REFRESH_TOKEN`.
+
+Depois de um deploy, execute manualmente o workflow **Music provider integration smoke** no GitHub Actions. Ele roda no container da VPS e valida, sem expor credenciais, as três playlists Spotify e os quatro vídeos/duas playlists YouTube de referência, incluindo a extração real pelo `yt-dlp`.
 Faixas, álbuns e playlists preservam título, artistas, duração e ISRC durante a
 resolução. `AUDIUS_API_KEY` também é opcional e permite usar uma credencial dos
 planos atuais da API Audius quando necessário.
+
+O áudio do bot é normalizado para `-18 LUFS` e recebe ganho padrão de `0.15`
+antes de entrar na call, para não sobrepor a voz. Ajuste `MUSIC_VOLUME` (por
+exemplo, `0.10`) no ambiente do bot se a comunidade preferir mais baixo;
+`MUSIC_LOUDNORM=0` desativa a normalização somente quando isso for necessário.
 
 Exemplos válidos para a ordem dos providers:
 

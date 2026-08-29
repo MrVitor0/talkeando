@@ -45,7 +45,7 @@ const peerAudioMuted = new Map<string, boolean>();
 // Applied through a per-peer WebAudio GainNode because an <audio> element's
 // own `.volume` clamps at 1 and can't boost a too-quiet talker.
 const peerVolume = new Map<string, number>();
-type PeerAudioGraph = { source: MediaStreamAudioSourceNode; gain: GainNode; dest: MediaStreamAudioDestinationNode };
+type PeerAudioGraph = { source: MediaStreamAudioSourceNode; gain: GainNode };
 const peerAudioGraphs = new Map<string, PeerAudioGraph>();
 let remoteAudioCtx: AudioContext | null = null;
 const pendingTurnRequests = new Map<string, (creds: TurnCredentials) => void>();
@@ -795,9 +795,7 @@ export function setLocalAudioState(muted: boolean, deafened: boolean) {
 }
 
 function applyRemoteMuting() {
-  for (const [peerUserId, audioEl] of remoteAudioEls) {
-    audioEl.muted = !joinedCall || localDeafened || (peerAudioMuted.get(peerUserId) ?? false);
-  }
+  for (const peerUserId of remoteAudioEls.keys()) applyPeerAudioOutput(peerUserId);
 }
 
 /// Local-only mute of a single participant's audio ("Silenciar" on a tile).
@@ -822,47 +820,68 @@ export function ensureSpeakingAudioCtx(): AudioContext {
 /// whenever that peer's set of audio tracks changes (mic arrives, screen-share
 /// audio starts or stops) because a MediaStreamAudioSourceNode is a snapshot
 /// of the stream taken at creation time.
-function wirePeerAudioGraph(peerUserId: string) {
+function disposePeerAudioGraph(peerUserId: string) {
+  const graph = peerAudioGraphs.get(peerUserId);
+  if (!graph) return;
+  try { graph.source.disconnect(); graph.gain.disconnect(); } catch { /* already closed */ }
+  peerAudioGraphs.delete(peerUserId);
+}
+
+/**
+ * Uses the element for normal attenuation (0..100%) and switches exclusively
+ * to WebAudio only for a true boost. The old implementation left both paths
+ * audible above 100%, which could duplicate the same remote track.
+ */
+function applyPeerAudioOutput(peerUserId: string, rebuildGraph = false) {
   const audioEl = remoteAudioEls.get(peerUserId);
   const audioStream = remoteAudioStreams.get(peerUserId);
   if (!audioEl || !audioStream || audioStream.getAudioTracks().length === 0) return;
   const isMuted = !joinedCall || localDeafened || (peerAudioMuted.get(peerUserId) ?? false);
-  const vol = peerVolume.get(peerUserId) ?? 1;
+  const volume = (peerVolume.get(peerUserId) ?? 1) * outputVolume;
+  const needsBoostGraph = !isMuted && volume > 1;
 
   audioEl.srcObject = audioStream;
-  audioEl.muted = isMuted;
-  audioEl.volume = isMuted ? 0 : Math.min(1, Math.max(0, vol));
   void audioEl.play().catch(error => console.error("[rtc] remote audio play() failed", error));
 
+  if (!needsBoostGraph) {
+    disposePeerAudioGraph(peerUserId);
+    audioEl.muted = isMuted;
+    audioEl.volume = isMuted ? 0 : Math.min(1, Math.max(0, volume));
+    return;
+  }
+
+  // The element must be muted while the WebAudio graph is active; otherwise
+  // it would play the same MediaStream a second time alongside the gain node.
+  audioEl.muted = true;
+  audioEl.volume = 0;
   try {
-    const ctx = ensureRemoteAudioCtx();
-    const previous = peerAudioGraphs.get(peerUserId);
-    if (previous) {
-      try { previous.source.disconnect(); previous.gain.disconnect(); } catch { /* already gone */ }
-    }
-    if (vol > 1 && !isMuted) {
+    const existing = peerAudioGraphs.get(peerUserId);
+    if (existing && !rebuildGraph) {
+      existing.gain.gain.value = volume;
+    } else {
+      disposePeerAudioGraph(peerUserId);
+      const ctx = ensureRemoteAudioCtx();
       const source = ctx.createMediaStreamSource(audioStream);
       const gain = ctx.createGain();
-      gain.gain.value = vol - 1;
+      gain.gain.value = volume;
       source.connect(gain).connect(ctx.destination);
-      peerAudioGraphs.set(peerUserId, { source, gain, dest: null as any });
-    } else {
-      peerAudioGraphs.delete(peerUserId);
+      peerAudioGraphs.set(peerUserId, { source, gain });
     }
   } catch (e) {
     console.warn("[rtc] WebAudio graph optional boost failed:", e);
+    audioEl.muted = isMuted;
+    audioEl.volume = isMuted ? 0 : 1;
   }
 }
+
+function wirePeerAudioGraph(peerUserId: string) { applyPeerAudioOutput(peerUserId, true); }
 
 /// Local-only playback volume for one participant. 1 = default, 0 = silent,
 /// 2 = +100% boost. Nothing leaves this client.
 export function setPeerVolume(peerUserId: string, volume: number) {
   const clamped = Math.max(0, Math.min(2, volume));
   peerVolume.set(peerUserId, clamped);
-  const audioEl = remoteAudioEls.get(peerUserId);
-  if (audioEl) audioEl.volume = Math.min(1, clamped);
-  const graph = peerAudioGraphs.get(peerUserId);
-  if (graph) graph.gain.gain.value = Math.max(0, clamped - 1);
+  applyPeerAudioOutput(peerUserId);
 }
 
 export function getPeerVolume(peerUserId: string): number {
@@ -1268,14 +1287,7 @@ export function setInputVolumeLevel(volume: number) {
 export function setOutputVolumeLevel(volume: number) {
   outputVolume = Math.max(0, Math.min(2, volume));
   try { localStorage.setItem("tk.outputVolume", outputVolume.toString()); } catch {}
-  for (const [peerUserId, audioEl] of remoteAudioEls) {
-    const isMuted = !joinedCall || localDeafened || (peerAudioMuted.get(peerUserId) ?? false);
-    const peerVol = peerVolume.get(peerUserId) ?? 1;
-    const combined = peerVol * outputVolume;
-    audioEl.volume = isMuted ? 0 : Math.min(1, Math.max(0, combined));
-    const graph = peerAudioGraphs.get(peerUserId);
-    if (graph) graph.gain.gain.value = isMuted ? 0 : Math.max(0, combined - 1);
-  }
+  for (const peerUserId of remoteAudioEls.keys()) applyPeerAudioOutput(peerUserId);
 }
 
 export async function listAllMediaDevices(): Promise<{

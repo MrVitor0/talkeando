@@ -3059,7 +3059,7 @@ export function App() {
                             "voice-member"
                             + (isBot ? " voice-member--bot" : "")
                             + (isLive ? " is-live" : "")
-                            + (!isBot && speakingUsers.has(entry.user_id) ? " is-speaking" : "")
+                            + ((botPlaying || speakingUsers.has(entry.user_id)) ? " is-speaking" : "")
                             + (canMoveMembers ? " is-draggable" : "")
                           }
                           key={entry.user_id}

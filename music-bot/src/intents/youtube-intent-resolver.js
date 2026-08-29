@@ -14,7 +14,10 @@ class YouTubeIntentResolver {
     const videoId = url.hostname.toLowerCase().endsWith("youtu.be")
       ? url.pathname.split("/").filter(Boolean)[0]
       : url.searchParams.get("v");
-    if (playlistId && !videoId) return this.resolvePlaylist(raw, playlistId);
+    // A URL copied from a playlist normally contains both `v` and `list`.
+    // The playlist is the user's explicit intent in that case; treating it as
+    // a single video made the queue silently omit every remaining item.
+    if (playlistId) return this.resolvePlaylist(raw, playlistId);
     return this.resolveVideo(raw, videoId);
   }
 

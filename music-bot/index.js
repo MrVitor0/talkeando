@@ -323,6 +323,7 @@ const spotifyClient = new SpotifyClient({
   http: httpClient,
   clientId: process.env.SPOTIFY_CLIENT_ID,
   clientSecret: process.env.SPOTIFY_CLIENT_SECRET,
+  refreshToken: process.env.SPOTIFY_REFRESH_TOKEN,
   maxTracks: MAX_QUEUE,
 });
 const youtubeClient = new YouTubeClient({ http: httpClient, apiKey: process.env.YOUTUBE_API_KEY, maxTracks: MAX_QUEUE });
@@ -539,6 +540,8 @@ function beginStream(meta, attempt = 0) {
   ffmpeg.stdin.on("error", () => { });
   yt.on("error", error => log(`yt-dlp spawn error: ${error.message}`));
   ffmpeg.on("error", error => log(`ffmpeg spawn error: ${error.message}`));
+  yt.on("close", (code, signal) => log(`yt-dlp exited code=${code ?? "unknown"}${signal ? ` signal=${signal}` : ""} for ${meta.provider}`));
+  ffmpeg.on("close", (code, signal) => log(`ffmpeg exited code=${code ?? "unknown"}${signal ? ` signal=${signal}` : ""} for ${meta.provider}`));
   yt.stderr.on("data", d => process.stderr.write(`[yt-dlp] ${d}`));
   ffmpeg.stderr.on("data", d => process.stderr.write(`[ffmpeg] ${d}`));
 
@@ -611,8 +614,11 @@ function audioFilter() {
   const chain = ["aresample=async=1:min_hard_comp=0.100:first_pts=0"];
   // Optional single-pass loudness levelling so a quiet track doesn't make
   // everyone reach for the volume knob mid-set.
-  if (process.env.MUSIC_LOUDNORM === "1") chain.push("loudnorm=I=-16:TP=-1.5:LRA=11");
-  const volume = Number(process.env.MUSIC_VOLUME || 1);
+  // Music masters are usually much hotter than speech captured by WebRTC.
+  // Keep a conservative, normalized default so a listener's 100% slider is
+  // usable; deployments may still set MUSIC_LOUDNORM=0 or tune MUSIC_VOLUME.
+  if (process.env.MUSIC_LOUDNORM !== "0") chain.push("loudnorm=I=-18:TP=-2:LRA=11");
+  const volume = Number(process.env.MUSIC_VOLUME || 0.15);
   if (volume > 0 && volume !== 1) chain.push(`volume=${volume}`);
   return chain.join(",");
 }

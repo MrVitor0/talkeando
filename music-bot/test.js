@@ -316,6 +316,14 @@ async function sourceResolutionChecks() {
   const videoIntents = await youtubeVideo.resolve("https://www.youtube.com/watch?v=AAAAAAAAAAA");
   check("YouTube oEmbed becomes a metadata-only intent", videoIntents.intents[0].title === oEmbedFixture.title && videoIntents.intents[0].durationMs === null);
 
+  let playlistIdFromWatchUrl = null;
+  const youtubeWatchPlaylist = new YouTubeIntentResolver({ client: {
+    apiKey: "test-key",
+    async playlist(id) { playlistIdFromWatchUrl = id; return { intents: [{ title: "Track in playlist" }], collection: { kind: "playlist" } }; },
+  } });
+  await youtubeWatchPlaylist.resolve("https://www.youtube.com/watch?v=AAAAAAAAAAA&list=PL123");
+  check("YouTube watch URLs with a list expand the playlist", playlistIdFromWatchUrl === "PL123");
+
   const youtubePlaylistFixture = fixture("youtube-playlist.json");
   const youtubeClient = new YouTubeClient({
     apiKey: "test-key",
