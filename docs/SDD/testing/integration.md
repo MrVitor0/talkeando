@@ -28,10 +28,10 @@ banco `postgres` de manutenção dele (a suíte cria e derruba seus próprios
 bancos `talkeando_test_<uuid>` a partir daí):
 
 ```
-TEST_DATABASE_ADMIN_URL="postgres://talkeando:talkeando@localhost:5432/postgres" cargo test
+TEST_DATABASE_ADMIN_URL="postgres://talkeando:talkeando@localhost:5434/postgres" cargo test
 ```
 
-Sem essa variável, o default assume Postgres em `localhost:5432` com as
+Sem essa variável, o default assume Postgres em `localhost:5434` com as
 credenciais de `infra/docker-compose.yml`. Os testes rodam em paralelo por
 padrão (`cargo test`'s default) com segurança — cada `TestApp::spawn()` cria
 seu próprio banco isolado, nenhum estado global (env vars, etc.) é mutado.

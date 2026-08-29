@@ -406,6 +406,10 @@ async fn teardown_call_membership(
         if djs.get(&channel_id).copied() == Some(user_id) { djs.remove(&channel_id); true } else { false }
     };
     if dj_left && state.hub.calls.read().await.is_participant(channel_id, MUSIC_BOT_ID) {
+        state.hub.send_to(MUSIC_BOT_ID, OutboundEnvelope::new(
+            "music.command",
+            serde_json::json!({ "command": "stop", "voice_channel_id": channel_id, "reason": "dj_left" }),
+        )).await;
         state.hub.calls.write().await.leave(channel_id, MUSIC_BOT_ID);
         let recipients = state.hub.calls.read().await.participant_ids(channel_id);
         state.hub.broadcast_to(&recipients, OutboundEnvelope::new("call.peer_left", CallPeerLeft {
@@ -593,6 +597,10 @@ async fn dispatch(state: &AppState, user_id: Uuid, text: &str, joined_calls: &mu
             let data: MusicCommand = parse_or_reject!(MusicCommand);
             handle_music_command(state, user_id, data).await;
         }
+        "music.status" => {
+            let data: MusicStatus = parse_or_reject!(MusicStatus);
+            handle_music_status(state, user_id, data).await;
+        }
         "device.list_changed" => {
             let data: DeviceListChanged = parse_or_reject!(DeviceListChanged);
             tracing::debug!(%user_id, summary = ?data.summary, "device list changed");
@@ -610,6 +618,11 @@ async fn dispatch(state: &AppState, user_id: Uuid, text: &str, joined_calls: &mu
 }
 
 async fn handle_music_command(state: &AppState, user_id: Uuid, data: MusicCommand) {
+    const COMMANDS: &[&str] = &["play", "pause", "resume", "skip", "stop", "queue"];
+    if !COMMANDS.contains(&data.command.as_str()) {
+        state.hub.send_to(user_id, OutboundEnvelope::error("validation_error", "comando de música desconhecido", None)).await;
+        return;
+    }
     let participants = state.hub.calls.read().await.participant_ids(data.voice_channel_id);
     if !participants.contains(&user_id) {
         state.hub.send_to(user_id, OutboundEnvelope::error("forbidden", "entre no canal de voz antes de controlar o bot", None)).await;
@@ -617,6 +630,14 @@ async fn handle_music_command(state: &AppState, user_id: Uuid, data: MusicComman
     }
     if data.command == "play" && data.query.as_deref().unwrap_or("").trim().is_empty() {
         state.hub.send_to(user_id, OutboundEnvelope::error("validation_error", "use /play <link ou nome>", None)).await;
+        return;
+    }
+    let Ok(Some(reply_channel)) = db::channel_if_member(&state.pool, data.channel_id, user_id).await else {
+        state.hub.send_to(user_id, OutboundEnvelope::error("forbidden", "canal de resposta indisponível", None)).await;
+        return;
+    };
+    if reply_channel.kind != "text" {
+        state.hub.send_to(user_id, OutboundEnvelope::error("validation_error", "as atualizações do bot exigem um canal de texto", None)).await;
         return;
     }
     if !state.hub.is_online(MUSIC_BOT_ID).await {
@@ -638,21 +659,42 @@ async fn handle_music_command(state: &AppState, user_id: Uuid, data: MusicComman
         "channel_id": data.channel_id, "voice_channel_id": data.voice_channel_id,
         "command": data.command, "query": data.query, "requested_by": user_id
     }))).await;
-    let note = match data.command.as_str() {
-        "play" => format!("🎵 **Tupi Música** vai tocar: {}", data.query.as_deref().unwrap_or("")),
-        "pause" => "⏸️ **Tupi Música** pausou a reprodução.".to_string(),
-        "resume" => "▶️ **Tupi Música** retomou a reprodução.".to_string(),
-        "skip" => "⏭️ **Tupi Música** pulou a faixa.".to_string(),
-        "stop" => "⏹️ **Tupi Música** encerrou a fila.".to_string(),
-        "queue" => "📜 **Tupi Música**: a fila é controlada pelo DJ nesta versão.".to_string(),
-        _ => { state.hub.send_to(user_id, OutboundEnvelope::error("validation_error", "comando de música desconhecido", None)).await; return; }
-    };
-    // This is a deliberately ephemeral bot reply: no fake database user or
-    // forged author id, and all connected community members converge at once.
-    match db::channel_community(&state.pool, data.channel_id).await {
-        Ok(Some(community_id)) => broadcast_to_community(state, community_id, OutboundEnvelope::new("music.announcement", serde_json::json!({ "channel_id": data.channel_id, "content": note }))).await,
-        _ => state.hub.send_to(user_id, OutboundEnvelope::error("not_found", "canal de texto não encontrado", None)).await,
+}
+
+async fn handle_music_status(state: &AppState, user_id: Uuid, data: MusicStatus) {
+    const KINDS: &[&str] = &["loading", "queued", "playing", "paused", "resumed", "skipped", "stopped", "finished", "disconnected", "queue", "error"];
+    if user_id != MUSIC_BOT_ID {
+        state.hub.send_to(user_id, OutboundEnvelope::error("forbidden", "somente o bot pode publicar estados de música", None)).await;
+        return;
     }
+    if !KINDS.contains(&data.kind.as_str())
+        || data.origin.as_ref().is_some_and(|value| !["text", "spotify", "youtube"].contains(&value.as_str()))
+        || data.provider.as_ref().is_some_and(|value| !["cache", "library", "soundcloud", "audius", "youtube"].contains(&value.as_str()))
+        || data.title.as_ref().is_some_and(|value| value.len() > 500)
+        || data.artist.as_ref().is_some_and(|value| value.len() > 300)
+        || data.detail.as_ref().is_some_and(|value| value.len() > 2000)
+        || data.image_url.as_ref().is_some_and(|value| value.len() > 2000 || !is_http_url(value))
+        || data.source_url.as_ref().is_some_and(|value| value.len() > 2000 || !is_http_url(value))
+        || data.collection_name.as_ref().is_some_and(|value| value.len() > 500)
+        || data.collection_kind.as_ref().is_some_and(|value| !["album", "playlist"].contains(&value.as_str()))
+        || data.items.len() > 10
+        || data.items.iter().any(|item| item.title.is_empty() || item.title.len() > 500 || item.artist.as_ref().is_some_and(|value| value.len() > 300))
+    {
+        state.hub.send_to(user_id, OutboundEnvelope::error("validation_error", "estado de música inválido", None)).await;
+        return;
+    }
+    let channel = match db::channel_by_id(&state.pool, data.channel_id).await {
+        Ok(Some(channel)) if channel.kind == "text" => channel,
+        _ => {
+            state.hub.send_to(user_id, OutboundEnvelope::error("not_found", "canal de texto não encontrado", None)).await;
+            return;
+        }
+    };
+    broadcast_to_community(state, channel.community_id, OutboundEnvelope::new("music.announcement", data)).await;
+}
+
+fn is_http_url(value: &str) -> bool {
+    value.starts_with("https://") || value.starts_with("http://")
 }
 
 async fn handle_chat_create(state: &AppState, user_id: Uuid, data: ChatMessageCreate) {
@@ -1239,7 +1281,7 @@ async fn handle_voice_disconnect_member(state: &AppState, actor_id: Uuid, data: 
         // ffmpeg / any playlist and leaves the channel.
         state.hub.music_djs.write().await.remove(&data.channel_id);
         state.hub.send_to(MUSIC_BOT_ID, OutboundEnvelope::new(
-            "music.command", serde_json::json!({ "command": "stop", "voice_channel_id": data.channel_id }),
+            "music.command", serde_json::json!({ "command": "stop", "voice_channel_id": data.channel_id, "reason": "disconnected" }),
         )).await;
     } else {
         // The kicked client leaves the call on this event.

@@ -34,6 +34,8 @@ services:
     depends_on:
       - tupi-server
       - bgutil-provider
+    env_file:
+      - ./music-bot.env
     environment:
       TUPI_WS_URL: ws://tupi-server:8080/ws
       # Falls back to TURN_SHARED_SECRET in the bot for existing deployments;
@@ -41,8 +43,7 @@ services:
       MUSIC_BOT_TOKEN: ${MUSIC_BOT_TOKEN:-}
       TURN_SHARED_SECRET: ${TURN_SHARED_SECRET:?set in production env}
       TURN_URIS: ${TURN_URIS:?set in production env}
-      SPOTIFY_CLIENT_ID: ${SPOTIFY_CLIENT_ID:-}
-      SPOTIFY_CLIENT_SECRET: ${SPOTIFY_CLIENT_SECRET:-}
+      PROVIDER_CHAIN: ${PROVIDER_CHAIN:-cache,library,soundcloud,audius,youtube}
       YT_POT_PROVIDER_URL: http://bgutil-provider:4416
     volumes:
       # Drop a Netscape cookies.txt exported from a logged-in YouTube session

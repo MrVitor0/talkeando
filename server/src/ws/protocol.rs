@@ -513,6 +513,59 @@ pub struct MusicCommand {
     pub query: Option<String>,
 }
 
+/// Playback state emitted by the authenticated headless bot. The server
+/// validates and fans it out to the community that owns `channel_id`; clients
+/// render it as a provider-branded status card in that text channel.
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct MusicStatus {
+    pub status_id: Uuid,
+    pub channel_id: Uuid,
+    pub kind: String,
+    #[serde(default)]
+    pub origin: Option<String>,
+    #[serde(default)]
+    pub provider: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub artist: Option<String>,
+    #[serde(default)]
+    pub detail: Option<String>,
+    #[serde(default)]
+    pub count: Option<u32>,
+    #[serde(default)]
+    pub position: Option<u32>,
+    #[serde(default)]
+    pub queue_size: Option<u32>,
+    #[serde(default)]
+    pub duration_ms: Option<u64>,
+    #[serde(default)]
+    pub total_duration_ms: Option<u64>,
+    #[serde(default)]
+    pub eta_ms: Option<u64>,
+    #[serde(default)]
+    pub image_url: Option<String>,
+    #[serde(default)]
+    pub source_url: Option<String>,
+    #[serde(default)]
+    pub collection_name: Option<String>,
+    #[serde(default)]
+    pub collection_kind: Option<String>,
+    #[serde(default)]
+    pub requested_by: Option<Uuid>,
+    #[serde(default)]
+    pub items: Vec<MusicStatusItem>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct MusicStatusItem {
+    pub title: String,
+    #[serde(default)]
+    pub artist: Option<String>,
+    #[serde(default)]
+    pub duration_ms: Option<u64>,
+}
+
 // ---- device.* ----
 
 #[derive(Debug, Deserialize)]

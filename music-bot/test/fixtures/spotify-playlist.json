@@ -1,0 +1,7 @@
+{
+  "items": [
+    { "item": { "id": "spotify-a", "type": "track", "name": "Song A", "duration_ms": 170900, "artists": [{ "name": "Artist A" }], "external_ids": { "isrc": "BRAAA0000001" } } },
+    { "item": { "id": "spotify-b", "type": "track", "name": "Song B", "duration_ms": 181000, "artists": [{ "name": "Artist B" }], "external_ids": { "isrc": "BRAAA0000002" } } }
+  ],
+  "next": null
+}

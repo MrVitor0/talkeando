@@ -4,8 +4,8 @@
 //! tests exercise the exact same code path as production.
 //!
 //! Requires a reachable Postgres server; point `TEST_DATABASE_ADMIN_URL` at
-//! it (defaults to `postgres://talkeando:talkeando@localhost:5432/postgres`,
-//! matching `infra/docker-compose.yml`). Each `TestApp` creates and drops
+//! it (defaults to `postgres://talkeando:talkeando@localhost:5434/postgres`,
+//! matching `infra/docker-compose.yml`'s host port). Each `TestApp` creates and drops
 //! its own randomly-named database, so tests are isolated from each other
 //! and safe to run in parallel (the default `cargo test` behavior).
 
@@ -25,7 +25,7 @@ pub struct TestApp {
 impl TestApp {
     pub async fn spawn() -> Self {
         let admin_url = std::env::var("TEST_DATABASE_ADMIN_URL")
-            .unwrap_or_else(|_| "postgres://talkeando:talkeando@localhost:5432/postgres".to_string());
+            .unwrap_or_else(|_| "postgres://talkeando:talkeando@localhost:5434/postgres".to_string());
         let admin_pool = PgPoolOptions::new()
             .max_connections(2)
             .connect(&admin_url)

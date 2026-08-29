@@ -39,6 +39,37 @@ jobs:
           chmod 600 ~/.ssh/talkeando-production
           ssh-keyscan -H "$DEPLOY_HOST" >> ~/.ssh/known_hosts
 
+      # Provider credentials live in a file read only by the music-bot
+      # container. Values are streamed over SSH and never written to the
+      # Actions workspace or passed as command-line arguments on the VPS.
+      - name: Deploy music-bot provider credentials
+        env:
+          DEPLOY_HOST: ${{ secrets.LIGHTSAIL_HOST }}
+          SPOTIFY_CLIENT_ID: ${{ secrets.SPOTIFY_CLIENT_ID }}
+          SPOTIFY_CLIENT_SECRET: ${{ secrets.SPOTIFY_CLIENT_SECRET }}
+          YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
+          AUDIUS_API_KEY: ${{ secrets.AUDIUS_API_KEY }}
+        run: |
+          test -n "$SPOTIFY_CLIENT_ID" || { echo "Missing production secret: SPOTIFY_CLIENT_ID"; exit 1; }
+          test -n "$SPOTIFY_CLIENT_SECRET" || { echo "Missing production secret: SPOTIFY_CLIENT_SECRET"; exit 1; }
+          test -n "$YOUTUBE_API_KEY" || { echo "Missing production secret: YOUTUBE_API_KEY"; exit 1; }
+          {
+            printf 'SPOTIFY_CLIENT_ID=%s\n' "$SPOTIFY_CLIENT_ID"
+            printf 'SPOTIFY_CLIENT_SECRET=%s\n' "$SPOTIFY_CLIENT_SECRET"
+            printf 'YOUTUBE_API_KEY=%s\n' "$YOUTUBE_API_KEY"
+            printf 'AUDIUS_API_KEY=%s\n' "$AUDIUS_API_KEY"
+          } | ssh -i ~/.ssh/talkeando-production "ubuntu@$DEPLOY_HOST" '
+              set -eu
+              install -d -m 755 /opt/talkeando/infra
+              umask 077
+              cat > /opt/talkeando/infra/music-bot.env.new
+              grep -q "^SPOTIFY_CLIENT_ID=." /opt/talkeando/infra/music-bot.env.new
+              grep -q "^SPOTIFY_CLIENT_SECRET=." /opt/talkeando/infra/music-bot.env.new
+              grep -q "^YOUTUBE_API_KEY=." /opt/talkeando/infra/music-bot.env.new
+              mv /opt/talkeando/infra/music-bot.env.new /opt/talkeando/infra/music-bot.env
+              echo "music-bot provider credentials deployed"
+            '
+
       # YouTube blocks this datacenter IP outright — the music bot only works
       # with cookies from a (throwaway) logged-in account. Store the Netscape
       # cookies.txt as base64 in the YT_DLP_COOKIES_B64 secret; it is written

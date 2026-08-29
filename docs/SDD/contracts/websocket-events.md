@@ -83,6 +83,18 @@ e o servidor faz o fan-out abaixo para a comunidade.
 
 RTC relay requer ambos os usuários na mesma call e não interpreta SDP/ICE.
 
+## Música
+
+| Op | Direção | Data |
+|---|---|---|
+| `music.command` | C→S→bot | `{ channel_id, voice_channel_id, command: "play"|"pause"|"resume"|"skip"|"stop"|"queue", query? }` |
+| `music.status` | bot→S | `{ status_id, channel_id, kind, origin?, provider?, title?, artist?, detail?, count?, position?, queue_size?, duration_ms?, total_duration_ms?, eta_ms?, image_url?, source_url?, collection_name?, collection_kind?, requested_by?, items? }` |
+| `music.announcement` | S→C | mesmo payload validado de `music.status` |
+
+O comando requer que o usuário esteja no canal de voz e seja membro do canal
+de texto. Somente a identidade fixa do bot publica estados. Os anúncios não são
+persistidos; a UI os mantém por canal durante a sessão.
+
 ## Streams e erros
 
 | Op | Direção | Data |
@@ -99,4 +111,3 @@ RTC relay requer ambos os usuários na mesma call e não interpreta SDP/ICE.
 
 Publicar não habilita mídia para ninguém. O publisher só habilita o sender
 para o subscriber explicitamente informado pelo servidor.
-

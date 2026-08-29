@@ -14,6 +14,22 @@ const fs = require("fs");
 const wrtc = require("@roamhq/wrtc");
 const { spawn } = require("child_process");
 const crypto = require("crypto");
+const { HttpClient } = require("./src/infrastructure/http-client");
+const { SpotifyClient } = require("./src/infrastructure/spotify-client");
+const { YouTubeClient } = require("./src/infrastructure/youtube-client");
+const { AudiusClient } = require("./src/infrastructure/audius-client");
+const { YtDlpClient } = require("./src/infrastructure/yt-dlp-client");
+const { IntentResolver } = require("./src/intents/intent-resolver");
+const { SpotifyIntentResolver } = require("./src/intents/spotify-intent-resolver");
+const { YouTubeIntentResolver } = require("./src/intents/youtube-intent-resolver");
+const { TextIntentResolver } = require("./src/intents/text-intent-resolver");
+const { TrackScorer } = require("./src/matching/track-scorer");
+const { ProviderChain } = require("./src/providers/provider-chain");
+const { NullProvider } = require("./src/providers/null-provider");
+const { SoundCloudProvider } = require("./src/providers/soundcloud-provider");
+const { AudiusProvider } = require("./src/providers/audius-provider");
+const { YouTubeProvider } = require("./src/providers/youtube-provider");
+const { MusicStatusReporter } = require("./src/status/music-status-reporter");
 
 const BOT_ID = "00000000-0000-0000-0000-000000000001";
 const WS_URL = process.env.TUPI_WS_URL || "ws://tupi-server:8080/ws";
@@ -52,6 +68,7 @@ const MAX_QUEUE = Number(process.env.MUSIC_MAX_QUEUE || 500);
 const IDLE_TIMEOUT_MS = 5 * 60 * 1000;
 
 let ws, voiceChannel = null;
+let lastStatusChannelId = null;
 // The server-side id of the `music` stream we currently have published, so we
 // can retract it the moment playback ends instead of leaving a phantom
 // "TOCANDO" in everyone's sidebar.
@@ -63,6 +80,7 @@ let paused = false;
 const peers = new Map();
 
 function send(op, data) { ws?.readyState === WebSocket.OPEN && ws.send(JSON.stringify({ v: 1, op, data })); }
+const statusReporter = new MusicStatusReporter({ send, createId: () => crypto.randomUUID() });
 
 // ------------------------------------------------------------- peer plumbing
 function iceServers() {
@@ -290,91 +308,51 @@ function runYtDlp(args, { timeoutMs = 45000 } = {}) {
   });
 }
 
-/** One metadata pass: resolves a search term or URL to a concrete video. */
-async function resolveMeta(spec) {
-  for (const clients of CLIENT_SETS) {
-    const args = [
-      ...ytArgs({ clients }),
-      "--skip-download", "--playlist-items", "1",
-      "--print", "%(id)s", "--print", "%(title)s", "--print", "%(duration)s",
-      spec,
-    ];
-    const { code, out, err } = await runYtDlp(args, { timeoutMs: 30000 });
-    const [id, title, duration] = out.trim().split("\n");
-    if (code === 0 && id && !/\s/.test(id)) {
-      return { id, url: `https://www.youtube.com/watch?v=${id}`, title: title || id, duration: Number(duration) || 0 };
-    }
-    const reason = (err || "").trim().split("\n").pop() || `exit ${code}`;
-    log(`resolve failed for ${JSON.stringify(spec)} with clients=${clients}: ${reason}`);
-  }
-  return null;
+function mediaArgs(provider, clients) {
+  if (provider === "youtube") return ytArgs({ clients });
+  return [
+    "--ignore-config", "--no-progress", "--no-call-home", "--no-playlist",
+    "--retries", "5", "--fragment-retries", "5", "--socket-timeout", "20",
+  ];
 }
 
 // ------------------------------------------------------------------ sourcing
-/** Expand whatever the user typed into queue entries (spec + display label). */
-async function expandQuery(query) {
-  const spotify = query.match(/^https:\/\/open\.spotify\.com\/(track|playlist|album)\/([A-Za-z0-9]+)/);
-  if (spotify) return expandSpotify(spotify[1], spotify[2]);
+const sourceLog = (event, details) => log(`${event} ${JSON.stringify(details)}`);
+const httpClient = new HttpClient();
+const spotifyClient = new SpotifyClient({
+  http: httpClient,
+  clientId: process.env.SPOTIFY_CLIENT_ID,
+  clientSecret: process.env.SPOTIFY_CLIENT_SECRET,
+  maxTracks: MAX_QUEUE,
+});
+const youtubeClient = new YouTubeClient({ http: httpClient, apiKey: process.env.YOUTUBE_API_KEY, maxTracks: MAX_QUEUE });
+const audiusClient = new AudiusClient({ http: httpClient, apiKey: process.env.AUDIUS_API_KEY || "" });
+const intentResolver = new IntentResolver([
+  new SpotifyIntentResolver({ client: spotifyClient }),
+  new YouTubeIntentResolver({ client: youtubeClient, logger: sourceLog }),
+  new TextIntentResolver(),
+]);
+const scorer = new TrackScorer();
+const providers = [
+  new NullProvider({ name: "cache" }),
+  new NullProvider({ name: "library" }),
+  new SoundCloudProvider({ client: new YtDlpClient({ run: runYtDlp }), scorer }),
+  new AudiusProvider({ client: audiusClient, scorer }),
+  new YouTubeProvider(),
+];
+const providerChain = new ProviderChain({ providers, order: providerOrder(), logger: sourceLog });
 
-  if (/^https?:\/\//.test(query)) {
-    // `watch?v=X&list=Y` means "play X"; a bare playlist/mix URL means "queue
-    // the whole thing".
-    const isPlaylist = /[?&]list=/.test(query) && !/[?&]v=/.test(query);
-    if (!isPlaylist) return [{ spec: query, label: query }];
-    const args = [
-      ...ytArgs({ clients: CLIENT_SETS[0], playlist: true }),
-      "--flat-playlist", "--skip-download", "--playlist-end", String(MAX_QUEUE),
-      "--print", "%(id)s", "--print", "%(title)s",
-      query,
-    ];
-    const { out } = await runYtDlp(args, { timeoutMs: 90000 });
-    const lines = out.trim().split("\n").filter(Boolean);
-    const entries = [];
-    for (let i = 0; i + 1 < lines.length; i += 2) {
-      entries.push({ spec: `https://www.youtube.com/watch?v=${lines[i]}`, label: lines[i + 1] });
-    }
-    if (!entries.length) throw new Error("não consegui ler essa playlist do YouTube");
-    return entries;
-  }
-
-  return [{ spec: `ytsearch1:${query}`, label: query }];
+function providerOrder() {
+  const configured = process.env.PROVIDER_CHAIN;
+  if (!configured) return ["cache", "library", "soundcloud", "audius", "youtube"];
+  try {
+    const parsed = JSON.parse(configured);
+    if (Array.isArray(parsed)) return parsed.map(String).map(value => value.trim().toLowerCase()).filter(Boolean);
+  } catch { /* comma-separated form below */ }
+  return configured.split(",").map(value => value.trim().toLowerCase()).filter(Boolean);
 }
 
-async function expandSpotify(kind, id) {
-  const [clientId, clientSecret] = [process.env.SPOTIFY_CLIENT_ID, process.env.SPOTIFY_CLIENT_SECRET];
-  if (!clientId || !clientSecret) throw new Error("Spotify ainda não está configurado; use uma busca, URL ou playlist do YouTube.");
-  const basic = Buffer.from(`${clientId}:${clientSecret}`).toString("base64");
-  const tokenResponse = await fetch("https://accounts.spotify.com/api/token", { method: "POST", headers: { authorization: `Basic ${basic}`, "content-type": "application/x-www-form-urlencoded" }, body: "grant_type=client_credentials" });
-  const accessToken = (await tokenResponse.json()).access_token;
-  if (!accessToken) throw new Error("não foi possível autenticar na API do Spotify");
-  const headers = { authorization: `Bearer ${accessToken}` };
-  const entry = track => {
-    const artists = (track.artists || []).map(artist => artist.name).join(" ");
-    return { spec: `ytsearch1:${track.name} ${artists}`, label: `${track.name} — ${artists}`.trim() };
-  };
-
-  if (kind === "track") {
-    const track = await (await fetch(`https://api.spotify.com/v1/tracks/${id}`, { headers })).json();
-    if (!track?.name) throw new Error("faixa do Spotify indisponível");
-    return [entry(track)];
-  }
-  // Playlists and albums used to collapse to a single bogus search of the
-  // Spotify URL itself; every track now lands in the queue.
-  const entries = [];
-  let next = kind === "album"
-    ? `https://api.spotify.com/v1/albums/${id}/tracks?limit=50`
-    : `https://api.spotify.com/v1/playlists/${id}/tracks?limit=100`;
-  while (next && entries.length < MAX_QUEUE) {
-    const page = await (await fetch(next, { headers })).json();
-    for (const item of page.items || []) {
-      const track = kind === "album" ? item : item.track;
-      if (track?.name) entries.push(entry(track));
-    }
-    next = page.next;
-  }
-  if (!entries.length) throw new Error("playlist Spotify vazia ou indisponível");
-  return entries;
-}
+async function expandQuery(query) { return intentResolver.resolve(query); }
 
 // ----------------------------------------------------------------- the queue
 const queue = [];
@@ -383,14 +361,80 @@ const queue = [];
 // queue on the way out instead of leaving a just-queued song stranded.
 let advancing = false, pendingAdvance = false;
 
-/** Metadata is resolved lazily, and the next entry is warmed while this one
+/** The playable source is resolved lazily, and the next entry is warmed while this one
  *  plays so /skip lands in well under a second instead of ~8. */
 function resolveEntry(entry) {
-  if (entry.meta !== undefined) return Promise.resolve(entry.meta);
-  if (!entry.pending) entry.pending = resolveMeta(entry.spec).then(meta => { entry.meta = meta; return meta; });
+  if (entry.resolution !== undefined) return Promise.resolve(entry.resolution);
+  if (!entry.pending) {
+    entry.pending = providerChain.resolve(entry.intent, { afterIndex: entry.providerIndex })
+      .then(resolution => {
+        entry.resolution = resolution;
+        if (resolution) entry.providerIndex = resolution.providerIndex;
+        return resolution;
+      });
+  }
   return entry.pending;
 }
 function prefetchNext() { if (queue[0]) void resolveEntry(queue[0]).catch(() => { }); }
+
+function resetEntryResolution(entry) {
+  entry.pending = null;
+  entry.resolution = undefined;
+}
+
+function entryTitle(entry, resolution) {
+  const intent = entry.intent;
+  if (intent.title && intent.artist) return `${intent.title} — ${intent.artist}`;
+  return intent.title || intent.query || resolution.candidate.title || intent.raw;
+}
+
+function streamMeta(entry, resolution) {
+  const intent = entry.intent;
+  return {
+    title: intent.title || resolution.candidate.title || intent.query || intent.raw,
+    artist: intent.artist || resolution.candidate.artist || null,
+    durationMs: intent.durationMs || resolution.candidate.durationMs || null,
+    imageUrl: intent.imageUrl || resolution.candidate.imageUrl || null,
+    sourceUrl: intent.sourceUrl || resolution.candidate.sourceUrl || null,
+    album: intent.album || null,
+    origin: intent.source || "text",
+    url: resolution.playable,
+    provider: resolution.provider,
+    providerIndex: resolution.providerIndex,
+    candidateScore: resolution.candidate.score,
+    entry,
+  };
+}
+
+function statusDetails(meta) {
+  return {
+    title: meta.title, artist: meta.artist, origin: meta.origin, provider: meta.provider,
+    durationMs: meta.durationMs, imageUrl: meta.imageUrl, sourceUrl: meta.sourceUrl,
+    collectionName: meta.album, collectionKind: meta.album ? "album" : null,
+    requestedBy: meta.entry.requestedBy,
+  };
+}
+
+function remainingTrackMs(track) {
+  const duration = Number(track?.meta.durationMs);
+  if (!(duration > 0)) return null;
+  if (!track.playbackStartedAt) return duration;
+  const pausedNow = track.pausedStartedAt ? Date.now() - track.pausedStartedAt : 0;
+  const elapsed = Date.now() - track.playbackStartedAt - track.accumulatedPausedMs - pausedNow;
+  return Math.max(0, duration - elapsed);
+}
+
+function estimatedWaitMs(entries) {
+  const durations = [];
+  if (current) durations.push(remainingTrackMs(current));
+  durations.push(...entries.map(entry => Number(entry.intent.durationMs || entry.resolution?.candidate.durationMs) || null));
+  return durations.some(value => value === null) ? null : durations.reduce((sum, value) => sum + value, 0);
+}
+
+function totalDurationMs(intents) {
+  const durations = intents.map(intent => Number(intent.durationMs)).filter(value => value > 0);
+  return durations.length ? durations.reduce((sum, value) => sum + value, 0) : null;
+}
 
 function stopCurrent() {
   const track = current;
@@ -428,15 +472,21 @@ async function playNext() {
   advancing = true;
   pendingAdvance = false;
   try {
+    const previous = current;
     stopCurrent();
     while (queue.length) {
       const entry = queue.shift();
-      const meta = await resolveEntry(entry);
-      if (!meta) { log(`skipping ${JSON.stringify(entry.label)} — could not resolve it`); continue; }
-      if (beginStream(meta)) { prefetchNext(); return; }
+      const resolution = await resolveEntry(entry);
+      if (!resolution) { log(`skipping ${JSON.stringify(entryTitle(entry, { candidate: {} }))} — could not resolve it`); continue; }
+      if (beginStream(streamMeta(entry, resolution))) { prefetchNext(); return; }
+      resetEntryResolution(entry);
+      queue.unshift(entry);
     }
     unpublishCurrent();
     idleSince = Date.now();
+    if (previous?.done && previous.bytes > 0) {
+      statusReporter.report(previous.meta.entry.channelId, "finished", statusDetails(previous.meta));
+    }
     log("queue drained — idle");
   } catch (error) {
     log(`playNext failed: ${error && error.message ? error.message : error}`);
@@ -448,17 +498,18 @@ async function playNext() {
   }
 }
 
-/** Spawn yt-dlp | ffmpeg for one resolved video. Returns false only if the
- *  spawn itself was impossible; a stream that dies empty retries with the next
- *  client set and then moves on by itself. */
+/** Spawn yt-dlp | ffmpeg for one playable reference. Returns false only if the
+ *  spawn itself was impossible. YouTube retains its client-set retries; other
+ *  empty sources fail over to the next provider. */
 function beginStream(meta, attempt = 0) {
   stopCurrent();
   const clients = CLIENT_SETS[Math.min(attempt, CLIENT_SETS.length - 1)];
-  log(`playing "${meta.title}" (${meta.url}) clients=${clients}${attempt ? ` attempt=${attempt + 1}` : ""}`);
+  const clientDetails = meta.provider === "youtube" ? ` clients=${clients}${attempt ? ` attempt=${attempt + 1}` : ""}` : "";
+  log(`playing "${meta.title}" (${meta.url}) provider=${meta.provider}${clientDetails}`);
 
   let yt, ffmpeg;
   try {
-    yt = spawn("yt-dlp", [...ytArgs({ clients }), "-f", AUDIO_FORMAT, "-o", "-", meta.url], { stdio: ["ignore", "pipe", "pipe"] });
+    yt = spawn("yt-dlp", [...mediaArgs(meta.provider, clients), "-f", AUDIO_FORMAT, "-o", "-", meta.url], { stdio: ["ignore", "pipe", "pipe"] });
     ffmpeg = spawn("ffmpeg", [
       "-hide_banner", "-loglevel", "warning", "-nostdin",
       "-i", "pipe:0",
@@ -475,7 +526,8 @@ function beginStream(meta, attempt = 0) {
   const track = {
     meta, title: meta.title, yt, ffmpeg, attempt,
     pcm: new PcmQueue(), eof: false, flowing: false, done: false, aborted: false,
-    stdoutPaused: false, bytes: 0, underruns: 0, startedAt: Date.now(),
+    stdoutPaused: false, bytes: 0, underruns: 0, startedAt: Date.now(), announced: false,
+    playbackStartedAt: 0, pausedStartedAt: 0, accumulatedPausedMs: 0,
   };
   current = track;
   idleSince = 0;
@@ -492,7 +544,15 @@ function beginStream(meta, attempt = 0) {
 
   ffmpeg.stdout.on("data", chunk => {
     if (current !== track) return;
-    if (track.bytes === 0) log(`first PCM from ffmpeg after ${Date.now() - track.startedAt}ms`);
+    if (track.bytes === 0) {
+      track.playbackStartedAt = Date.now();
+      log(`first PCM from ffmpeg after ${Date.now() - track.startedAt}ms`);
+      if (!track.announced) {
+        track.announced = true;
+        lastStatusChannelId = meta.entry.channelId || lastStatusChannelId;
+        statusReporter.report(meta.entry.channelId, "playing", statusDetails(meta));
+      }
+    }
     track.bytes += chunk.length;
     track.pcm.push(chunk);
     if (!track.stdoutPaused && track.pcm.bytes >= HIGH_WATER_BYTES) {
@@ -503,20 +563,46 @@ function beginStream(meta, attempt = 0) {
 
   ffmpeg.on("close", () => {
     if (track.aborted || current !== track) return;
-    track.eof = true;
-    if (track.bytes > 0) return;   // the feeder drains the tail, then advances
-    if (attempt + 1 < CLIENT_SETS.length) {
+    if (track.bytes > 0) { track.eof = true; return; }   // the feeder drains the tail, then advances
+    if (meta.provider === "youtube" && attempt + 1 < CLIENT_SETS.length) {
       log(`"${meta.title}" produced no audio with clients=${clients} — retrying`);
       beginStream(meta, attempt + 1);
       return;
     }
-    log(`"${meta.title}" produced no audio on any client — skipping (see [yt-dlp] above)`);
-    track.done = true;
-    void playNext();
+    log(`"${meta.title}" produced no audio with provider=${meta.provider} — trying the next provider`);
+    sourceLog("source.failed", {
+      intent: { title: meta.entry.intent.title, artist: meta.entry.intent.artist, raw: meta.entry.intent.raw },
+      provider: meta.provider,
+      score: meta.candidateScore,
+      reason: "no_pcm",
+    });
+    void failoverSource(track);
   });
 
   publishTrack(meta.title);
   return true;
+}
+
+async function failoverSource(track) {
+  const { entry, providerIndex } = track.meta;
+  resetEntryResolution(entry);
+  entry.providerIndex = providerIndex;
+  const resolution = await resolveEntry(entry);
+  if (track.aborted || current !== track) return;
+  if (resolution) {
+    beginStream(streamMeta(entry, resolution));
+    prefetchNext();
+    return;
+  }
+  log(`"${track.title}" exhausted the provider chain — skipping`);
+  statusReporter.report(entry.channelId, "error", {
+    title: entryTitle(entry, { candidate: {} }),
+    origin: entry.intent.source,
+    detail: "Não encontrei uma fonte reproduzível para esta faixa.",
+  });
+  track.done = true;
+  current = null;
+  void playNext();
 }
 
 function audioFilter() {
@@ -532,15 +618,55 @@ function audioFilter() {
 }
 
 // ------------------------------------------------------------------ commands
-async function enqueue(query) {
-  const entries = await expandQuery(query);
+async function enqueue(query, { channelId, requestedBy } = {}) {
+  const request = await expandQuery(query);
+  const intents = request.intents;
+  const collection = request.collection;
   const room = Math.max(0, MAX_QUEUE - queue.length);
-  const accepted = entries.slice(0, room);
+  const wasPlaying = Boolean(current);
+  const position = queue.length + 1;
+  const etaMs = wasPlaying ? estimatedWaitMs(queue) : 0;
+  const accepted = intents.slice(0, room).map(intent => ({
+    intent, channelId, requestedBy, providerIndex: -1, resolution: undefined, pending: null,
+  }));
   queue.push(...accepted);
-  if (accepted.length < entries.length) log(`queue full — dropped ${entries.length - accepted.length} entries`);
+  if (accepted.length < intents.length) log(`queue full — dropped ${intents.length - accepted.length} entries`);
   log(`queued ${accepted.length} item(s); ${queue.length} waiting`);
+  lastStatusChannelId = channelId || lastStatusChannelId;
+  if (accepted.length) {
+    statusReporter.report(channelId, wasPlaying ? "queued" : "loading", {
+      title: collection?.title || (intents.length === 1 ? entryTitle(accepted[0], { candidate: {} }) : query),
+      artist: collection?.owner || (intents.length === 1 ? accepted[0].intent.artist : null),
+      origin: intents.length === 1 ? intents[0].source : sourceFromQuery(query),
+      count: accepted.length,
+      position: wasPlaying ? position : 0,
+      queueSize: queue.length,
+      durationMs: accepted.length === 1 ? accepted[0].intent.durationMs : null,
+      totalDurationMs: totalDurationMs(accepted.map(entry => entry.intent)),
+      etaMs,
+      imageUrl: collection?.imageUrl || accepted[0].intent.imageUrl,
+      sourceUrl: collection?.sourceUrl || accepted[0].intent.sourceUrl,
+      collectionName: collection?.title || accepted[0].intent.album,
+      collectionKind: collection?.kind || (accepted[0].intent.album ? "album" : null),
+      requestedBy,
+      detail: collection?.description ? String(collection.description).replace(/<[^>]+>/g, "").trim().slice(0, 500) || null : null,
+      items: accepted.map(entry => entry.intent),
+    });
+  } else {
+    statusReporter.report(channelId, "error", { title: query, detail: "A fila está cheia." });
+  }
+  if (paused && current?.pausedStartedAt) {
+    current.accumulatedPausedMs += Date.now() - current.pausedStartedAt;
+    current.pausedStartedAt = 0;
+  }
   paused = false;
   if (!current) await playNext(); else prefetchNext();
+}
+
+function sourceFromQuery(query) {
+  if (/open\.spotify\.com/i.test(query)) return "spotify";
+  if (/youtu(?:\.be|be\.com)/i.test(query)) return "youtube";
+  return "text";
 }
 
 async function join(channelId) {
@@ -561,6 +687,7 @@ function leaveVoice() {
   voiceChannel = null;
   paused = false;
   idleSince = 0;
+  lastStatusChannelId = null;
 }
 
 async function onEvent(op, data) {
@@ -576,14 +703,51 @@ async function onEvent(op, data) {
   else if (op === "music.command") {
     log(`music.command: ${data.command} ${JSON.stringify(data.query ?? "")}`);
     try {
-      if (data.command === "play") { await join(data.voice_channel_id); await enqueue(data.query); }
-      else if (data.command === "pause") { paused = true; idleSince = Date.now(); }
-      else if (data.command === "resume") { paused = false; idleSince = 0; }
-      else if (data.command === "skip") { paused = false; await playNext(); }
-      else if (data.command === "stop") leaveVoice();
-      else if (data.command === "queue") log(`queue: ${queue.length} waiting, now playing ${JSON.stringify(current?.title ?? null)}`);
+      if (data.command === "play") {
+        await join(data.voice_channel_id);
+        await enqueue(data.query, { channelId: data.channel_id, requestedBy: data.requested_by });
+      } else if (data.command === "pause") {
+        if (current && !paused) {
+          paused = true;
+          current.pausedStartedAt = Date.now();
+          idleSince = Date.now();
+          lastStatusChannelId = data.channel_id || lastStatusChannelId;
+          statusReporter.report(data.channel_id, "paused", statusDetails(current.meta));
+        }
+      } else if (data.command === "resume") {
+        if (current && paused) {
+          if (current.pausedStartedAt) current.accumulatedPausedMs += Date.now() - current.pausedStartedAt;
+          current.pausedStartedAt = 0;
+          paused = false;
+          idleSince = 0;
+          lastStatusChannelId = data.channel_id || lastStatusChannelId;
+          statusReporter.report(data.channel_id, "resumed", statusDetails(current.meta));
+        }
+      } else if (data.command === "skip") {
+        if (current) statusReporter.report(data.channel_id, "skipped", statusDetails(current.meta));
+        lastStatusChannelId = data.channel_id || lastStatusChannelId;
+        paused = false;
+        await playNext();
+      } else if (data.command === "stop") {
+        const statusChannelId = data.channel_id || current?.meta.entry.channelId || lastStatusChannelId;
+        const kind = data.reason === "disconnected" || data.reason === "dj_left" ? "disconnected" : "stopped";
+        statusReporter.report(statusChannelId, kind, current ? statusDetails(current.meta) : {});
+        leaveVoice();
+      } else if (data.command === "queue") {
+        const upcoming = queue.slice(0, 5).map((entry, index) => `${index + 1}. ${entryTitle(entry, { candidate: {} })}`);
+        statusReporter.report(data.channel_id, "queue", {
+          title: current?.title || null,
+          count: queue.length,
+          totalDurationMs: totalDurationMs(queue.map(entry => ({ durationMs: entry.intent.durationMs || entry.resolution?.candidate.durationMs }))),
+          imageUrl: current?.meta.imageUrl || queue[0]?.intent.imageUrl,
+          sourceUrl: current?.meta.sourceUrl || queue[0]?.intent.sourceUrl,
+          items: queue.map(entry => entry.intent),
+          detail: upcoming.length ? null : "Nenhuma faixa aguardando.",
+        });
+      }
     } catch (error) {
       log(`${data.command} failed: ${error && error.message ? error.message : error}`);
+      statusReporter.report(data.channel_id, "error", { title: data.query || null, detail: error && error.message ? error.message : String(error) });
       if (!current) unpublishCurrent();
     }
   }
@@ -609,6 +773,7 @@ setInterval(() => {
   if (!idleSince) idleSince = Date.now();
   if (Date.now() - idleSince >= IDLE_TIMEOUT_MS) {
     log("idle timeout reached, leaving voice channel");
+    statusReporter.report(current?.meta.entry.channelId || lastStatusChannelId, "disconnected", current ? statusDetails(current.meta) : {});
     leaveVoice();
   }
 }, 30 * 1000);

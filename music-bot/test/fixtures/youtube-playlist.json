@@ -1,0 +1,6 @@
+{
+  "items": [
+    { "snippet": { "title": "Song A", "videoOwnerChannelTitle": "Artist A" }, "contentDetails": { "videoId": "AAAAAAAAAAA" } },
+    { "snippet": { "title": "Song B", "videoOwnerChannelTitle": "Artist B" }, "contentDetails": { "videoId": "BBBBBBBBBBB" } }
+  ]
+}

@@ -25,10 +25,20 @@ type MessageEmbed = {
   image_url?: string | null; thumbnail_url?: string | null;
   fields?: { name: string; value: string; inline?: boolean }[] | null;
 };
+type MusicStatus = {
+  kind: "loading" | "queued" | "playing" | "paused" | "resumed" | "skipped" | "stopped" | "finished" | "disconnected" | "queue" | "error";
+  origin?: string | null; provider?: string | null; title?: string | null; artist?: string | null;
+  detail?: string | null; count?: number | null; position?: number | null;
+  queue_size?: number | null; duration_ms?: number | null; total_duration_ms?: number | null; eta_ms?: number | null;
+  image_url?: string | null; source_url?: string | null; collection_name?: string | null; collection_kind?: "album" | "playlist" | null;
+  requested_by?: string | null;
+  items?: { title: string; artist?: string | null; duration_ms?: number | null }[];
+};
 type Message = {
   id: string; content: string; created_at: string; author?: { display_name: string; avatar_url?: string | null; profile_tag?: string | null; profile_badge_url?: string | null }; author_id?: string; attachments?: Attachment[];
   link_preview?: { url: string; title?: string | null; description?: string | null; site_name?: string | null; image_url?: string | null } | null;
   embeds?: MessageEmbed[];
+  music_status?: MusicStatus;
   // Optimistic-send bookkeeping (never sent to the server, purely local UI
   // state) — see submitMessage/retryMessage. `reqId` is the same id echoed
   // back by the server as `in_reply_to` (CHAT-FR idempotent send).
@@ -163,6 +173,122 @@ function renderText(
 
     return <span key={index}>{part}</span>;
   });
+}
+
+function SpotifyLogo() {
+  return (
+    <svg viewBox="0 0 24 24" aria-label="Spotify" role="img">
+      <circle cx="12" cy="12" r="12" fill="#1ed760" />
+      <path d="M5.7 9.1c4.2-1.25 8.85-.96 12.65.79" fill="none" stroke="#101010" strokeWidth="1.9" strokeLinecap="round" />
+      <path d="M6.55 12.45c3.55-1.02 7.48-.78 10.72.64" fill="none" stroke="#101010" strokeWidth="1.65" strokeLinecap="round" />
+      <path d="M7.3 15.55c2.9-.78 6.05-.59 8.68.51" fill="none" stroke="#101010" strokeWidth="1.45" strokeLinecap="round" />
+    </svg>
+  );
+}
+
+function YouTubeLogo() {
+  return (
+    <svg viewBox="0 0 24 24" aria-label="YouTube" role="img">
+      <path d="M23.5 7.1a3 3 0 0 0-2.1-2.12C19.54 4.5 12 4.5 12 4.5s-7.54 0-9.4.48A3 3 0 0 0 .5 7.1 31 31 0 0 0 0 12a31 31 0 0 0 .5 4.9 3 3 0 0 0 2.1 2.12c1.86.48 9.4.48 9.4.48s7.54 0 9.4-.48a3 3 0 0 0 2.1-2.12A31 31 0 0 0 24 12a31 31 0 0 0-.5-4.9Z" fill="#ff0033" />
+      <path d="m9.6 15.25 6.3-3.25-6.3-3.25v6.5Z" fill="#fff" />
+    </svg>
+  );
+}
+
+function MusicProviderLogo({ status }: { status: MusicStatus }) {
+  const brand = (status.origin === "spotify" || status.origin === "youtube" ? status.origin : status.provider)?.toLowerCase();
+  if (brand === "spotify") return <SpotifyLogo />;
+  if (brand === "youtube") return <YouTubeLogo />;
+  return <MusicNoteIcon />;
+}
+
+const MUSIC_STATUS_LABEL: Record<MusicStatus["kind"], string> = {
+  loading: "Procurando uma fonte",
+  queued: "Adicionada à fila",
+  playing: "Tocando agora",
+  paused: "Reprodução pausada",
+  resumed: "Reprodução retomada",
+  skipped: "Faixa pulada",
+  stopped: "Fila encerrada",
+  finished: "Reprodução finalizada",
+  disconnected: "Bot desconectado",
+  queue: "Fila atual",
+  error: "Não foi possível reproduzir",
+};
+
+function formatMusicDuration(value?: number | null) {
+  if (value == null || !Number.isFinite(value) || value < 0) return null;
+  const totalSeconds = Math.round(value / 1000);
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  return hours > 0
+    ? `${hours}:${String(minutes).padStart(2, "0")}:${String(seconds).padStart(2, "0")}`
+    : `${minutes}:${String(seconds).padStart(2, "0")}`;
+}
+
+function MusicStatusCard({ status, members }: { status: MusicStatus; members: Member[] }) {
+  const [imageFailed, setImageFailed] = useState(false);
+  const suffix = status.artist ? ` por ${status.artist}` : "";
+  const requestedBy = status.requested_by ? members.find(member => member.id === status.requested_by) : null;
+  const duration = formatMusicDuration(status.duration_ms);
+  const totalDuration = formatMusicDuration(status.total_duration_ms);
+  const eta = formatMusicDuration(status.eta_ms);
+  const visibleItems = status.items?.slice(0, 5) ?? [];
+  return (
+    <div className={`music-status music-status--${status.kind}`}>
+      {status.image_url && !imageFailed ? (
+        <a className="music-status__art-link" href={status.source_url || status.image_url} target="_blank" rel="noreferrer noopener">
+          <img className="music-status__art" src={status.image_url} alt="" loading="lazy" onError={() => setImageFailed(true)} />
+          <span className="music-status__art-provider"><MusicProviderLogo status={status} /></span>
+        </a>
+      ) : <span className="music-status__provider"><MusicProviderLogo status={status} /></span>}
+      <div className="music-status__copy">
+        <span className="music-status__label">{MUSIC_STATUS_LABEL[status.kind]}</span>
+        {status.title && (status.source_url
+          ? <a className="music-status__track" href={status.source_url} target="_blank" rel="noreferrer noopener">{status.title}<span className="music-status__artist">{suffix}</span></a>
+          : <span className="music-status__track">{status.title}<span className="music-status__artist">{suffix}</span></span>)}
+        {status.collection_name && status.collection_name !== status.title && (
+          <span className="music-status__collection">{status.collection_kind === "album" ? "Álbum" : "Playlist"} · {status.collection_name}</span>
+        )}
+        {status.kind === "queue" && <span className="music-status__count">{status.count ?? 0} faixa(s) aguardando</span>}
+        {(duration || totalDuration || (status.kind === "queued" && (eta !== null || status.position || status.queue_size))) && (
+          <div className="music-status__facts">
+            {duration && <span><b>Duração</b>{duration}</span>}
+            {totalDuration && <span><b>Duração total</b>{totalDuration}</span>}
+            {status.count != null && status.count > 1 && <span><b>Faixas</b>{status.count}</span>}
+            {eta !== null && status.kind === "queued" && <span><b>Estimativa até tocar</b>{eta}</span>}
+            {status.kind === "queued" && !!status.position && <span><b>Primeira faixa na posição</b>{status.position}</span>}
+            {status.kind === "queued" && !!status.queue_size && <span><b>Total aguardando</b>{status.queue_size}</span>}
+          </div>
+        )}
+        {visibleItems.length > 0 && (status.count ?? 0) > 1 && (
+          <ol className="music-status__items">
+            {visibleItems.map((item, index) => (
+              <li key={`${item.title}-${index}`}>
+                <span>{item.title}{item.artist ? ` — ${item.artist}` : ""}</span>
+                <time>{formatMusicDuration(item.duration_ms) || "—"}</time>
+              </li>
+            ))}
+            {(status.count ?? 0) > visibleItems.length && <li className="music-status__items-more">+ {(status.count ?? 0) - visibleItems.length} outras faixas</li>}
+          </ol>
+        )}
+        {status.detail && <span className="music-status__detail">{status.detail}</span>}
+        {requestedBy && (
+          <span className="music-status__requester">
+            {requestedBy.avatar_url && <img src={requestedBy.avatar_url} alt="" />}
+            Pedido por {requestedBy.display_name}
+          </span>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function mergeMessages(...groups: Message[][]) {
+  const byId = new Map<string, Message>();
+  groups.flat().forEach(message => byId.set(message.id, message));
+  return [...byId.values()].sort((left, right) => Date.parse(left.created_at) - Date.parse(right.created_at));
 }
 
 // Renders rich Twitter / WhatsApp / Discord style link previews with 3D card layout
@@ -1091,6 +1217,7 @@ export function App() {
   const [historyLoading, setHistoryLoading] = useState(false);
   const [skeletonRows, setSkeletonRows] = useState(8);
   const historyCacheRef = useRef<Record<string, Message[]>>({});
+  const musicAnnouncementsRef = useRef<Record<string, Message[]>>({});
   const messagesRef = useRef<Message[]>([]);
   // The scrollable message viewport — kept pinned to the newest message.
   const messagesScrollRef = useRef<HTMLDivElement>(null);
@@ -1250,12 +1377,32 @@ export function App() {
           if (streamId) { void rtc.stopMusic(voiceChannelId, streamId); musicStreamRef.current = null; setMyMusicStreamId(null); }
         }
       }
-      if (event.op === "music.announcement" && event.data.channel_id === activeChannel?.id) {
-        setMessages(current => [...current, { id: crypto.randomUUID(), content: event.data.content, created_at: new Date().toISOString(), author: { display_name: "Tupi Música" } }]);
+      if (event.op === "music.announcement") {
+        const channelId: string = event.data.channel_id;
+        const status = event.data as MusicStatus & { status_id: string; channel_id: string };
+        const announcement: Message = {
+          id: status.status_id || crypto.randomUUID(),
+          content: "",
+          created_at: new Date().toISOString(),
+          author_id: MUSIC_BOT_ID,
+          author: { display_name: "Tupi Música", profile_tag: "BOT" },
+          music_status: status,
+        };
+        const channelAnnouncements = mergeMessages(musicAnnouncementsRef.current[channelId] ?? [], [announcement]);
+        musicAnnouncementsRef.current[channelId] = channelAnnouncements;
+        historyCacheRef.current[channelId] = mergeMessages(historyCacheRef.current[channelId] ?? [], [announcement]);
+        if (channelId === activeChannel?.id) {
+          setMessages(current => mergeMessages(current, [announcement]));
+        } else {
+          setUnread(current => current[channelId] ? current : { ...current, [channelId]: true });
+        }
       }
       if (event.op === "chat.history") {
         const historyChannelId: string | undefined = event.data.channel_id ?? event.data.messages?.[0]?.channel_id;
-        const historyMessages: Message[] = event.data.messages ?? [];
+        const persistedMessages: Message[] = event.data.messages ?? [];
+        const historyMessages = historyChannelId
+          ? mergeMessages(persistedMessages, musicAnnouncementsRef.current[historyChannelId] ?? [])
+          : persistedMessages;
         if (historyChannelId) {
           historyCacheRef.current[historyChannelId] = historyMessages;
           writeSkeletonRows(historyChannelId, historyMessages.length);
@@ -3334,6 +3481,7 @@ export function App() {
                           </small>
                         )}
                       </span>
+                      {message.music_status && <MusicStatusCard status={message.music_status} members={members} />}
                       {message.content && message.content.trim() !== "[anexo]" && (
                         <span className="msg__body">
                           {renderText(message.content, currentUserId, currentUser, members)}

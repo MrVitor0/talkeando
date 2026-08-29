@@ -270,6 +270,46 @@ Encaminhado da mesma forma ao owner (evento `stream.unsubscribe_requested`
 [S→C], mesmo shape trocando o nome do campo de ação), que desativa o sender
 para aquele peer específico (`SUB-FR-003`).
 
+## `music.*` — controle e estados efêmeros
+
+### `music.command` [C→S→bot]
+
+```json
+{ "v": 1, "op": "music.command", "data": {
+  "channel_id": "uuid-text-channel", "voice_channel_id": "uuid-voice-channel",
+  "command": "play", "query": "nome ou URL"
+} }
+```
+
+`command` é `play|pause|resume|skip|stop|queue`. O servidor confirma que o
+remetente está no canal de voz, que `channel_id` é um canal de texto acessível
+e então encaminha o comando ao bot autenticado.
+
+### `music.status` [bot→S] e `music.announcement` [S→C]
+
+```json
+{ "v": 1, "op": "music.announcement", "data": {
+  "status_id": "uuid-status", "channel_id": "uuid-text-channel",
+  "kind": "playing", "origin": "spotify", "provider": "soundcloud",
+  "title": "Faixa", "artist": "Artista", "detail": null,
+  "count": null, "position": null, "queue_size": null,
+  "duration_ms": 218000, "total_duration_ms": null, "eta_ms": null,
+  "image_url": "https://.../cover.jpg", "source_url": "https://...",
+  "collection_name": "Álbum", "collection_kind": "album",
+  "requested_by": "uuid-user", "items": []
+} }
+```
+
+Somente a identidade fixa do bot pode enviar `music.status`. O servidor valida
+o payload e o retransmite como `music.announcement` para a comunidade dona do
+canal. Os estados são efêmeros e cada faixa conserva o canal de texto que
+originou seu pedido. `kind` é `loading|queued|playing|paused|resumed|skipped|
+stopped|finished|disconnected|queue|error`.
+
+Campos de duração usam milissegundos. `items` contém no máximo dez prévias
+`{ title, artist?, duration_ms? }`; a UI atualmente mostra as cinco primeiras.
+URLs são aceitas apenas com esquema HTTP(S).
+
 ## `device.*`
 
 ### `device.list_changed` [C→S, informacional/telemetria apenas — `DEV-FR-003`]
@@ -299,6 +339,8 @@ retorna nenhuma lista.
 | `stream.unpublish/unpublished` | bidi/S→C | não | sim |
 | `stream.subscribe` → `stream.subscription_requested` | bidi/S→C | não | sim |
 | `stream.unsubscribe` → `stream.unsubscribe_requested` | bidi/S→C | não | sim |
+| `music.command` | C→S→bot | não | sim |
+| `music.status` → `music.announcement` | bot→S→C | não | não |
 | `device.list_changed` | C→S | não (log apenas) | não |
 | `error` | S→C | — | — |
 
