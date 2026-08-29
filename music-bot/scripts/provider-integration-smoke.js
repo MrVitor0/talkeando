@@ -2,6 +2,7 @@
 // Runs inside the deployed music-bot container. It checks the real provider
 // credentials, cookies and PoToken path without printing any secret.
 const { spawn } = require("child_process");
+const fs = require("fs");
 const { HttpClient } = require("../src/infrastructure/http-client");
 const { SpotifyClient } = require("../src/infrastructure/spotify-client");
 const { YouTubeClient } = require("../src/infrastructure/youtube-client");
@@ -29,8 +30,17 @@ function ytdlp(args, timeoutMs = 60000) {
 function youtubeArgs() {
   const args = ["--ignore-config", "--no-progress", "--no-call-home", "--no-playlist", "--skip-download", "--simulate", "--retries", "5", "--fragment-retries", "5", "--extractor-retries", "3", "--socket-timeout", "20", "--js-runtimes", "deno", "--remote-components", "ejs:github", "--extractor-args", `youtube:player_client=${process.env.YT_PLAYER_CLIENTS || "default,-visionos"}`];
   if (process.env.YT_POT_PROVIDER_URL) args.push("--extractor-args", `youtubepot-bgutilhttp:base_url=${process.env.YT_POT_PROVIDER_URL}`);
-  args.push("--cookies", process.env.YT_DLP_COOKIES || "/cookies/yt.txt");
+  args.push("--cookies", writableCookieJar());
   return args;
+}
+
+function writableCookieJar() {
+  const source = process.env.YT_DLP_COOKIES || "/cookies/yt.txt";
+  const destination = "/tmp/yt-integration-cookies.txt";
+  // yt-dlp updates some cookie values while handling YouTube. The production
+  // bot therefore never hands it the read-only Docker mount directly.
+  fs.copyFileSync(source, destination);
+  return destination;
 }
 
 async function main() {
