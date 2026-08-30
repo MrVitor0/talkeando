@@ -181,6 +181,11 @@ public sealed class ActivityMonitor : IDisposable
         catch { /* transient — treat as nothing playing this tick */ }
         if (props is null || string.IsNullOrWhiteSpace(props.Title)) return null;
 
+        // Browser media sessions expose the title of the active tab. They are
+        // too broad for community presence (and may disclose what someone is
+        // watching/listening to), so only report dedicated media apps here.
+        if (IsBrowserSession(_session.SourceAppUserModelId)) return null;
+
         var title = props.Title.Trim();
         var artist = (props.Artist ?? "").Trim();
         if (artist.Length == 0) artist = (props.AlbumArtist ?? "").Trim();
@@ -262,6 +267,20 @@ public sealed class ActivityMonitor : IDisposable
         if (bang > 0) id = id[..bang];
         var dot = id.LastIndexOf('.');
         return dot > 0 && dot < id.Length - 1 ? id[(dot + 1)..] : id;
+    }
+
+    private static bool IsBrowserSession(string? aumid)
+    {
+        if (string.IsNullOrWhiteSpace(aumid)) return false;
+        var id = aumid.ToLowerInvariant();
+        return id.Contains("chrome")
+            || id.Contains("msedge")
+            || id.Contains("microsoftedge")
+            || id.Contains("firefox")
+            || id.Contains("opera")
+            || id.Contains("brave")
+            || id.Contains("vivaldi")
+            || id.Contains("chromium");
     }
 
     // ---- Phase 2: game detection -----------------------------------------
