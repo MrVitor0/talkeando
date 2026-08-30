@@ -26,6 +26,17 @@ let outputVolume = storedNumber("tk.outputVolume", 1);
 const remotes = new Set<Remote>();
 const cameras = new Set<(stream: MediaStream | null) => void>();
 const speakers = new Set<(ids: Set<string>) => void>();
+// LiveKit's active-speaker event is authoritative for remote people, but it
+// reaches us only after the SFU has received and classified a few audio
+// packets. Keep the local microphone level separately so our own speaking
+// ring reacts at capture time instead of a second later.
+const remoteSpeakers = new Set<string>();
+let localSpeakerIdentity: string | null = null;
+let localSpeaking = false;
+let localSpeakingUntil = 0;
+let localAudioContext: AudioContext | null = null;
+let localAnalyser: AnalyserNode | null = null;
+let localSpeechFrame = 0;
 const qualities = new Set<(quality: ConnQuality) => void>();
 const mediaErrors = new Set<(message: string) => void>();
 const volumes = new Map<string, number>(Object.entries(stored("tk.peerVolumes")));
@@ -45,6 +56,61 @@ function storedNumber(key: string, fallback: number): number {
 }
 function persist(key: string, values: Map<string, number>) { try { localStorage.setItem(key, JSON.stringify(Object.fromEntries(values))); } catch {} }
 function persistValue(key: string, value: string | number) { try { localStorage.setItem(key, String(value)); } catch {} }
+
+function emitSpeaking() {
+  const ids = new Set(remoteSpeakers);
+  if (localSpeaking && localSpeakerIdentity) ids.add(localSpeakerIdentity);
+  speakers.forEach(listener => listener(ids));
+}
+
+function stopLocalSpeechMonitor() {
+  if (localSpeechFrame) cancelAnimationFrame(localSpeechFrame);
+  localSpeechFrame = 0;
+  localAnalyser?.disconnect(); localAnalyser = null;
+  const context = localAudioContext; localAudioContext = null;
+  void context?.close().catch(() => {});
+  localSpeakerIdentity = null;
+  localSpeaking = false;
+  localSpeakingUntil = 0;
+  emitSpeaking();
+}
+
+function startLocalSpeechMonitor(room: Room) {
+  stopLocalSpeechMonitor();
+  const track = [...room.localParticipant.audioTrackPublications.values()]
+    .map(publication => publication.track)
+    .find((candidate): candidate is NonNullable<typeof candidate> => !!candidate);
+  if (!track) return;
+
+  try {
+    const context = new AudioContext();
+    const analyser = context.createAnalyser();
+    analyser.fftSize = 512;
+    analyser.smoothingTimeConstant = 0.15;
+    context.createMediaStreamSource(new MediaStream([track.mediaStreamTrack])).connect(analyser);
+    localAudioContext = context;
+    localAnalyser = analyser;
+    localSpeakerIdentity = room.localParticipant.identity;
+    void context.resume().catch(() => {});
+    const samples = new Uint8Array(analyser.fftSize);
+    const tick = () => {
+      if (active !== room || localAnalyser !== analyser) return;
+      analyser.getByteTimeDomainData(samples);
+      let energy = 0;
+      for (const sample of samples) { const value = (sample - 128) / 128; energy += value * value; }
+      // -36 dB RMS: reacts to normal speech while ignoring the capture floor.
+      const speaking = Math.sqrt(energy / samples.length) > 0.016;
+      const now = performance.now();
+      if (speaking) localSpeakingUntil = now + 180;
+      const next = speaking || now < localSpeakingUntil;
+      if (next !== localSpeaking) { localSpeaking = next; emitSpeaking(); }
+      localSpeechFrame = requestAnimationFrame(tick);
+    };
+    localSpeechFrame = requestAnimationFrame(tick);
+  } catch {
+    // The SFU event remains as the no-permission/no-WebAudio fallback.
+  }
+}
 
 async function credentials(channel_id: string, mode = "participant") {
   const request_id = crypto.randomUUID();
@@ -88,7 +154,12 @@ function bind(room: Room) {
     track.detach().forEach(element => element.remove());
     if (track.kind === Track.Kind.Video) remotes.forEach(listener => listener(participant.identity, null, publication.trackSid));
   });
-  room.on(RoomEvent.ActiveSpeakersChanged, list => speakers.forEach(listener => listener(new Set(list.map(participant => participant.identity)))));
+  room.on(RoomEvent.ActiveSpeakersChanged, list => {
+    if (active !== room && connecting !== room) return;
+    remoteSpeakers.clear();
+    list.forEach(participant => remoteSpeakers.add(participant.identity));
+    emitSpeaking();
+  });
   room.on(RoomEvent.ConnectionQualityChanged, quality => qualities.forEach(listener => listener(quality === "poor" ? "poor" : quality === "good" ? "good" : "medium")));
   room.on(RoomEvent.MediaDevicesError, (error, kind) => {
     const device = kind === "audioinput" ? "microfone" : kind === "audiooutput" ? "saída de áudio" : "dispositivo de mídia";
@@ -101,6 +172,7 @@ function bind(room: Room) {
     if (active !== room && connecting !== room) return;
     if (active === room) active = null;
     if (connecting === room) connecting = null;
+    stopLocalSpeechMonitor();
     if (presentChannelId) { send("voice.presence.leave", { channel_id: presentChannelId }); presentChannelId = null; }
   });
 }
@@ -148,6 +220,7 @@ export async function joinCall(id: string, isMuted: boolean, _: boolean) {
     send("voice.presence.enter", { channel_id: id });
     presentChannelId = id;
     await room.localParticipant.setMicrophoneEnabled(!isMuted, audioInputDeviceId ? { deviceId: audioInputDeviceId } : undefined);
+    startLocalSpeechMonitor(room);
   } catch (error) {
     if (connecting === room) connecting = null;
     room.disconnect();
@@ -159,10 +232,14 @@ export async function leaveCall() {
   if (presentChannelId) { send("voice.presence.leave", { channel_id: presentChannelId }); presentChannelId = null; }
   const room = active ?? connecting;
   active = null; connecting = null;
+  stopLocalSpeechMonitor();
   room?.disconnect();
   screen?.getTracks().forEach(track => track.stop()); screen = null;
 }
-export async function setLocalAudioState(isMuted: boolean, _: boolean) { await active?.localParticipant.setMicrophoneEnabled(!isMuted); }
+export async function setLocalAudioState(isMuted: boolean, _: boolean) {
+  await active?.localParticipant.setMicrophoneEnabled(!isMuted);
+  if (!isMuted && active) startLocalSpeechMonitor(active);
+}
 export async function startCamera(_: string, __: string, deviceId?: string) {
   if (!active) return;
   await active.localParticipant.setCameraEnabled(true, { deviceId, resolution: { width: 1280, height: 720 } });
@@ -218,7 +295,7 @@ export async function listCameras(): Promise<MediaDeviceInfo[]> { return (await 
 export async function listAllMediaDevices(): Promise<DeviceLists> { const devices = await navigator.mediaDevices.enumerateDevices(); return { audioInputs: devices.filter(device => device.kind === "audioinput"), audioOutputs: devices.filter(device => device.kind === "audiooutput"), videoInputs: devices.filter(device => device.kind === "videoinput") }; }
 export function getAudioInputDeviceId() { return audioInputDeviceId; }
 export function getAudioOutputDeviceId() { return audioOutputDeviceId; }
-export async function setAudioInputDevice(deviceId: string) { audioInputDeviceId = deviceId || undefined; if (deviceId) persistValue("tk.audioInputDeviceId", deviceId); await active?.switchActiveDevice("audioinput", deviceId).catch(() => {}); }
+export async function setAudioInputDevice(deviceId: string) { audioInputDeviceId = deviceId || undefined; if (deviceId) persistValue("tk.audioInputDeviceId", deviceId); await active?.switchActiveDevice("audioinput", deviceId).catch(() => {}); if (active) startLocalSpeechMonitor(active); }
 export async function setAudioOutputDevice(deviceId: string) { audioOutputDeviceId = deviceId || undefined; if (deviceId) persistValue("tk.audioOutputDeviceId", deviceId); await active?.switchActiveDevice("audiooutput", deviceId).catch(() => {}); for (const items of [...audio.values(), ...screenAudio.values()]) for (const element of items) void setSink(element); }
 export function getInputVolume() { return inputVolume; }
 export function getOutputVolume() { return outputVolume; }

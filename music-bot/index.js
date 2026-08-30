@@ -743,6 +743,12 @@ async function onEvent(op, data) {
         paused = false;
         await playNext();
       } else if (data.command === "stop") {
+        // A delayed room_finished event for an old channel must never kill
+        // music playing in the bot's current room.
+        if (data.voice_channel_id && voiceChannel && data.voice_channel_id !== voiceChannel) {
+          log(`ignoring stop for stale channel ${data.voice_channel_id}; active channel is ${voiceChannel}`);
+          return;
+        }
         const statusChannelId = data.channel_id || current?.meta.entry.channelId || lastStatusChannelId;
         const kind = data.reason === "disconnected" || data.reason === "dj_left" ? "disconnected" : "stopped";
         statusReporter.report(statusChannelId, kind, current ? statusDetails(current.meta) : {});

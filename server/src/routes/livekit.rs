@@ -2,7 +2,7 @@ use axum::{extract::{State, Json}, http::{header, HeaderMap}, Json as AxumJson};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{auth::authenticate_token, db, error::{AppError, AppResult}, livekit::{self, Mode}, state::AppState, ws::{handler::broadcast_voice_roster, protocol::OutboundEnvelope}};
+use crate::{auth::authenticate_token, db, error::{AppError, AppResult}, livekit::{self, Mode}, state::AppState, ws::handler::broadcast_voice_roster};
 
 const MUSIC_BOT_ID: Uuid = Uuid::from_u128(1);
 
@@ -46,7 +46,11 @@ pub async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: St
         "participant_left" => if let Some(user) = participant { state.hub.calls.write().await.apply_participant(room, user, false); broadcast_voice_roster(&state, room).await; },
         "track_published" => if let (Some(user), Some(track)) = (participant, event.track) { state.hub.calls.write().await.apply_track(room, user, &track.source, true, track.sid.clone()); broadcast_voice_roster(&state, room).await; },
         "track_unpublished" => if let (Some(user), Some(track)) = (participant, event.track) { state.hub.calls.write().await.apply_track(room, user, &track.source, false, track.sid.clone()); broadcast_voice_roster(&state, room).await; },
-        "room_finished" => { state.hub.calls.write().await.clear_channel(room); state.hub.send_to(MUSIC_BOT_ID, OutboundEnvelope::new("music.command", serde_json::json!({"command":"stop","voice_channel_id":room,"reason":"room_finished"}))).await; broadcast_voice_roster(&state, room).await; },
+        // A media room can finish after a transient participant disconnects or
+        // after a user changes channels. Music playback is controlled only by
+        // an explicit /stop (or the bot's idle timeout), never by the
+        // lifecycle of an unrelated LiveKit room.
+        "room_finished" => { state.hub.calls.write().await.clear_channel(room); broadcast_voice_roster(&state, room).await; },
         _ => {}
     }
     Ok(())
