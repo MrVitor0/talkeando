@@ -690,7 +690,57 @@ async fn handle_music_status(state: &AppState, user_id: Uuid, data: MusicStatus)
             return;
         }
     };
-    broadcast_to_community(state, channel.community_id, OutboundEnvelope::new("music.announcement", data)).await;
+
+    // Persist the card as a real message (author = the music bot's users row,
+    // see migration 0011) so it survives a reconnect / reload and loads with
+    // channel history, then broadcast it exactly like a chat message. `content`
+    // stays empty: the client renders `music_status` as a card, not body text.
+    let card = match serde_json::to_value(&data) {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::error!(%error, "failed to serialize music status card");
+            return;
+        }
+    };
+    let inserted = sqlx::query_as::<_, (Uuid, chrono::DateTime<chrono::Utc>)>(
+        "INSERT INTO messages (channel_id, author_id, content, music_status) \
+         VALUES ($1, $2, '', $3) RETURNING id, created_at",
+    )
+    .bind(channel.id)
+    .bind(MUSIC_BOT_ID)
+    .bind(&card)
+    .fetch_one(&state.pool)
+    .await;
+    let (message_id, created_at) = match inserted {
+        Ok(row) => row,
+        Err(error) => {
+            tracing::error!(%error, channel_id = %channel.id, "failed to persist music status message");
+            return;
+        }
+    };
+
+    broadcast_to_community(
+        state,
+        channel.community_id,
+        OutboundEnvelope::new(
+            "chat.message.created",
+            ChatMessageCreated {
+                message: MessageDto {
+                    id: message_id,
+                    channel_id: channel.id,
+                    author_id: MUSIC_BOT_ID,
+                    content: String::new(),
+                    created_at,
+                    edited_at: None,
+                    attachment_ids: vec![],
+                    attachments: vec![],
+                    music_status: Some(card),
+                },
+                in_reply_to: None,
+            },
+        ),
+    )
+    .await;
 }
 
 fn is_http_url(value: &str) -> bool {
@@ -801,6 +851,7 @@ async fn handle_chat_create(state: &AppState, user_id: Uuid, data: ChatMessageCr
                         edited_at: m.edited_at,
                         attachment_ids: data.attachment_ids,
                         attachments: resolved_attachments,
+                        music_status: None,
                     },
                     in_reply_to: data.req_id,
                 },
@@ -866,6 +917,7 @@ async fn handle_chat_create(state: &AppState, user_id: Uuid, data: ChatMessageCr
                             edited_at: m.edited_at,
                             attachment_ids: data.attachment_ids,
                             attachments: resolved_attachments,
+                            music_status: None,
                         },
                         in_reply_to: data.req_id,
                     },

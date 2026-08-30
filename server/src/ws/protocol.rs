@@ -220,6 +220,10 @@ pub struct MessageDto {
     pub attachment_ids: Vec<Uuid>,
     #[serde(default)]
     pub attachments: Vec<crate::routes::messages::MessageAttachment>,
+    /// Present only on the music bot's status cards (persisted `music.status`);
+    /// the client renders it as a provider-branded card instead of body text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub music_status: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]

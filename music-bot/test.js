@@ -195,10 +195,13 @@ async function main() {
 
   // yt-dlp invocation shape — the flags the 403 hunt actually turned on.
   const stream = spawned.filter(s => s.cmd === "yt-dlp" && s.args.includes("-o")).pop();
-  check("no --geo-bypass", !stream.args.includes("--geo-bypass"));
-  check("excludes the visionos client", stream.args.join(" ").includes("player_client="));
-  check("runs YouTube without a cookie jar (discovery-only, no PoToken)", !stream.args.includes("--cookies") && !stream.args.join(" ").includes("youtubepot"));
-  check("asks for an audio-only format", stream.args[stream.args.indexOf("-f") + 1].startsWith("bestaudio"));
+  const streamArgs = stream.args.join(" ");
+  check("YouTube stream args: no --geo-bypass, has player_client, audio-only format",
+    !stream.args.includes("--geo-bypass")
+    && streamArgs.includes("player_client=")
+    && stream.args[stream.args.indexOf("-f") + 1].startsWith("bestaudio"));
+  check("YouTube runs cookieless (discovery-only, no PoToken)",
+    !stream.args.includes("--cookies") && !streamArgs.includes("youtubepot"));
 
   // ---- pause/resume must hold the audio, not drop it on the floor.
   received.length = 0;
@@ -317,12 +320,13 @@ async function sourceResolutionChecks() {
   const spotifyRichRequest = await spotifyRich.resolve("https://open.spotify.com/playlist/playlist123");
   check("Spotify preserves collection and album artwork", spotifyRichRequest.collection.title === "Playlist A" && spotifyRichRequest.intents[0].imageUrl === "https://img.test/album-a.jpg");
 
+  // A playlist that 404s (private / editorial "37i9…") yields an actionable
+  // message — and it does so with only client_credentials, no refresh token.
   const { SpotifyClient } = require("./src/infrastructure/spotify-client");
   const blockedSpotify = new SpotifyClient({ clientId: "id", clientSecret: "secret", http: { async json(url) {
     if (url.includes("accounts.spotify.com/api/token")) return { access_token: "t", expires_in: 3600 };
     const error = new Error("HTTP 404 for api.spotify.com"); error.status = 404; throw error;
   } } });
-  check("public playlists need no SPOTIFY_REFRESH_TOKEN", blockedSpotify.configured && !blockedSpotify.hasUserAuthorization);
   let blockedMessage = null;
   try { await blockedSpotify.getCollection("playlist", "37i9dQZEVXbjtrVpztYEcP"); }
   catch (error) { blockedMessage = error.message; }

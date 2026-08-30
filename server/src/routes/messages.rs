@@ -40,6 +40,10 @@ pub struct HistoryMessage {
     pub attachments: Vec<MessageAttachment>,
     pub link_preview: Option<LinkPreview>,
     pub embeds: Vec<MessageEmbedDto>,
+    /// The music bot's status card (migration 0011); `None` for every
+    /// human-authored message. The client renders it instead of body text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub music_status: Option<serde_json::Value>,
 }
 
 #[derive(Clone, Serialize, sqlx::FromRow)]
@@ -110,6 +114,7 @@ struct HistoryRow {
     profile_tag: Option<String>,
     profile_badge_url: Option<String>,
     name_color: Option<String>,
+    music_status: Option<serde_json::Value>,
 }
 
 fn default_limit() -> i64 {
@@ -137,7 +142,7 @@ pub async fn history(
     let mut rows = match q.before {
         Some(before_id) => {
             sqlx::query_as::<_, HistoryRow>(
-                "SELECT m.id, m.channel_id, m.author_id, m.content, m.created_at, m.edited_at, \
+                "SELECT m.id, m.channel_id, m.author_id, m.content, m.created_at, m.edited_at, m.music_status, \
                         u.username, u.display_name, u.avatar_color, \
                         CASE WHEN u.avatar_storage_path IS NULL THEN NULL ELSE '/api/users/' || u.id::text || '/avatar' END AS avatar_url, u.profile_tag, \
                         CASE WHEN u.profile_badge_storage_path IS NULL THEN NULL ELSE '/api/users/' || u.id::text || '/profile-badge' END AS profile_badge_url, u.name_color \
@@ -154,7 +159,7 @@ pub async fn history(
         }
         None => {
             sqlx::query_as::<_, HistoryRow>(
-                "SELECT m.id, m.channel_id, m.author_id, m.content, m.created_at, m.edited_at, \
+                "SELECT m.id, m.channel_id, m.author_id, m.content, m.created_at, m.edited_at, m.music_status, \
                         u.username, u.display_name, u.avatar_color, \
                         CASE WHEN u.avatar_storage_path IS NULL THEN NULL ELSE '/api/users/' || u.id::text || '/avatar' END AS avatar_url, u.profile_tag, \
                         CASE WHEN u.profile_badge_storage_path IS NULL THEN NULL ELSE '/api/users/' || u.id::text || '/profile-badge' END AS profile_badge_url, u.name_color \
@@ -251,6 +256,7 @@ pub async fn history(
             attachments: attachments_by_message.remove(&row.id).unwrap_or_default(),
             link_preview: previews_by_message.get(&row.id).cloned(),
             embeds: embeds_by_message.remove(&row.id).unwrap_or_default(),
+            music_status: row.music_status,
     }).collect();
 
     Ok(Json(HistoryResponse { messages, has_more }))

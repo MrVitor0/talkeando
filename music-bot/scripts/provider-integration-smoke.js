@@ -3,13 +3,18 @@
 // YouTube is discovery-only now — the Data API turns a link/playlist into a
 // title + artist and playback comes from SoundCloud/Audius — so this no longer
 // touches cookies, a Proof-of-Origin sidecar, or a datacenter-IP bot check.
-// What it proves, all against live services, without printing any secret:
-//   * Spotify: a public user playlist expands to tracks (client_credentials,
-//     no SPOTIFY_REFRESH_TOKEN needed);
+//
+// It is deliberately lenient about individual tracks: a DRM-protected /
+// geo-blocked / preview-only result is skipped, not failed, and the audio
+// checks only need ONE playable result across every probe. A hard failure
+// therefore means a provider is actually broken (auth, search, or the whole
+// catalogue unreachable), which is worth blocking a deploy on.
+//   * Spotify: a public playlist expands to tracks (client_credentials, no
+//     SPOTIFY_REFRESH_TOKEN needed);
 //   * Spotify: an editorial "37i9…" playlist fails with the actionable message;
 //   * YouTube Data API: video + playlist metadata resolve;
-//   * SoundCloud: `yt-dlp` search returns entries and a real audio stream;
-//   * Audius: search returns tracks and the stream endpoint serves bytes.
+//   * SoundCloud: `yt-dlp` search works and at least one track streams;
+//   * Audius: search works and at least one track streams.
 const { spawn } = require("child_process");
 const { HttpClient } = require("../src/infrastructure/http-client");
 const { SpotifyClient } = require("../src/infrastructure/spotify-client");
@@ -19,13 +24,22 @@ const { AudiusClient } = require("../src/infrastructure/audius-client");
 const youtubeVideos = (process.env.SMOKE_YOUTUBE_VIDEOS || "7qw4iloZORQ,cBEEtp4AAAw").split(",").map(s => s.trim()).filter(Boolean);
 const youtubePlaylists = (process.env.SMOKE_YOUTUBE_PLAYLISTS || "PL1qZUeYbFlKjNqTu--CN5tm3a0NWo8nwf").split(",").map(s => s.trim()).filter(Boolean);
 const editorialPlaylistId = process.env.SMOKE_SPOTIFY_EDITORIAL || "37i9dQZEVXbjtrVpztYEcP";
-const audioProbe = ["Daft Punk Get Lucky", "Tame Impala The Less I Know The Better"];
+const audioProbe = (process.env.SMOKE_AUDIO_QUERIES
+  || "Odesza Say My Name,RÜFÜS DU SOL Innerbloom,ODESZA A Moment Apart,Bonobo Kerala,Flume Never Be Like You")
+  .split(",").map(s => s.trim()).filter(Boolean);
+
+// yt-dlp stderr fragments that mean "this particular track can't be streamed" —
+// try the next candidate rather than failing the provider.
+const SKIPPABLE = /\b(drm|not available|unavailable|geo|region|private|removed|deleted|requested format is not available|only available|sign in|login required|http error 4)\b/i;
 
 const failures = [];
+const warnings = [];
 const check = (name, condition, detail = "") => {
   if (condition) console.log(`PASS ${name}`);
   else { failures.push(name); console.error(`FAIL ${name}${detail ? `: ${detail}` : ""}`); }
 };
+const warn = (name, detail = "") => { warnings.push(name); console.warn(`WARN ${name}${detail ? `: ${detail}` : ""}`); };
+const lastLine = text => String(text || "").trim().split("\n").slice(-1)[0];
 
 // `stopAfterBytes` lets an `-o -` stream be proven live without downloading the
 // whole track: once that many bytes land on stdout the child is killed and the
@@ -50,8 +64,7 @@ function ytdlp(args, { timeoutMs = 60000, stopAfterBytes = 0 } = {}) {
 const scsearchArgs = ["--ignore-config", "--no-progress", "--no-call-home", "--no-playlist", "--socket-timeout", "20"];
 
 /// Follow redirects and pull at most `limit` bytes off the response body, then
-/// abort — enough to prove the endpoint actually serves audio without pulling
-/// the whole file.
+/// abort — enough to prove the endpoint actually serves audio.
 async function readFirstBytes(url, limit) {
   const controller = new AbortController();
   const response = await fetch(url, { redirect: "follow", signal: controller.signal });
@@ -65,22 +78,23 @@ async function readFirstBytes(url, limit) {
   return { ok: true, status: response.status, length };
 }
 
-async function resolveSpotifyPlaylistIds(spotify) {
+/// Candidate playlist ids for the "expands to tracks" check. Editorial "37i9…"
+/// playlists are API-blocked, and a fixed user playlist can be deleted, so
+/// search a few genres and hand back everything found — the caller tries each
+/// until one works.
+async function spotifyPlaylistCandidates(spotify) {
   const configured = (process.env.SMOKE_SPOTIFY_PLAYLIST_IDS || "").split(",").map(s => s.trim()).filter(Boolean);
   if (configured.length) return configured;
-  // No hardcoded ids: editorial "37i9…" playlists are API-blocked and a fixed
-  // user playlist can be deleted. Search for public, user-owned playlists so
-  // the smoke keeps working without maintenance.
-  const seen = new Set();
-  for (const query of ["top hits 2024", "rock classics", "lofi beats"]) {
-    let found = [];
-    try { found = await spotify.searchPlaylists(query, 20); } catch { continue; }
-    for (const playlist of found) {
-      if (playlist && playlist.id && playlist.owner && playlist.owner.id !== "spotify") seen.add(playlist.id);
-    }
-    if (seen.size >= 2) break;
+  const ids = new Set();
+  for (const query of ["indie", "house music", "hip hop", "workout", "study"]) {
+    try {
+      for (const playlist of await spotify.searchPlaylists(query, 20)) {
+        if (playlist && playlist.id) ids.add(playlist.id);
+      }
+    } catch (error) { warn(`Spotify playlist search "${query}"`, error.message); }
+    if (ids.size >= 12) break;
   }
-  return [...seen].slice(0, 2);
+  return [...ids];
 }
 
 async function main() {
@@ -90,18 +104,19 @@ async function main() {
   const spotify = new SpotifyClient({ http, clientId: process.env.SPOTIFY_CLIENT_ID, clientSecret: process.env.SPOTIFY_CLIENT_SECRET, refreshToken: process.env.SPOTIFY_REFRESH_TOKEN });
   check("Spotify app credentials configured", spotify.configured, "set SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET");
   if (spotify.configured) {
-    let playlistIds = [];
-    try { playlistIds = await resolveSpotifyPlaylistIds(spotify); }
-    catch (error) { check("Spotify playlist search", false, error.message); }
-    check("Spotify playlist search returned candidates", playlistIds.length > 0, "no public user playlists found");
-    for (const id of playlistIds) {
+    const candidates = await spotifyPlaylistCandidates(spotify);
+    check("Spotify playlist search returned candidates", candidates.length > 0, "no playlists in search results");
+    let expanded = 0;
+    let lastError = "";
+    for (const id of candidates) {
+      if (expanded >= 2) break;
       try {
         const result = await spotify.getCollection("playlist", id);
-        check(`Spotify public playlist ${id} expands to tracks`, result.tracks.length > 0, "returned no tracks");
-      } catch (error) {
-        check(`Spotify public playlist ${id} expands to tracks`, false, error.message);
-      }
+        if (result.tracks.length > 0) { expanded++; console.log(`  ok  playlist ${id} → ${result.tracks.length} tracks`); }
+      } catch (error) { lastError = error.message; }
     }
+    check("Spotify public playlist expands to tracks", expanded > 0, `tried ${candidates.length} playlists; last error: ${lastError}`);
+
     try {
       await spotify.getCollection("playlist", editorialPlaylistId);
       check("Editorial Spotify playlist is rejected with a clear message", false, "expected a rejection, got tracks");
@@ -114,44 +129,66 @@ async function main() {
   const youtube = new YouTubeClient({ http, apiKey: process.env.YOUTUBE_API_KEY, maxTracks: 50 });
   check("YouTube API key configured", Boolean(process.env.YOUTUBE_API_KEY));
   if (process.env.YOUTUBE_API_KEY) {
+    let videoOk = 0;
     for (const id of youtubeVideos) {
-      try { const intent = await youtube.video(id); check(`YouTube metadata ${id}`, Boolean(intent?.title && intent.durationMs), "missing title or duration"); }
-      catch (error) { check(`YouTube metadata ${id}`, false, error.message); }
+      try { const intent = await youtube.video(id); if (intent?.title && intent.durationMs) videoOk++; }
+      catch (error) { warn(`YouTube metadata ${id}`, error.message); }
     }
+    check("YouTube Data API resolves video metadata", videoOk > 0, `0/${youtubeVideos.length} videos resolved`);
+    let playlistOk = 0;
     for (const id of youtubePlaylists) {
-      try { const result = await youtube.playlist(id); check(`YouTube playlist ${id}`, result.intents.length > 0, "returned no playable videos"); }
-      catch (error) { check(`YouTube playlist ${id}`, false, error.message); }
+      try { const result = await youtube.playlist(id); if (result.intents.length > 0) playlistOk++; }
+      catch (error) { warn(`YouTube playlist ${id}`, error.message); }
     }
+    check("YouTube Data API expands a playlist", playlistOk > 0, `0/${youtubePlaylists.length} playlists expanded`);
   }
 
-  // ---- SoundCloud (playback) --------------------------------------------------
+  // ---- SoundCloud (playback) ---------------------------------------------------
+  let scSearchOk = 0;
+  let scStreamed = null;
   for (const query of audioProbe) {
-    const listing = await ytdlp([...scsearchArgs, "--skip-download", "--dump-single-json", `scsearch3:${query}`], { timeoutMs: 45000 });
+    if (scStreamed) break;
+    const listing = await ytdlp([...scsearchArgs, "--skip-download", "--dump-single-json", `scsearch5:${query}`], { timeoutMs: 45000 });
     let entries = [];
-    try { entries = JSON.parse(listing.stdout.toString() || "{}").entries || []; } catch { /* handled by the check */ }
-    check(`SoundCloud search "${query}"`, listing.code === 0 && entries.length > 0, listing.stderr.trim().split("\n").slice(-1)[0]);
-    const url = entries[0]?.webpage_url || entries[0]?.url;
-    if (!url) continue;
-    const stream = await ytdlp([...scsearchArgs, "-f", "bestaudio/best", "-o", "-", url], { timeoutMs: 60000, stopAfterBytes: 65536 });
-    check(`SoundCloud audio streams "${query}"`, stream.enough || stream.stdout.length > 32768, `${stream.stdout.length} bytes; ${stream.stderr.trim().split("\n").slice(-1)[0]}`);
+    try { entries = JSON.parse(listing.stdout.toString() || "{}").entries || []; } catch { /* handled below */ }
+    if (listing.code === 0 && entries.length > 0) scSearchOk++;
+    else { warn(`SoundCloud search "${query}"`, lastLine(listing.stderr)); continue; }
+    for (const entry of entries.slice(0, 4)) {
+      const url = entry?.webpage_url || entry?.url;
+      if (!url) continue;
+      const stream = await ytdlp([...scsearchArgs, "-f", "bestaudio/best", "-o", "-", url], { timeoutMs: 60000, stopAfterBytes: 65536 });
+      if (stream.enough || stream.stdout.length > 32768) { scStreamed = `${query} → ${url}`; break; }
+      if (SKIPPABLE.test(stream.stderr)) { warn(`SoundCloud skip "${entry.title || url}"`, lastLine(stream.stderr)); continue; }
+      warn(`SoundCloud stream "${entry.title || url}"`, `${stream.stdout.length} bytes; ${lastLine(stream.stderr)}`);
+    }
   }
+  check("SoundCloud search returns results", scSearchOk > 0, "every probe query failed");
+  check("SoundCloud streams at least one track", Boolean(scStreamed), "no probe track produced audio (all DRM / unavailable?)");
+  if (scStreamed) console.log(`  ok  streamed ${scStreamed}`);
 
   // ---- Audius (playback) ----------------------------------------------------
   const audius = new AudiusClient({ http, apiKey: process.env.AUDIUS_API_KEY || "" });
+  let auSearchOk = 0;
+  let auStreamed = null;
   for (const query of audioProbe) {
+    if (auStreamed) break;
     let tracks = [];
-    try { tracks = await audius.search(query, 5); } catch (error) { check(`Audius search "${query}"`, false, error.message); continue; }
-    check(`Audius search "${query}"`, tracks.length > 0, "no tracks");
-    const id = tracks[0]?.id;
-    if (!id) continue;
-    try {
-      const bytes = await readFirstBytes(audius.streamUrl(id), 65536);
-      check(`Audius audio streams "${query}"`, bytes.ok && bytes.length > 32768, `HTTP ${bytes.status}, ${bytes.length} bytes`);
-    } catch (error) {
-      check(`Audius audio streams "${query}"`, false, error.message);
+    try { tracks = await audius.search(query, 8); } catch (error) { warn(`Audius search "${query}"`, error.message); continue; }
+    if (tracks.length > 0) auSearchOk++; else continue;
+    for (const track of tracks.slice(0, 4)) {
+      if (!track?.id) continue;
+      try {
+        const bytes = await readFirstBytes(audius.streamUrl(track.id), 65536);
+        if (bytes.ok && bytes.length > 32768) { auStreamed = `${query} → ${track.title || track.id}`; break; }
+        warn(`Audius stream "${track.title || track.id}"`, `HTTP ${bytes.status}, ${bytes.length} bytes`);
+      } catch (error) { warn(`Audius stream "${track.title || track.id}"`, error.message); }
     }
   }
+  check("Audius search returns results", auSearchOk > 0, "every probe query failed");
+  check("Audius streams at least one track", Boolean(auStreamed), "no probe track produced audio");
+  if (auStreamed) console.log(`  ok  streamed ${auStreamed}`);
 
+  if (warnings.length) console.warn(`\n${warnings.length} warning(s) (skipped tracks / degraded results) — not fatal`);
   if (failures.length) console.error(`\n${failures.length} check(s) failed: ${failures.join(", ")}`);
   else console.log("\nall provider checks passed");
   process.exitCode = failures.length ? 1 : 0;

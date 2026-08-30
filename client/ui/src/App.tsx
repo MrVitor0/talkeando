@@ -285,11 +285,6 @@ function MusicStatusCard({ status, members }: { status: MusicStatus; members: Me
   );
 }
 
-function mergeMessages(...groups: Message[][]) {
-  const byId = new Map<string, Message>();
-  groups.flat().forEach(message => byId.set(message.id, message));
-  return [...byId.values()].sort((left, right) => Date.parse(left.created_at) - Date.parse(right.created_at));
-}
 
 // Renders rich Twitter / WhatsApp / Discord style link previews with 3D card layout
 function LinkPreviewCard({ preview }: { preview: NonNullable<Message["link_preview"]> }) {
@@ -1217,7 +1212,6 @@ export function App() {
   const [historyLoading, setHistoryLoading] = useState(false);
   const [skeletonRows, setSkeletonRows] = useState(8);
   const historyCacheRef = useRef<Record<string, Message[]>>({});
-  const musicAnnouncementsRef = useRef<Record<string, Message[]>>({});
   const messagesRef = useRef<Message[]>([]);
   // The scrollable message viewport — kept pinned to the newest message.
   const messagesScrollRef = useRef<HTMLDivElement>(null);
@@ -1377,32 +1371,12 @@ export function App() {
           if (streamId) { void rtc.stopMusic(voiceChannelId, streamId); musicStreamRef.current = null; setMyMusicStreamId(null); }
         }
       }
-      if (event.op === "music.announcement") {
-        const channelId: string = event.data.channel_id;
-        const status = event.data as MusicStatus & { status_id: string; channel_id: string };
-        const announcement: Message = {
-          id: status.status_id || crypto.randomUUID(),
-          content: "",
-          created_at: new Date().toISOString(),
-          author_id: MUSIC_BOT_ID,
-          author: { display_name: "Tupi Música", profile_tag: "BOT" },
-          music_status: status,
-        };
-        const channelAnnouncements = mergeMessages(musicAnnouncementsRef.current[channelId] ?? [], [announcement]);
-        musicAnnouncementsRef.current[channelId] = channelAnnouncements;
-        historyCacheRef.current[channelId] = mergeMessages(historyCacheRef.current[channelId] ?? [], [announcement]);
-        if (channelId === activeChannel?.id) {
-          setMessages(current => mergeMessages(current, [announcement]));
-        } else {
-          setUnread(current => current[channelId] ? current : { ...current, [channelId]: true });
-        }
-      }
+      // The music bot's status cards now arrive as ordinary persisted messages
+      // (`chat.message.created` with a `music_status` payload) and load with
+      // channel history — no separate transient `music.announcement` path.
       if (event.op === "chat.history") {
         const historyChannelId: string | undefined = event.data.channel_id ?? event.data.messages?.[0]?.channel_id;
-        const persistedMessages: Message[] = event.data.messages ?? [];
-        const historyMessages = historyChannelId
-          ? mergeMessages(persistedMessages, musicAnnouncementsRef.current[historyChannelId] ?? [])
-          : persistedMessages;
+        const historyMessages: Message[] = event.data.messages ?? [];
         if (historyChannelId) {
           historyCacheRef.current[historyChannelId] = historyMessages;
           writeSkeletonRows(historyChannelId, historyMessages.length);
@@ -1442,7 +1416,8 @@ export function App() {
       if (event.op === "chat.message.created") {
         const created = event.data.message;
         const createdChannelId: string | undefined = created?.channel_id;
-        const fromSomeoneElse = !!created?.author_id && created.author_id !== selfIdRef.current;
+        const isMusicBot = created?.author_id === MUSIC_BOT_ID;
+        const fromSomeoneElse = !!created?.author_id && created.author_id !== selfIdRef.current && !isMusicBot;
         const lookingAtIt = createdChannelId === activeChannel?.id;
         const isMention = fromSomeoneElse && isUserMentioned(created?.content, selfIdRef.current, currentUserRef.current);
         // If received a message from someone else, auto-add them to active DM list if it's a DM channel
@@ -1461,6 +1436,10 @@ export function App() {
             if (myStatusRef.current !== "busy") playSound("notification");
             if (createdChannelId) setUnread(current => current[createdChannelId] ? current : { ...current, [createdChannelId]: true });
           }
+        } else if (isMusicBot && !lookingAtIt && createdChannelId) {
+          // The Tupi Música bot's status cards mark the channel unread but
+          // never chime — they can arrive several per song.
+          setUnread(current => current[createdChannelId] ? current : { ...current, [createdChannelId]: true });
         }
       }
       if (event.op === "chat.message.created" && event.data.message?.channel_id === activeChannel?.id) {
@@ -3447,11 +3426,14 @@ export function App() {
                   previous.author_id !== authorId ||
                   (message.author?.display_name ?? "") !== (previous.author?.display_name ?? "") ||
                   new Date(message.created_at).getTime() - new Date(previous.created_at).getTime() > 5 * 60 * 1000;
-                const displayName = message.author?.display_name ?? memberName(authorId);
+                const isMusicBot = authorId === MUSIC_BOT_ID;
+                const displayName = message.author?.display_name ?? (isMusicBot ? "Tupi Música" : memberName(authorId));
+                const authorTag = message.author?.profile_tag ?? (isMusicBot ? "BOT" : null);
                 const isOwn = authorId != null && authorId === currentUserId;
                 const authorMember = members.find(m => m.id === authorId);
                 const isOwner = authorMember?.role === "owner";
-                const nameColor = authorMember?.name_color
+                const nameColor = isMusicBot ? "#5865f2"
+                  : authorMember?.name_color
                   || (isOwner ? "#f0b232" : `hsl(${hueFromString(displayName)} 62% 72%)`);
                 const time = new Date(message.created_at).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
                 const mentionsMe = isUserMentioned(message.content, currentUserId, currentUser);
@@ -3474,10 +3456,10 @@ export function App() {
                         title={`Ver perfil de ${displayName}`}
                       >
                         {displayName}
-                        {message.author?.profile_tag && (
+                        {authorTag && (
                           <small className="msg__tag">
-                            {message.author.profile_badge_url && <img src={message.author.profile_badge_url} alt="" />}
-                            {message.author.profile_tag}
+                            {message.author?.profile_badge_url && <img src={message.author.profile_badge_url} alt="" />}
+                            {authorTag}
                           </small>
                         )}
                       </span>
