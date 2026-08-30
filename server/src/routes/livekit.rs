@@ -2,7 +2,7 @@ use axum::{extract::{State, Json}, http::{header, HeaderMap}, Json as AxumJson};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{auth::{authenticate_token, AuthUser}, db, error::{AppError, AppResult}, livekit::{self, Mode}, state::AppState, ws::protocol::OutboundEnvelope};
+use crate::{auth::authenticate_token, db, error::{AppError, AppResult}, livekit::{self, Mode}, state::AppState, ws::{handler::broadcast_voice_roster, protocol::OutboundEnvelope}};
 
 const MUSIC_BOT_ID: Uuid = Uuid::from_u128(1);
 
