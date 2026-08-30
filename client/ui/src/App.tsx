@@ -2289,7 +2289,7 @@ export function App() {
     if (!call) return;
     const streamId = crypto.randomUUID();
     try {
-      await rtc.startCamera(call.channelId, streamId, deviceId ?? cameraDeviceId);
+      await rtc.startCamera(call.channelId, streamId, deviceId ?? cameraDeviceId ?? undefined);
       setMyCameraStreamId(streamId);
       playSound("startScreen");
       // Permission is granted now — re-list so the menu shows real labels.
