@@ -11,6 +11,7 @@ type DeviceLists = { audioInputs: MediaDeviceInfo[]; audioOutputs: MediaDeviceIn
 let active: Room | null = null;
 let connecting: Room | null = null;
 let connectAttempt = 0;
+let controlPlaneSubscription: (() => void) | null = null;
 // The voice channel the server currently lists us in. Mirrors `active`, but
 // outlives a `RoomEvent.Disconnected` long enough to send the matching
 // `voice.presence.leave` — the server roster is driven by these signals, not
@@ -190,7 +191,35 @@ function reportTrack(published: boolean, source: string, trackSid?: string) {
   });
 }
 
-export function init(_: string) {}
+// LiveKit media and the application WebSocket recover independently.  A brief
+// loss of the latter must not make an otherwise healthy LiveKit participant
+// disappear from the sidebar forever: the server deliberately evicts voice
+// presence after its reconnect grace window.  Re-announce the call (and any
+// already-published visual tracks) once the control plane comes back.
+function restoreControlPlanePresence() {
+  const room = active;
+  const channelId = presentChannelId;
+  if (!room || !channelId) return;
+
+  send("voice.presence.enter", { channel_id: channelId });
+  for (const publication of room.localParticipant.trackPublications.values()) {
+    if (!publication.track) continue;
+    if (publication.source === Track.Source.Camera) reportTrack(true, "camera", publication.trackSid);
+    if (publication.source === Track.Source.ScreenShare) reportTrack(true, "screen_share", publication.trackSid);
+    if (publication.source === Track.Source.ScreenShareAudio) reportTrack(true, "screen_share_audio", publication.trackSid);
+  }
+}
+
+export function init(_: string) {
+  // app.bootstrap may be delivered again after login/reload. Keep exactly one
+  // observer so a reconnect does not multiply presence notifications.
+  if (controlPlaneSubscription) return;
+  controlPlaneSubscription = subscribe(event => {
+    if (event.op === "connection.state" && event.data?.state === "connected") {
+      restoreControlPlanePresence();
+    }
+  });
+}
 export async function joinCall(id: string, isMuted: boolean, _: boolean) {
   const attempt = ++connectAttempt;
   const previous = active ?? connecting;
