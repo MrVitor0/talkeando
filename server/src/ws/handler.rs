@@ -582,9 +582,13 @@ async fn dispatch(
         }
         "voice.presence.leave" => {
             let data: VoicePresence = parse_or_reject!(VoicePresence);
-            if joined_calls.remove(&data.channel_id) {
-                evict_voice_participant(state, data.channel_id, user_id).await;
-            }
+            // `joined_calls` belongs to one WebSocket connection. A brief WS
+            // reconnect can therefore leave it empty even though the LiveKit
+            // room (and the sidebar registry) still contains this user. A
+            // leave is always safe to apply to the caller itself, so do not
+            // make roster cleanup conditional on that per-connection cache.
+            joined_calls.remove(&data.channel_id);
+            evict_voice_participant(state, data.channel_id, user_id).await;
         }
         "voice.track.published" => {
             let data: VoiceTrack = parse_or_reject!(VoiceTrack);

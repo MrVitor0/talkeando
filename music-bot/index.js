@@ -720,6 +720,10 @@ async function onEvent(op, data) {
           paused = true;
           current.pausedStartedAt = Date.now();
           idleSince = Date.now();
+          // The audio feeder is paused, so the presence stream must disappear
+          // as well. Otherwise the sidebar keeps showing "TOCANDO" while the
+          // bot is silent.
+          unpublishCurrent();
           lastStatusChannelId = data.channel_id || lastStatusChannelId;
           statusReporter.report(data.channel_id, "paused", statusDetails(current.meta));
         }
@@ -729,6 +733,7 @@ async function onEvent(op, data) {
           current.pausedStartedAt = 0;
           paused = false;
           idleSince = 0;
+          publishTrack(current.title);
           lastStatusChannelId = data.channel_id || lastStatusChannelId;
           statusReporter.report(data.channel_id, "resumed", statusDetails(current.meta));
         }
