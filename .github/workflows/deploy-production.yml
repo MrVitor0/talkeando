@@ -225,6 +225,12 @@ jobs:
           GHCR_USERNAME: ${{ github.actor }}
           GHCR_TOKEN: ${{ github.token }}
         run: |
+          # Copy/paste from some Windows editors can prefix a secret with an
+          # UTF-8 BOM. In a URL it becomes `%EF%BB%BF`, producing a hostname
+          # that looks correct in logs but cannot receive LiveKit webhooks.
+          bom=$'\ufeff'
+          API_DOMAIN="${API_DOMAIN#"$bom"}"
+          SFU_DOMAIN="${SFU_DOMAIN#"$bom"}"
           test -n "$LIVEKIT_API_KEY" && test -n "$LIVEKIT_API_SECRET" && test -n "$LIVEKIT_URL" && test -n "$SFU_DOMAIN" && test -n "$TUPI_SERVER_IMAGE" && test -n "$MUSIC_BOT_IMAGE"
           export LIVEKIT_API_KEY LIVEKIT_API_SECRET API_DOMAIN
           envsubst < infra/livekit/livekit.yaml.tmpl | ssh -i ~/.ssh/talkeando-production "ubuntu@$DEPLOY_HOST" 'set -eu; install -d -m 755 /opt/talkeando/infra/livekit; umask 077; cat > /opt/talkeando/infra/livekit/livekit.yaml'
