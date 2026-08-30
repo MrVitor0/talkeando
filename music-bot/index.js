@@ -639,7 +639,16 @@ function sourceFromQuery(query) {
 }
 
 async function join(channelId) {
-  if (voiceChannel === channelId) return;
+  if (voiceChannel === channelId) {
+    // We think we're already here — but a WS reconnect or a server restart can
+    // drop us from the server's call registry while `voiceChannel` still points
+    // at this channel, so `call.peer_joined` for anyone who joined since never
+    // reached us and they hear nothing. Re-announcing is a server-side upsert:
+    // it hands back a fresh `call.snapshot` that the handler reconciles against.
+    send("call.join", { channel_id: channelId, muted: true, deafened: false });
+    startFeeder();
+    return;
+  }
   if (voiceChannel) send("call.leave", { channel_id: voiceChannel });
   for (const pc of peers.values()) pc.close(); peers.clear();
   voiceChannel = channelId;
@@ -663,8 +672,23 @@ async function onEvent(op, data) {
   if (op === "call.snapshot") {
     voiceChannel = data.channel_id;
     startFeeder();
-    for (const participant of data.participants || []) if (participant.user_id !== BOT_ID && !participant.is_bot) await offer(participant.user_id);
-  } else if (op === "call.peer_joined" && data.participant?.user_id !== BOT_ID && !data.participant?.is_bot) await offer(data.participant.user_id);
+    // Reconcile against the authoritative roster: drop peers who left, and
+    // (re)offer to everyone we have no healthy connection to. One bad offer
+    // must not stop the rest — that used to leave later participants silent.
+    const present = new Set((data.participants || []).filter(p => !p.is_bot && p.user_id !== BOT_ID).map(p => p.user_id));
+    for (const uid of [...peers.keys()]) {
+      if (!present.has(uid)) { peers.get(uid)?.close(); peers.delete(uid); }
+    }
+    for (const uid of present) {
+      const pc = peers.get(uid);
+      if (pc && !["failed", "closed", "disconnected"].includes(pc.connectionState)) continue;
+      if (pc) { pc.close(); peers.delete(uid); }
+      try { await offer(uid); } catch (error) { log(`offer to ${uid} failed: ${error.message}`); }
+    }
+  } else if (op === "call.peer_joined" && data.participant?.user_id !== BOT_ID && !data.participant?.is_bot) {
+    try { await offer(data.participant.user_id); }
+    catch (error) { log(`offer to ${data.participant.user_id} failed: ${error.message}`); }
+  }
   else if (op === "call.peer_left") { peers.get(data.user_id)?.close(); peers.delete(data.user_id); }
   else if (op === "rtc.offer") { const pc = await peer(data.from); await pc.setRemoteDescription({ type: "offer", sdp: data.sdp }); const answer = await pc.createAnswer(); await pc.setLocalDescription(answer); send("rtc.answer", { channel_id: voiceChannel, to: data.from, sdp: answer.sdp }); }
   else if (op === "rtc.answer") { const pc = peers.get(data.from); if (pc) await pc.setRemoteDescription({ type: "answer", sdp: data.sdp }); }
@@ -756,7 +780,13 @@ function connect() {
   ws.on("message", raw => {
     try {
       const e = JSON.parse(raw);
-      if (e.op === "auth.ok") log("authenticated as the music bot");
+      if (e.op === "auth.ok") {
+        log("authenticated as the music bot");
+        // A reconnect (or server restart) drops us from the call registry
+        // silently. If we still believe we're in a voice channel, re-announce
+        // so new/rejoined listeners get an offer instead of silence.
+        if (voiceChannel) { log(`re-announcing presence in ${voiceChannel} after (re)connect`); void join(voiceChannel); }
+      }
       if (e.op === "auth.rejected") log(`AUTH REJECTED: ${JSON.stringify(e.data)} — check MUSIC_BOT_TOKEN matches the server`);
       if (e.op === "error") log(`server error: ${JSON.stringify(e.data)}`);
       void onEvent(e.op, e.data || {});

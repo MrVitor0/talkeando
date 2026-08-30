@@ -160,6 +160,17 @@ async function main() {
   check("stream label is the resolved title", publish?.data.label === "Song A", `got ${JSON.stringify(publish?.data.label)}`);
   check("joined the voice channel", sent.some(m => m.op === "call.join" && m.data.channel_id === "chan-1"));
   check("playing status waits for PCM and targets the invoking channel", sent.some(m => m.op === "music.status" && m.data.kind === "playing" && m.data.channel_id === "text-1" && m.data.title === "Song A"));
+
+  // Reconnect / server-restart desync: a fresh auth.ok while we still believe
+  // we're in a call must re-announce, and the reconciled snapshot must offer
+  // music to a listener we have no connection to (otherwise they hear silence).
+  const afterFirstPlay = sent.length;
+  deliver("auth.ok", {});
+  await sleep(30);
+  check("re-announces call membership after a reconnect", sent.slice(afterFirstPlay).some(m => m.op === "call.join" && m.data.channel_id === "chan-1"));
+  deliver("call.snapshot", { channel_id: "chan-1", participants: [{ user_id: "listener-9" }] });
+  await sleep(30);
+  check("offers music to a listener from the reconciled snapshot", sent.slice(afterFirstPlay).some(m => m.op === "rtc.offer" && m.data.to === "listener-9"));
   check("YouTube status carries the provider brand", sent.some(m => m.op === "music.status" && m.data.kind === "playing" && m.data.origin === "youtube"));
 
   // Queue a second track while the first plays: it must not restart playback.
@@ -320,17 +331,39 @@ async function sourceResolutionChecks() {
   const spotifyRichRequest = await spotifyRich.resolve("https://open.spotify.com/playlist/playlist123");
   check("Spotify preserves collection and album artwork", spotifyRichRequest.collection.title === "Playlist A" && spotifyRichRequest.intents[0].imageUrl === "https://img.test/album-a.jpg");
 
-  // A playlist that 404s (private / editorial "37i9…") yields an actionable
-  // message — and it does so with only client_credentials, no refresh token.
+  // When the Web API refuses a playlist (public user playlists 403/404 now,
+  // editorial "37i9…" always), the public embed page still resolves it.
   const { SpotifyClient } = require("./src/infrastructure/spotify-client");
-  const blockedSpotify = new SpotifyClient({ clientId: "id", clientSecret: "secret", http: { async json(url) {
+  const apiThrows404 = async url => {
     if (url.includes("accounts.spotify.com/api/token")) return { access_token: "t", expires_in: 3600 };
     const error = new Error("HTTP 404 for api.spotify.com"); error.status = 404; throw error;
-  } } });
-  let blockedMessage = null;
-  try { await blockedSpotify.getCollection("playlist", "37i9dQZEVXbjtrVpztYEcP"); }
-  catch (error) { blockedMessage = error.message; }
-  check("editorial/private Spotify playlist yields an actionable message", /privada ou n[aã]o pode ser usada/i.test(blockedMessage || ""), blockedMessage);
+  };
+  const embedEntity = {
+    type: "playlist", name: "A Voz do Brasil", subtitle: "Vitor Hugo",
+    coverArt: { sources: [{ url: "https://img.test/small.jpg" }, { url: "https://img.test/cover.jpg" }] },
+    trackList: [
+      { uri: "spotify:track:aaaaaaaaaaaaaaaaaaaaaa", title: "Apesar De Você", subtitle: "Clara Nunes", duration: 224000 },
+      { uri: "spotify:track:bbbbbbbbbbbbbbbbbbbbbb", title: "Azul", subtitle: "Gal Costa", duration: 224000 },
+    ],
+  };
+  const embedNext = JSON.stringify({ props: { pageProps: { state: { data: { entity: embedEntity } } } } });
+  const embedHtml = `<html><body><script id="__NEXT_DATA__" type="application/json">${embedNext}</script></body></html>`;
+  const embedSpotify = new SpotifyClient({ clientId: "id", clientSecret: "secret", http: { json: apiThrows404, async text() { return embedHtml; } } });
+  const embedResult = await embedSpotify.getCollection("playlist", "72uTpSoHV28ujv7m7NsDZ6");
+  check("a playlist the Web API blocks still resolves via the public embed",
+    embedResult.tracks.length === 2
+    && embedResult.tracks[0].name === "Apesar De Você"
+    && embedResult.tracks[0].artists[0].name === "Clara Nunes"
+    && embedResult.tracks[0].duration_ms === 224000
+    && embedResult.tracks[0].external_urls.spotify === "https://open.spotify.com/track/aaaaaaaaaaaaaaaaaaaaaa"
+    && embedResult.collection.title === "A Voz do Brasil"
+    && embedResult.collection.imageUrl === "https://img.test/cover.jpg",
+    JSON.stringify(embedResult.collection));
+
+  const deadSpotify = new SpotifyClient({ clientId: "id", clientSecret: "secret", http: { json: apiThrows404, async text() { return "<html></html>"; } } });
+  let deadMessage = null;
+  try { await deadSpotify.getCollection("playlist", "private123"); } catch (error) { deadMessage = error.message; }
+  check("a playlist neither the API nor the embed can read yields an actionable message", /p[uú]blica/i.test(deadMessage || ""), deadMessage);
 
   const youtube = new YouTubeIntentResolver({ client: { apiKey: "", async oEmbed() { throw new Error("offline"); } } });
   const degraded = await youtube.resolve("https://www.youtube.com/playlist?list=PL123");

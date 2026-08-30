@@ -46,6 +46,19 @@ const peerAudioMuted = new Map<string, boolean>();
 // own `.volume` clamps at 1 and can't boost a too-quiet talker.
 const PEER_VOLUME_STORAGE_KEY = "tk.peerVolumes";
 const peerVolume = new Map<string, number>(Object.entries(readStoredPeerVolumes()));
+
+// A screen share's audio is a SEPARATE track from the sharer's microphone —
+// muting/attenuating "the live" must never touch their voice. So screen-share
+// (and music) audio gets its own <audio> sink per owner, with its own
+// mute/volume, instead of being folded into that peer's mic element above.
+const SCREEN_VOLUME_STORAGE_KEY = "tk.screenVolumes";
+const screenAudioStreams = new Map<string, MediaStream>();      // owner -> screen-audio stream
+const screenAudioEls = new Map<string, HTMLAudioElement>();     // owner -> its <audio> sink
+const screenAudioMuted = new Map<string, boolean>();
+const screenAudioVolume = new Map<string, number>(Object.entries(readStoredScreenVolumes()));
+// Published stream metadata (stream_id -> {msid,owner,kind}) so `ontrack` can
+// tell a screen/music audio track apart from a mic track by its stream id.
+const remoteStreamMeta = new Map<string, { msid: string | null; owner: string; kind: string }>();
 let remoteAudioCtx: AudioContext | null = null;
 const pendingTurnRequests = new Map<string, (creds: TurnCredentials) => void>();
 const remoteVideoListeners = new Set<RemoteStreamListener>();
@@ -202,6 +215,18 @@ async function createPeer(peerUserId: string): Promise<RTCPeerConnection> {
   pc.ontrack = event => {
     console.log(`[rtc] ontrack from ${peerUserId}: kind=${event.track.kind} streams=${event.streams.length} readyState=${event.track.readyState}`);
     if (event.track.kind === "audio") {
+      // Screen-share / music audio rides its own MediaStream (msid matches a
+      // published screen|music row) — route it to a dedicated sink so its
+      // mute/volume are independent of the sharer's microphone.
+      const trackMsid = event.streams[0]?.id;
+      const streamMeta = trackMsid
+        ? [...remoteStreamMeta.values()].find(m => m.msid === trackMsid && (m.kind === "screen" || m.kind === "music"))
+        : undefined;
+      if (streamMeta) {
+        attachScreenAudio(streamMeta.owner, event.track);
+        event.track.onended = () => { detachScreenAudioTrack(streamMeta.owner, event.track); };
+        return;
+      }
       let audioStream = remoteAudioStreams.get(peerUserId);
       if (!audioStream) { audioStream = new MediaStream(); remoteAudioStreams.set(peerUserId, audioStream); }
       audioStream.addTrack(event.track);
@@ -421,8 +446,10 @@ function closePeer(peerUserId: string) {
   if (timer) { clearTimeout(timer); iceRestartTimers.delete(peerUserId); }
   const audioEl = remoteAudioEls.get(peerUserId);
   if (audioEl) { audioEl.srcObject = null; audioEl.remove(); remoteAudioEls.delete(peerUserId); }
-  // Keep peerVolume[peerUserId] so a rejoin restores the level the user set.
+  // Keep peerVolume[peerUserId] / screenAudioVolume so a rejoin restores the
+  // levels the user set.
   remoteAudioStreams.delete(peerUserId);
+  teardownScreenAudio(peerUserId);
   emitRemoteStream(peerUserId, null);
 }
 
@@ -500,6 +527,9 @@ function handleEnvelope(event: Envelope) {
     }
     case "call.snapshot": {
       if (data.channel_id) currentChannelId = data.channel_id;
+      for (const s of data.streams ?? []) {
+        remoteStreamMeta.set(s.stream_id, { msid: s.msid ?? null, owner: s.owner, kind: s.kind });
+      }
       if (!selfUserId) break;
       for (const participant of data.participants ?? []) {
         const peerUserId: string = participant.user_id;
@@ -536,17 +566,31 @@ function handleEnvelope(event: Envelope) {
       console.log(`[rtc] stream.unsubscribed from ${data.subscriber}`);
       void setScreenSubscription(data.subscriber, false);
       break;
-    case "stream.unpublished":
+    case "stream.published":
+      remoteStreamMeta.set(data.stream_id, { msid: data.msid ?? null, owner: data.owner, kind: data.kind });
+      break;
+    case "stream.unpublished": {
       // Nothing more will ever arrive for this stream — if we were watching
       // its owner, tear down the rendered video (owner already stopped
-      // sending, but the element would otherwise show a frozen last frame).
-      emitRemoteStream(data.owner ?? "", null);
+      // sending, but the element would otherwise show a frozen last frame)
+      // and its separate screen-audio sink.
+      const meta = remoteStreamMeta.get(data.stream_id);
+      remoteStreamMeta.delete(data.stream_id);
+      const owner = data.owner ?? meta?.owner ?? "";
+      if (owner) teardownScreenAudio(owner);
+      emitRemoteStream(owner, null);
       break;
+    }
   }
 }
 
 async function setScreenSubscription(peerUserId: string, subscribed: boolean) {
+  const wasSubscribed = screenSubscribers.has(peerUserId);
   if (subscribed) screenSubscribers.add(peerUserId); else screenSubscribers.delete(peerUserId);
+  // Re-subscribe while we still think we're sending (viewer's receiver died,
+  // or they toggled watch off→on): force a fresh offer so `applyScreenSend`
+  // can't short-circuit on "already sending" and leave them with no track.
+  if (subscribed && wasSubscribed) screenNeedsOffer.add(peerUserId);
   // A spectator (subscribed but never joined the call) has no peer connection
   // yet — the stream owner has to initiate one, ignoring the usual
   // lower-id-offers rule since the spectator will never offer.
@@ -628,8 +672,18 @@ function applyScreenSend(peerUserId: string, sending: boolean) {
     }
 
     if (!screenNeedsOffer.has(peerUserId)) return;
-    // Can't renegotiate mid-flight — retried from handleIncomingOffer/Answer.
-    if (!currentChannelId || pc.signalingState !== "stable") return;
+    // Can't renegotiate mid-flight — normally retried from handleIncomingOffer/
+    // Answer, but a re-subscribe after an unsubscribe can leave nothing to
+    // trigger that flush and the viewer never gets a track. Poll back until
+    // stable so "click Assistir again" reliably re-attaches the share.
+    if (!currentChannelId || pc.signalingState !== "stable") {
+      setTimeout(() => {
+        if (screenNeedsOffer.has(peerUserId) && peers.get(peerUserId) === pc) {
+          void applyScreenSend(peerUserId, screenSubscribers.has(peerUserId) && localScreenStream !== null);
+        }
+      }, 600);
+      return;
+    }
     screenNeedsOffer.delete(peerUserId);
     const offer = await pc.createOffer();
     await pc.setLocalDescription(offer);
@@ -722,6 +776,9 @@ export async function leaveCall() {
   screenSubscribers.clear();
   spectatedStreams.clear();
   spectatorPeers.clear();
+  remoteStreamMeta.clear();
+  for (const owner of [...screenAudioEls.keys()]) teardownScreenAudio(owner);
+  screenAudioMuted.clear();
   if (localStream) { for (const track of localStream.getTracks()) track.stop(); localStream = null; }
   if (rawMic) { for (const track of rawMic.getTracks()) track.stop(); rawMic = null; }
   void noiseSuppression.teardown();
@@ -789,6 +846,7 @@ export function setLocalAudioState(muted: boolean, deafened: boolean) {
 
 function applyRemoteMuting() {
   for (const peerUserId of remoteAudioEls.keys()) applyPeerAudioOutput(peerUserId);
+  for (const owner of screenAudioEls.keys()) applyScreenAudioOutput(owner);
 }
 
 /// Local-only mute of a single participant's audio ("Silenciar" on a tile).
@@ -833,6 +891,84 @@ function applyPeerAudioOutput(peerUserId: string) {
 }
 
 function wirePeerAudioGraph(peerUserId: string) { applyPeerAudioOutput(peerUserId); }
+
+// ---- screen-share / music audio (separate from the sharer's mic) ----------
+
+function attachScreenAudio(owner: string, track: MediaStreamTrack) {
+  let stream = screenAudioStreams.get(owner);
+  if (!stream) { stream = new MediaStream(); screenAudioStreams.set(owner, stream); }
+  if (!stream.getTracks().includes(track)) stream.addTrack(track);
+  let el = screenAudioEls.get(owner);
+  if (!el) {
+    el = document.createElement("audio");
+    el.autoplay = true;
+    el.style.display = "none";
+    document.body.appendChild(el);
+    if (audioOutputDeviceId && "setSinkId" in el) {
+      try { (el as HTMLAudioElement & { setSinkId(id: string): Promise<void> }).setSinkId(audioOutputDeviceId); } catch { /* unsupported */ }
+    }
+    screenAudioEls.set(owner, el);
+  }
+  applyScreenAudioOutput(owner);
+}
+
+function detachScreenAudioTrack(owner: string, track: MediaStreamTrack) {
+  const stream = screenAudioStreams.get(owner);
+  if (stream) { try { stream.removeTrack(track); } catch { /* already gone */ } }
+  applyScreenAudioOutput(owner);
+}
+
+function teardownScreenAudio(owner: string) {
+  const el = screenAudioEls.get(owner);
+  if (el) { el.srcObject = null; el.remove(); screenAudioEls.delete(owner); }
+  screenAudioStreams.delete(owner);
+}
+
+function applyScreenAudioOutput(owner: string) {
+  const el = screenAudioEls.get(owner);
+  const stream = screenAudioStreams.get(owner);
+  if (!el || !stream || stream.getAudioTracks().length === 0) return;
+  const isMuted = !joinedCall || localDeafened || (screenAudioMuted.get(owner) ?? false);
+  const volume = clampUnit((screenAudioVolume.get(owner) ?? 1) * outputVolume);
+  el.srcObject = stream;
+  void el.play().catch(error => console.error("[rtc] screen audio play() failed", error));
+  el.muted = isMuted;
+  el.volume = isMuted ? 0 : volume;
+}
+
+/// Local-only mute of one screen share's audio ("Silenciar tela") — leaves the
+/// sharer's voice untouched.
+export function setScreenAudioMuted(owner: string, isMuted: boolean) {
+  screenAudioMuted.set(owner, isMuted);
+  applyScreenAudioOutput(owner);
+}
+export function getScreenAudioMuted(owner: string): boolean {
+  return screenAudioMuted.get(owner) ?? false;
+}
+/// Local-only playback volume for one screen share's audio (0..1).
+export function setScreenAudioVolume(owner: string, volume: number) {
+  screenAudioVolume.set(owner, clampUnit(volume));
+  persistScreenVolumes();
+  applyScreenAudioOutput(owner);
+}
+export function getScreenAudioVolume(owner: string): number {
+  return screenAudioVolume.get(owner) ?? 1;
+}
+export function getScreenAudioVolumes(): Record<string, number> {
+  return Object.fromEntries(screenAudioVolume);
+}
+function readStoredScreenVolumes(): Record<string, number> {
+  try {
+    const value = JSON.parse(localStorage.getItem(SCREEN_VOLUME_STORAGE_KEY) || "{}");
+    if (!value || typeof value !== "object") return {};
+    return Object.fromEntries(Object.entries(value)
+      .filter(([owner, volume]) => Boolean(owner) && typeof volume === "number")
+      .map(([owner, volume]) => [owner, clampUnit(volume as number)]));
+  } catch { return {}; }
+}
+function persistScreenVolumes() {
+  try { localStorage.setItem(SCREEN_VOLUME_STORAGE_KEY, JSON.stringify(Object.fromEntries(screenAudioVolume))); } catch { /* private mode */ }
+}
 
 /// Local-only playback volume for one participant. 1 = default, 0 = silent,
 /// 2 = +100% boost. Nothing leaves this client.
@@ -1015,6 +1151,7 @@ export function watchStream(channelId: string, streamId: string, ownerUserId: st
 export function stopWatchingStream(channelId: string, streamId: string, ownerUserId: string) {
   console.log(`[rtc] stopWatchingStream: unsubscribing from ${ownerUserId}'s stream ${streamId}`);
   send("stream.unsubscribe", { channel_id: channelId, stream_id: streamId, owner_user_id: ownerUserId });
+  teardownScreenAudio(ownerUserId);
   emitRemoteStream(ownerUserId, null);
 }
 
@@ -1251,6 +1388,7 @@ export function setOutputVolumeLevel(volume: number) {
   outputVolume = clampUnit(volume);
   try { localStorage.setItem("tk.outputVolume", outputVolume.toString()); } catch {}
   for (const peerUserId of remoteAudioEls.keys()) applyPeerAudioOutput(peerUserId);
+  for (const owner of screenAudioEls.keys()) applyScreenAudioOutput(owner);
 }
 
 function clampUnit(value: number): number {

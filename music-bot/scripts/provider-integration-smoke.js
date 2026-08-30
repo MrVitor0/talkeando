@@ -20,8 +20,10 @@ const { YouTubeClient } = require("../src/infrastructure/youtube-client");
 const { AudiusClient } = require("../src/infrastructure/audius-client");
 
 const stableTrackId = process.env.SMOKE_SPOTIFY_TRACK || "4cOdK2wGLETKBW3PvgPWqT"; // Never Gonna Give You Up
-const editorialPlaylistId = process.env.SMOKE_SPOTIFY_EDITORIAL || "37i9dQZEVXbjtrVpztYEcP";
-const spotifyPlaylistIds = (process.env.SMOKE_SPOTIFY_PLAYLIST_IDS || "").split(",").map(s => s.trim()).filter(Boolean);
+// A user playlist ("A Voz do Brasil") and a Spotify editorial one ("Viva Latino").
+// Both resolve through the public embed even when the Web API refuses them.
+const spotifyPlaylistIds = (process.env.SMOKE_SPOTIFY_PLAYLIST_IDS
+  || "72uTpSoHV28ujv7m7NsDZ6,37i9dQZF1DX10zKzsJ2jva").split(",").map(s => s.trim()).filter(Boolean);
 const youtubeVideos = (process.env.SMOKE_YOUTUBE_VIDEOS || "7qw4iloZORQ,cBEEtp4AAAw").split(",").map(s => s.trim()).filter(Boolean);
 const youtubePlaylists = (process.env.SMOKE_YOUTUBE_PLAYLISTS || "PL1qZUeYbFlKjNqTu--CN5tm3a0NWo8nwf").split(",").map(s => s.trim()).filter(Boolean);
 const audioProbe = (process.env.SMOKE_AUDIO_QUERIES
@@ -75,33 +77,26 @@ async function main() {
   const http = new HttpClient({ timeoutMs: 30000 });
 
   // ---- Spotify (discovery) -----------------------------------------------------
-  // Spotify's /v1/search has become unreliable for app tokens ("Invalid limit",
-  // playlist type restrictions), so this proves the client works via a track
-  // read + the editorial-rejection path instead of hunting for a live playlist.
+  // The Web API refuses many playlists for app tokens now (public user
+  // playlists 403/404, editorial "37i9…" always). getCollection falls back to
+  // the public embed page, so any public playlist still resolves.
   const spotify = new SpotifyClient({ http, clientId: process.env.SPOTIFY_CLIENT_ID, clientSecret: process.env.SPOTIFY_CLIENT_SECRET, refreshToken: process.env.SPOTIFY_REFRESH_TOKEN });
   check("Spotify app credentials configured", spotify.configured, "set SPOTIFY_CLIENT_ID / SPOTIFY_CLIENT_SECRET");
   if (spotify.configured) {
     try {
       const track = await spotify.getTrack(stableTrackId);
-      check("Spotify reads a track with client_credentials", Boolean(track?.name && track.artists?.length), `got ${JSON.stringify(track?.name)}`);
-    } catch (error) { check("Spotify reads a track with client_credentials", false, error.message); }
+      check("Spotify reads a track (API or embed)", Boolean(track?.name && track.artists?.length), `got ${JSON.stringify(track?.name)}`);
+    } catch (error) { check("Spotify reads a track (API or embed)", false, error.message); }
 
-    try {
-      await spotify.getCollection("playlist", editorialPlaylistId);
-      check("Editorial Spotify playlist is rejected with a clear message", false, "expected a rejection, got tracks");
-    } catch (error) {
-      check("Editorial Spotify playlist is rejected with a clear message", /privada ou n[aã]o pode ser usada/i.test(error.message), error.message);
-    }
-
-    // Playlist expansion: only checkable against a real id. Fatal when one is
-    // pinned via SMOKE_SPOTIFY_PLAYLIST_IDS, otherwise just a heads-up.
+    let playlistsExpanded = 0;
     for (const id of spotifyPlaylistIds) {
       try {
         const result = await spotify.getCollection("playlist", id);
-        check(`Spotify playlist ${id} expands to tracks`, result.tracks.length > 0, "returned no tracks");
-      } catch (error) { check(`Spotify playlist ${id} expands to tracks`, false, error.message); }
+        if (result.tracks.length > 0) { playlistsExpanded++; console.log(`  ok  playlist ${id} → ${result.tracks.length} tracks ("${result.collection.title}")`); }
+        else warn(`Spotify playlist ${id}`, "resolved but empty");
+      } catch (error) { warn(`Spotify playlist ${id}`, error.message); }
     }
-    if (!spotifyPlaylistIds.length) warn("Spotify playlist expansion not verified", "set SMOKE_SPOTIFY_PLAYLIST_IDS to a public playlist id to make this a hard check");
+    check("Spotify playlists expand to tracks (via embed fallback)", playlistsExpanded > 0, `0/${spotifyPlaylistIds.length} expanded`);
   }
 
   // ---- YouTube Data API (discovery only, no yt-dlp) --------------------------

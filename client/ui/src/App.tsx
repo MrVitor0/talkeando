@@ -572,6 +572,11 @@ function VideoTile({
   onToggleFocus,
   isSelf = false,
   variant = "screen",
+  onStopWatch,
+  screenAudioMuted = false,
+  screenAudioVolume = 1,
+  onToggleScreenAudioMute,
+  onScreenAudioVolumeChange,
 }: {
   stream: MediaStream;
   name: string;
@@ -583,8 +588,19 @@ function VideoTile({
   onToggleFocus: () => void;
   isSelf?: boolean;
   variant?: "screen" | "camera";
+  // Screen variant only: stop viewing, and control the SHARE's audio (never
+  // the sharer's mic).
+  onStopWatch?: () => void;
+  screenAudioMuted?: boolean;
+  screenAudioVolume?: number;
+  onToggleScreenAudioMute?: () => void;
+  onScreenAudioVolumeChange?: (volume: number) => void;
 }) {
   const isCamera = variant === "camera";
+  // On a screen tile the mute/volume act on the share's audio; on a camera
+  // tile they act on the person (same as their avatar tile).
+  const audioMuted = isCamera ? peerMuted : screenAudioMuted;
+  const onToggleAudio = isCamera ? onToggleMute : (onToggleScreenAudioMute ?? onToggleMute);
   const wrapRef = useRef<HTMLDivElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const [menuOpen, setMenuOpen] = useState(false);
@@ -624,7 +640,7 @@ function VideoTile({
         ref={videoRef}
         autoPlay
         playsInline
-        muted={isSelf || peerMuted}
+        muted
         className={
           "vtile__video"
           + (isCamera ? " is-cam" : "")
@@ -660,8 +676,17 @@ function VideoTile({
       </div>
       <div className="vtile__hud">
         {!isSelf && (
-          <button className={peerMuted ? "vhud-btn is-on" : "vhud-btn"} title={peerMuted ? "Ativar som" : "Silenciar"} onClick={onToggleMute}>
-            <Icon name={peerMuted ? "headphone-muted" : "headphone"} size={16} />
+          <button
+            className={audioMuted ? "vhud-btn is-on" : "vhud-btn"}
+            title={audioMuted ? (isCamera ? "Ativar som" : "Ativar som da tela") : (isCamera ? "Silenciar" : "Silenciar tela")}
+            onClick={onToggleAudio}
+          >
+            <Icon name={audioMuted ? "headphone-muted" : "headphone"} size={16} />
+          </button>
+        )}
+        {!isSelf && !isCamera && onStopWatch && (
+          <button className="vhud-btn" title="Parar de assistir" onClick={onStopWatch}>
+            <Icon name="share-screen" size={16} />
           </button>
         )}
         <button className="vhud-btn" title="Janela flutuante" onClick={popOut}><PipIcon size={16} /></button>
@@ -673,7 +698,24 @@ function VideoTile({
           <button className="vhud-btn" title="Mais opções" onClick={() => setMenuOpen(value => !value)}><DotsIcon size={16} /></button>
           {menuOpen && (
             <div className="vhud-menu" onMouseLeave={() => setMenuOpen(false)}>
-              <button onClick={() => { onToggleMute(); setMenuOpen(false); }}>{peerMuted ? "Ativar som" : "Silenciar tela"}</button>
+              {!isSelf && (
+                <button onClick={() => { onToggleAudio(); setMenuOpen(false); }}>
+                  {audioMuted ? (isCamera ? "Ativar som" : "Ativar som da tela") : (isCamera ? "Silenciar" : "Silenciar tela")}
+                </button>
+              )}
+              {!isSelf && !isCamera && onScreenAudioVolumeChange && (
+                <label className="vhud-slider" onClick={e => e.stopPropagation()}>
+                  <span>Volume da tela {Math.round((screenAudioVolume ?? 1) * 100)}%</span>
+                  <input
+                    type="range" min={0} max={100} step={1}
+                    value={Math.round((screenAudioVolume ?? 1) * 100)}
+                    onChange={e => onScreenAudioVolumeChange(parseInt(e.target.value, 10) / 100)}
+                  />
+                </label>
+              )}
+              {!isSelf && !isCamera && onStopWatch && (
+                <button onClick={() => { onStopWatch(); setMenuOpen(false); }}>Parar de assistir</button>
+              )}
               <button onClick={() => { toggleFullscreen(); setMenuOpen(false); }}>Tela cheia</button>
               <button onClick={() => { popOut(); setMenuOpen(false); }}>Janela flutuante</button>
               <button onClick={() => { onToggleFocus(); setMenuOpen(false); }}>{focused ? "Sair do foco" : "Modo teatro"}</button>
@@ -1092,8 +1134,12 @@ export function App() {
   const [focusedUser, setFocusedUser] = useState<string | null>(null);
   const [theater, setTheater] = useState(false);
   const [mutedPeers, setMutedPeers] = useState<Record<string, boolean>>({});
-  // Local-only per-user playback volume (0..2, 1 = default). Not sent anywhere.
+  // Local-only per-user playback volume (0..1, 1 = default). Not sent anywhere.
   const [peerVolumes, setPeerVolumes] = useState<Record<string, number>>(() => rtc.getPeerVolumes());
+  // Local-only, per screen-share: mute / volume for the SHARE's audio only —
+  // independent of the sharer's microphone (rtc.ts routes it to its own sink).
+  const [screenMutedPeers, setScreenMutedPeers] = useState<Record<string, boolean>>({});
+  const [screenVolumes, setScreenVolumes] = useState<Record<string, number>>(() => rtc.getScreenAudioVolumes());
   const [noiseSup, setNoiseSup] = useState(() => {
     try { return localStorage.getItem("tk.noiseSuppression") !== "off"; } catch { return true; }
   });
@@ -2294,10 +2340,31 @@ export function App() {
   }
   function toggleWatch(ownerId: string, streamId: string) {
     if (!call) return;
-    const isWatching = !!watching[ownerId];
-    if (isWatching) rtc.stopWatchingStream(call.channelId, streamId, ownerId);
+    // Decide from what's ACTUALLY on screen, not just the flag: after the share
+    // drops (or a transient blip) the flag can be stuck "true" with no video,
+    // and a click should then re-subscribe — not unsubscribe.
+    const hasVideo = !!pickRemoteVideo(ownerId, "screen");
+    const shouldStop = !!watching[ownerId] && hasVideo;
+    if (shouldStop) rtc.stopWatchingStream(call.channelId, streamId, ownerId);
     else rtc.watchStream(call.channelId, streamId, ownerId);
-    setWatching(current => ({ ...current, [ownerId]: !isWatching }));
+    setWatching(current => ({ ...current, [ownerId]: !shouldStop }));
+  }
+  function stopWatch(ownerId: string, streamId: string) {
+    if (!call) return;
+    rtc.stopWatchingStream(call.channelId, streamId, ownerId);
+    setWatching(current => ({ ...current, [ownerId]: false }));
+  }
+  function toggleScreenAudioMute(ownerId: string) {
+    setScreenMutedPeers(current => {
+      const next = !current[ownerId];
+      rtc.setScreenAudioMuted(ownerId, next);
+      return { ...current, [ownerId]: next };
+    });
+  }
+  function changeScreenVolume(ownerId: string, volume: number) {
+    const clamped = Math.max(0, Math.min(1, volume));
+    rtc.setScreenAudioVolume(ownerId, clamped);
+    setScreenVolumes(current => ({ ...current, [ownerId]: clamped }));
   }
   // Hover-to-peek in the sidebar: transiently subscribe just to show a
   // thumbnail; hovering the floating preview expands it and its "Assistir"
@@ -2621,6 +2688,11 @@ export function App() {
           onToggleMute={() => togglePeerMute(participant.user_id)}
           onToggleFocus={() => toggleFocus(participant.user_id)}
           isSelf={isSelf}
+          onStopWatch={isSelf || !screenRow ? undefined : () => stopWatch(participant.user_id, screenRow.stream_id)}
+          screenAudioMuted={!!screenMutedPeers[participant.user_id]}
+          screenAudioVolume={screenVolumes[participant.user_id] ?? 1}
+          onToggleScreenAudioMute={() => toggleScreenAudioMute(participant.user_id)}
+          onScreenAudioVolumeChange={volume => changeScreenVolume(participant.user_id, volume)}
         />
       );
     }

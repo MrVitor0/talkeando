@@ -2427,6 +2427,18 @@ a:hover {
   background: var(--brand);
   color: #fff;
 }
+.vhud-slider {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+.vhud-slider input[type="range"] {
+  width: 100%;
+  accent-color: var(--brand);
+}
 .vtile__avatar {
   width: 88px;
   height: 88px;

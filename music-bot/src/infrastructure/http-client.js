@@ -33,6 +33,20 @@ class HttpClient {
       clearTimeout(timer);
     }
   }
+
+  /// Raw-text GET (used to scrape the public Spotify embed page when the Web
+  /// API refuses a playlist). Same timeout/abort discipline as `json`.
+  async text(url, options = {}) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), this.timeoutMs);
+    try {
+      const response = await this.fetch(url, { ...options, signal: options.signal || controller.signal });
+      if (!response.ok) throw new HttpError({ url, status: response.status, body: null });
+      return await response.text();
+    } finally {
+      clearTimeout(timer);
+    }
+  }
 }
 
 module.exports = { HttpClient, HttpError };

@@ -47,18 +47,20 @@ para obter título e autor, sem executar `yt-dlp`. Playlists usam
 link degrada para uma única busca textual; o bot nunca chama o endpoint caro
 `search.list`.
 
-Spotify é opcional e **não precisa de `SPOTIFY_REFRESH_TOKEN`**. Faixas,
-álbuns e playlists **públicas** de usuário funcionam só com `SPOTIFY_CLIENT_ID`
-e `SPOTIFY_CLIENT_SECRET` (fluxo client credentials). Playlists **privadas ou
-colaborativas** e as playlists editoriais/algorítmicas do próprio Spotify (ids
-que começam com `37i9`) retornam erro pela API independentemente do token; o
-bot responde com "Essa playlist é privada ou não pode ser usada". Se você
-realmente precisa de playlists privadas, gere um `SPOTIFY_REFRESH_TOKEN` com
-`node music-bot/scripts/spotify-authorize.js` (cadastre
-`http://127.0.0.1:8787/spotify/callback` como Redirect URI no painel Spotify) e
-salve só como GitHub Secret.
+Spotify é opcional e **não precisa de `SPOTIFY_REFRESH_TOKEN`**. Faixas, álbuns
+e playlists funcionam só com `SPOTIFY_CLIENT_ID` e `SPOTIFY_CLIENT_SECRET`
+(client credentials). A Web API do Spotify passou a recusar leitura de muitas
+playlists com token de app (playlists públicas de usuário dão 403/404, e as
+editoriais `37i9…` sempre), então o bot tenta a API primeiro (ela traz o ISRC,
+que melhora o casamento) e, se falhar, **raspa a página pública de embed**
+(`open.spotify.com/embed/playlist/<id>`) — sem auth, sem rate limit, funciona
+para qualquer playlist pública ou editorial. Só playlist genuinamente privada
+falha nos dois caminhos, e aí o bot responde "Não consegui ler essa playlist do
+Spotify — confirme que ela está pública". `SPOTIFY_REFRESH_TOKEN` continua
+existindo (via `node music-bot/scripts/spotify-authorize.js`) apenas para quem
+quiser cobrir playlists privadas.
 
-Depois de um deploy, execute manualmente o workflow **Music provider integration smoke** no GitHub Actions. Ele roda no container da VPS e valida, sem expor credenciais: uma playlist pública do Spotify expande em faixas, uma playlist editorial `37i9…` é rejeitada com a mensagem certa, os metadados de vídeo/playlist da YouTube Data API resolvem, e SoundCloud + Audius realmente entregam bytes de áudio.
+Depois de um deploy, execute manualmente o workflow **Music provider integration smoke** no GitHub Actions. Ele roda no container da VPS e valida, sem expor credenciais: leitura de faixa e de playlist do Spotify (via API ou embed), metadados de vídeo/playlist da YouTube Data API, busca no SoundCloud, e que **SoundCloud ou Audius** entrega bytes de áudio de verdade. DRM / "registered users only" / Spotify search instável viram `WARN` e não bloqueiam o deploy.
 Faixas, álbuns e playlists preservam título, artistas, duração e ISRC durante a
 resolução. `AUDIUS_API_KEY` também é opcional e permite usar uma credencial dos
 planos atuais da API Audius quando necessário.
