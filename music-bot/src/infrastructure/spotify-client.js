@@ -35,17 +35,6 @@ class SpotifyClient {
     return this.get(`https://api.spotify.com/v1/tracks/${id}`);
   }
 
-  /// Public playlist search (client_credentials is enough). Used by the
-  /// integration smoke to pick a live user playlist instead of a brittle
-  /// hardcoded id. Returns `{ id, name, owner }` rows.
-  async searchPlaylists(query, limit = 10) {
-    const params = new URLSearchParams({ q: query, type: "playlist", limit: String(Math.min(50, Math.max(1, limit))) });
-    const body = await this.get(`https://api.spotify.com/v1/search?${params}`);
-    return (body.playlists?.items || [])
-      .filter(Boolean)
-      .map(item => ({ id: item.id, name: item.name || null, owner: item.owner || null }));
-  }
-
   async getCollection(kind, id) {
     // Public user playlists read fine with an app-only (client_credentials)
     // token — no SPOTIFY_REFRESH_TOKEN needed. Private/collaborative playlists

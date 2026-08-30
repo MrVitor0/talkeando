@@ -465,7 +465,15 @@ function beginStream(meta, attempt = 0) {
 
   let yt, ffmpeg;
   try {
-    yt = spawn("yt-dlp", [...mediaArgs(meta.provider, clients), "-f", AUDIO_FORMAT, "-o", "-", meta.url], { stdio: ["ignore", "pipe", "pipe"] });
+    // SoundCloud (and other non-YouTube sources) serve the same track as both
+    // progressive HTTP and HLS. Piping an HLS/m3u8 format to `-o -` produces an
+    // empty file ("The downloaded file is empty"), and `bestaudio[acodec=opus]`
+    // resolves to SoundCloud's HLS-only opus — so ask for a progressive stream
+    // there and keep the opus-preferring selector for YouTube.
+    const format = meta.provider === "youtube"
+      ? AUDIO_FORMAT
+      : "bestaudio[protocol^=http]/bestaudio[protocol^=https]/bestaudio/best";
+    yt = spawn("yt-dlp", [...mediaArgs(meta.provider, clients), "-f", format, "-o", "-", meta.url], { stdio: ["ignore", "pipe", "pipe"] });
     ffmpeg = spawn("ffmpeg", [
       "-hide_banner", "-loglevel", "warning", "-nostdin",
       "-i", "pipe:0",
