@@ -258,14 +258,12 @@ jobs:
               set +a
               docker compose -f docker-compose.production.yml pull tupi-server music-bot
               docker compose -f docker-compose.production.yml up -d --no-build --remove-orphans
-              # `up` does not recreate caddy when only the bind-mounted Caddyfile
-              # changed (compose hashes the service def, not the file contents),
-              # and caddy reads its config once at process start — so an
-              # upstream/host rename in the Caddyfile is otherwise ignored until
-              # something restarts the container. `caddy reload` proved
-              # unreliable over `compose exec` (exits 0 without applying), so just
-              # recreate it — a ~1s restart on this box.
-              docker compose -f docker-compose.production.yml up -d --force-recreate caddy
+              # Compose hashes service definitions, not the contents of mounted
+              # config files. Both Caddyfile and livekit.yaml are read only at
+              # process start, so recreate their consumers to apply new domains,
+              # certificates/upstreams and LiveKit webhook settings. This also
+              # discards a stale webhook retry queue after a bad configuration.
+              docker compose -f docker-compose.production.yml up -d --force-recreate caddy livekit
               docker compose -f docker-compose.production.yml ps
               docker logout ghcr.io
             '
