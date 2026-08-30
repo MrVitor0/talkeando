@@ -266,7 +266,12 @@ public sealed class IpcBridge : IDisposable
                     var requestId = d.GetProperty("request_id").GetString();
                     var mode = d.TryGetProperty("mode", out var modeValue) ? modeValue.GetString() ?? "participant" : "participant";
                     var roomToken = await _network.GetLiveKitTokenAsync(d.GetProperty("channel_id").GetGuid(), mode);
-                    Publish("livekit.token", new { request_id = requestId, token = roomToken });
+                    Publish("livekit.token", new
+                    {
+                        request_id = requestId,
+                        url = roomToken.GetProperty("url").GetString(),
+                        access_token = roomToken.GetProperty("token").GetString(),
+                    });
                     break;
                 }
                 case "host.title":

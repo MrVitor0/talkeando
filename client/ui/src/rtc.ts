@@ -45,7 +45,12 @@ async function credentials(channel_id: string, mode = "participant") {
     const timer = setTimeout(() => { off(); reject(new Error("LiveKit token timeout")); }, 10_000);
     const off = subscribe(event => {
       if (event.op !== "livekit.token" || event.data.request_id !== request_id) return;
-      clearTimeout(timer); off(); resolve(event.data.token);
+      clearTimeout(timer); off();
+      const url = typeof event.data.url === "string" ? event.data.url.trim() : "";
+      const token = typeof event.data.access_token === "string" ? event.data.access_token : "";
+      if (!url || !token) { reject(new Error("LiveKit retornou uma credencial incompleta")); return; }
+      try { new URL(url); } catch { reject(new Error(`LiveKit retornou URL inválida: ${url}`)); return; }
+      resolve({ url, token });
     });
     send("livekit.token.request", { request_id, channel_id, mode });
   });
