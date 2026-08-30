@@ -91,5 +91,8 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         shell: pwsh
         run: |
-          $tag = "v${{ inputs.version_label }}-${{ github.run_number }}"
+          # The updater compares semantic versions. Keep the channel label in
+          # the title/file name, but use one unambiguous numeric tag so a
+          # client can jump straight to the newest release.
+          $tag = "v0.1.${{ github.run_number }}"
           gh release create $tag "release/Tupi-${{ inputs.version_label }}-win-x64.zip" "client/native/installer/output/Tupi-Setup-${{ inputs.version_label }}-x64.exe" --title "Tupi Client v${{ inputs.version_label }} (Build #${{ github.run_number }})" --notes "Manual release build from main branch."
