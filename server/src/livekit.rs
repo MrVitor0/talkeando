@@ -3,7 +3,7 @@ use anyhow::{anyhow, Result};
 use chrono::{Duration, Utc};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use hmac::{Hmac, Mac};
-use sha2::Sha256;
+use sha2::{Digest, Sha256};
 use serde::{Deserialize, Serialize};
 
 use crate::config::Config;
@@ -45,8 +45,13 @@ pub struct Participant { pub identity: String }
 #[derive(Debug, Deserialize)]
 pub struct Track { pub source: String }
 
-pub fn verify_webhook(cfg: &Config, auth_header: &str) -> Result<WebhookEvent> {
-    let (_, secret) = credentials(cfg)?;
+#[derive(Deserialize)]
+struct WebhookClaims { iss: String, sha256: String }
+
+/// LiveKit signs the SHA-256 of the raw webhook body in the JWT sent through
+/// Authorization. The event itself is JSON in the body, not JWT claims.
+pub fn verify_webhook(cfg: &Config, auth_header: &str, body: &str) -> Result<WebhookEvent> {
+    let (key, secret) = credentials(cfg)?;
     let token = auth_header.strip_prefix("Bearer ").unwrap_or(auth_header);
     let mut parts = token.split('.');
     let header = parts.next().ok_or_else(|| anyhow!("malformed webhook token"))?;
@@ -56,7 +61,11 @@ pub fn verify_webhook(cfg: &Config, auth_header: &str) -> Result<WebhookEvent> {
     let supplied = URL_SAFE_NO_PAD.decode(signature)?;
     let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())?;
     mac.update(format!("{header}.{payload}").as_bytes()); mac.verify_slice(&supplied)?;
-    Ok(serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload)?)?)
+    let claims: WebhookClaims = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload)?)?;
+    if claims.iss != key { return Err(anyhow!("unexpected webhook API key")); }
+    let actual_hash = base64::engine::general_purpose::STANDARD.encode(Sha256::digest(body.as_bytes()));
+    if claims.sha256 != actual_hash { return Err(anyhow!("webhook body hash mismatch")); }
+    Ok(serde_json::from_str(body)?)
 }
 
 pub async fn remove_participant(cfg: &Config, room: &str, identity: &str) -> Result<()> {

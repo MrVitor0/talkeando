@@ -29,7 +29,7 @@ pub async fn token(State(state): State<AppState>, headers: HeaderMap, Json(reque
 
 pub async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: String) -> AppResult<()> {
     let authorization = headers.get(header::AUTHORIZATION).and_then(|v| v.to_str().ok()).ok_or(AppError::Unauthorized)?;
-    let event = livekit::verify_webhook(&state.config, authorization).map_err(|_| AppError::Unauthorized)?;
+    let event = livekit::verify_webhook(&state.config, authorization, &body).map_err(|_| AppError::Unauthorized)?;
     let Some(room) = event.room.and_then(|room| Uuid::parse_str(&room.name).ok()) else { return Ok(()); };
     let participant = event.participant.and_then(|p| Uuid::parse_str(&p.identity).ok());
     match event.event.as_str() {
@@ -40,6 +40,5 @@ pub async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: St
         "room_finished" => { state.hub.calls.write().await.clear_channel(room); state.hub.send_to(MUSIC_BOT_ID, OutboundEnvelope::new("music.command", serde_json::json!({"command":"stop","voice_channel_id":room,"reason":"room_finished"}))).await; broadcast_voice_roster(&state, room).await; },
         _ => {}
     }
-    let _ = body; // axum extracts the raw body before signature processing.
     Ok(())
 }
