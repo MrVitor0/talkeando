@@ -1787,6 +1787,7 @@ export function App() {
 
   useEffect(() => rtc.onConnectionQuality(setConnQuality), []);
   useEffect(() => rtc.onSpeaking(setSpeakingUsers), []);
+  useEffect(() => rtc.onMediaError(message => setError(message)), []);
 
   useEffect(() => { setSoundsMuted(deafened); }, [deafened]);
   useEffect(() => {
@@ -2146,13 +2147,21 @@ export function App() {
       setVoiceConnState("connecting");
     }, 900);
 
-    const t3 = window.setTimeout(() => {
-      setVoiceConnState("connected");
-    }, 1450);
+    voiceConnTimers.current = [t1, t2];
 
-    voiceConnTimers.current = [t1, t2, t3];
-
-    void rtc.joinCall(channel.id, initialMuted, false);
+    void rtc.joinCall(channel.id, initialMuted, false)
+      .then(() => {
+        voiceConnTimers.current.forEach(id => window.clearTimeout(id));
+        voiceConnTimers.current = [];
+        setVoiceConnState("connected");
+      })
+      .catch(error => {
+        voiceConnTimers.current.forEach(id => window.clearTimeout(id));
+        voiceConnTimers.current = [];
+        setVoiceConnState("disconnected");
+        console.error("[ui] LiveKit voice connection failed", error);
+        setError(`Não foi possível conectar o áudio: ${error instanceof Error ? error.message : "erro desconhecido"}`);
+      });
   }
   function leaveCall() {
     if (call) { playSound("leaveCall"); void rtc.leaveCall(); }

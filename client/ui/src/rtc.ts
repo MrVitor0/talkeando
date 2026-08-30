@@ -20,6 +20,7 @@ const remotes = new Set<Remote>();
 const cameras = new Set<(stream: MediaStream | null) => void>();
 const speakers = new Set<(ids: Set<string>) => void>();
 const qualities = new Set<(quality: ConnQuality) => void>();
+const mediaErrors = new Set<(message: string) => void>();
 const volumes = new Map<string, number>(Object.entries(stored("tk.peerVolumes")));
 const screenVolumes = new Map<string, number>(Object.entries(stored("tk.screenVolumes")));
 const muted = new Map<string, boolean>(), screenMuted = new Map<string, boolean>();
@@ -27,7 +28,14 @@ const audio = new Map<string, HTMLAudioElement[]>(), screenAudio = new Map<strin
 
 function stored(key: string): Record<string, number> { try { return JSON.parse(localStorage.getItem(key) || "{}"); } catch { return {}; } }
 function storedString(key: string): string | undefined { try { return localStorage.getItem(key) || undefined; } catch { return undefined; } }
-function storedNumber(key: string, fallback: number): number { try { const value = Number(localStorage.getItem(key)); return Number.isFinite(value) ? value : fallback; } catch { return fallback; } }
+function storedNumber(key: string, fallback: number): number {
+  try {
+    const raw = localStorage.getItem(key);
+    if (raw === null) return fallback;
+    const value = Number(raw);
+    return Number.isFinite(value) ? value : fallback;
+  } catch { return fallback; }
+}
 function persist(key: string, values: Map<string, number>) { try { localStorage.setItem(key, JSON.stringify(Object.fromEntries(values))); } catch {} }
 function persistValue(key: string, value: string | number) { try { localStorage.setItem(key, String(value)); } catch {} }
 
@@ -70,14 +78,34 @@ function bind(room: Room) {
   });
   room.on(RoomEvent.ActiveSpeakersChanged, list => speakers.forEach(listener => listener(new Set(list.map(participant => participant.identity)))));
   room.on(RoomEvent.ConnectionQualityChanged, quality => qualities.forEach(listener => listener(quality === "poor" ? "poor" : quality === "good" ? "good" : "medium")));
+  room.on(RoomEvent.MediaDevicesError, (error, kind) => {
+    const device = kind === "audioinput" ? "microfone" : kind === "audiooutput" ? "saída de áudio" : "dispositivo de mídia";
+    mediaErrors.forEach(listener => listener(`Não foi possível usar ${device}: ${error.message}`));
+  });
+  room.on(RoomEvent.AudioPlaybackStatusChanged, () => {
+    if (!room.canPlaybackAudio) mediaErrors.forEach(listener => listener("O aplicativo bloqueou a reprodução de áudio. Clique novamente no canal para ativá-la."));
+  });
   room.on(RoomEvent.Disconnected, () => { active = null; });
 }
 
 export function init(_: string) {}
 export async function joinCall(id: string, isMuted: boolean, _: boolean) {
-  await leaveCall(); const credential = await credentials(id); const room = new Room({ adaptiveStream: true, dynacast: true }); bind(room);
-  await room.connect(credential.url, credential.token); active = room;
-  await room.localParticipant.setMicrophoneEnabled(!isMuted, audioInputDeviceId ? { deviceId: audioInputDeviceId } : undefined);
+  active?.disconnect(); active = null;
+  screen?.getTracks().forEach(track => track.stop()); screen = null;
+  const room = new Room({ adaptiveStream: true, dynacast: true });
+  bind(room);
+  // Invoke this while handling the channel click. Some WebViews require a user
+  // gesture before they allow remote audio to play.
+  void room.startAudio().catch(() => {});
+  try {
+    const credential = await credentials(id);
+    await room.connect(credential.url, credential.token);
+    active = room;
+    await room.localParticipant.setMicrophoneEnabled(!isMuted, audioInputDeviceId ? { deviceId: audioInputDeviceId } : undefined);
+  } catch (error) {
+    room.disconnect();
+    throw error;
+  }
 }
 export async function leaveCall() { active?.disconnect(); active = null; screen?.getTracks().forEach(track => track.stop()); screen = null; }
 export async function setLocalAudioState(isMuted: boolean, _: boolean) { await active?.localParticipant.setMicrophoneEnabled(!isMuted); }
@@ -109,6 +137,7 @@ export function stopSpectate(_: string) {}
 export function onRemoteStream(listener: Remote) { remotes.add(listener); return () => { remotes.delete(listener); }; }
 export function onSpeaking(listener: (ids: Set<string>) => void) { speakers.add(listener); return () => { speakers.delete(listener); }; }
 export function onConnectionQuality(listener: (quality: ConnQuality) => void) { qualities.add(listener); return () => { qualities.delete(listener); }; }
+export function onMediaError(listener: (message: string) => void) { mediaErrors.add(listener); return () => { mediaErrors.delete(listener); }; }
 export function setPeerVolume(id: string, value: number) { volumes.set(id, value); persist("tk.peerVolumes", volumes); apply(id); }
 export function getPeerVolumes() { return Object.fromEntries(volumes); }
 export function setPeerAudioMuted(id: string, value: boolean) { muted.set(id, value); apply(id); }

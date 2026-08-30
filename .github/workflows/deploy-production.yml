@@ -162,8 +162,9 @@ jobs:
           LIVEKIT_API_SECRET: ${{ secrets.LIVEKIT_API_SECRET }}
           LIVEKIT_URL: ${{ secrets.LIVEKIT_URL }}
           API_DOMAIN: ${{ secrets.API_DOMAIN }}
+          SFU_DOMAIN: ${{ secrets.SFU_DOMAIN }}
         run: |
-          test -n "$LIVEKIT_API_KEY" && test -n "$LIVEKIT_API_SECRET" && test -n "$LIVEKIT_URL"
+          test -n "$LIVEKIT_API_KEY" && test -n "$LIVEKIT_API_SECRET" && test -n "$LIVEKIT_URL" && test -n "$SFU_DOMAIN"
           export LIVEKIT_API_KEY LIVEKIT_API_SECRET API_DOMAIN
           envsubst < infra/livekit/livekit.yaml.tmpl | ssh -i ~/.ssh/talkeando-production "ubuntu@$DEPLOY_HOST" 'set -eu; install -d -m 755 /opt/talkeando/infra/livekit; umask 077; cat > /opt/talkeando/infra/livekit/livekit.yaml'
           {
@@ -171,6 +172,7 @@ jobs:
             printf 'LIVEKIT_API_KEY=%s\n' "$LIVEKIT_API_KEY"
             printf 'LIVEKIT_API_SECRET=%s\n' "$LIVEKIT_API_SECRET"
             printf 'API_DOMAIN=%s\n' "$API_DOMAIN"
+            printf 'SFU_DOMAIN=%s\n' "$SFU_DOMAIN"
           } | ssh -i ~/.ssh/talkeando-production "ubuntu@$DEPLOY_HOST" 'set -eu; umask 077; cat > /opt/talkeando/infra/livekit.env'
           tar -czf - \
             --exclude='server/target' \

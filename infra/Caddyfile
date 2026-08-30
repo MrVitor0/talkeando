@@ -4,6 +4,6 @@
     reverse_proxy tupi-server:8080
 }
 
-sfu.{$API_DOMAIN} {
+{$SFU_DOMAIN} {
     reverse_proxy host.docker.internal:7880
 }

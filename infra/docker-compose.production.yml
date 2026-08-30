@@ -52,6 +52,7 @@ services:
       - tupi-server
     environment:
       API_DOMAIN: ${API_DOMAIN:?set in production env}
+      SFU_DOMAIN: ${SFU_DOMAIN:?set in production env}
     # LiveKit uses host networking for WebRTC.  Resolve this name to the
     # Docker host so the reverse proxy can reach LiveKit's signal API.
     extra_hosts:
