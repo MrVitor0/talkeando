@@ -9,6 +9,11 @@ type Remote = (id: string, stream: MediaStream | null, id2: string | null) => vo
 type DeviceLists = { audioInputs: MediaDeviceInfo[]; audioOutputs: MediaDeviceInfo[]; videoInputs: MediaDeviceInfo[] };
 
 let active: Room | null = null;
+// The voice channel the server currently lists us in. Mirrors `active`, but
+// outlives a `RoomEvent.Disconnected` long enough to send the matching
+// `voice.presence.leave` — the server roster is driven by these signals, not
+// by LiveKit's webhooks.
+let presentChannelId: string | null = null;
 let screen: MediaStream | null = null;
 let screenSource = "";
 let screenAudioEnabled = false;
@@ -90,7 +95,10 @@ function bind(room: Room) {
   room.on(RoomEvent.AudioPlaybackStatusChanged, () => {
     if (!room.canPlaybackAudio) mediaErrors.forEach(listener => listener("O aplicativo bloqueou a reprodução de áudio. Clique novamente no canal para ativá-la."));
   });
-  room.on(RoomEvent.Disconnected, () => { active = null; });
+  room.on(RoomEvent.Disconnected, () => {
+    active = null;
+    if (presentChannelId) { send("voice.presence.leave", { channel_id: presentChannelId }); presentChannelId = null; }
+  });
 }
 
 export function init(_: string) {}
@@ -106,13 +114,21 @@ export async function joinCall(id: string, isMuted: boolean, _: boolean) {
     const credential = await credentials(id);
     await room.connect(credential.url, credential.token);
     active = room;
+    // Tell the server we're a participant now. It evicts us from any channel we
+    // were previously in, so switching channels never shows us in two at once.
+    send("voice.presence.enter", { channel_id: id });
+    presentChannelId = id;
     await room.localParticipant.setMicrophoneEnabled(!isMuted, audioInputDeviceId ? { deviceId: audioInputDeviceId } : undefined);
   } catch (error) {
     room.disconnect();
     throw error;
   }
 }
-export async function leaveCall() { active?.disconnect(); active = null; screen?.getTracks().forEach(track => track.stop()); screen = null; }
+export async function leaveCall() {
+  if (presentChannelId) { send("voice.presence.leave", { channel_id: presentChannelId }); presentChannelId = null; }
+  active?.disconnect(); active = null;
+  screen?.getTracks().forEach(track => track.stop()); screen = null;
+}
 export async function setLocalAudioState(isMuted: boolean, _: boolean) { await active?.localParticipant.setMicrophoneEnabled(!isMuted); }
 export async function startCamera(_: string, __: string, deviceId?: string) {
   if (!active) return;

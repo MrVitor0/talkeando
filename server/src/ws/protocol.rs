@@ -279,6 +279,16 @@ pub struct CallStateUpdate {
     pub deafened: Option<bool>,
 }
 
+/// Inbound `voice.presence.enter` / `voice.presence.leave` — a lightweight,
+/// socket-lifetime-bound signal that the client is (or is no longer) an active
+/// participant of a voice channel. This is the authoritative source for the
+/// community voice roster; LiveKit's `participant_*` webhooks only reconcile it.
+/// Carries no media semantics — the client already talks to LiveKit directly.
+#[derive(Debug, Deserialize)]
+pub struct VoicePresence {
+    pub channel_id: Uuid,
+}
+
 /// Inbound `voice.move_member` — a community owner dragging another member's
 /// row onto a different voice channel in the sidebar. The server only tells
 /// the target to move; the target's own client performs the `call.join`, so

@@ -209,6 +209,8 @@ public sealed class IpcBridge : IDisposable
                 // WebSocket — the JS RTC engine (client/ui/src/rtc.ts) owns
                 // all of the actual call/screen-share semantics now.
                 case "call.state.update":
+                case "voice.presence.enter":
+                case "voice.presence.leave":
                 case "voice.move_member":
                 case "voice.disconnect_member":
                 case "music.command":

@@ -153,6 +153,13 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         broadcast_presence_update(&state, user_id, "online").await;
     }
 
+    // Voice channels this connection is an active participant of. Bound to the
+    // socket lifetime: a clean `voice.presence.leave`, a channel switch, or the
+    // disconnect path below all evict the user from the community voice roster
+    // immediately, instead of waiting on LiveKit's (laggy, best-effort)
+    // `participant_left` webhook.
+    let mut joined_calls: HashSet<Uuid> = HashSet::new();
+
     // Application-level heartbeat: any inbound frame (including the Pong the
     // client sends in reply to our Ping) refreshes `last_seen`; if nothing
     // arrives for HEARTBEAT_TIMEOUT we drop the socket so the disconnect
@@ -173,7 +180,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 last_seen = Instant::now();
                 match msg {
                     Message::Text(text) => {
-                        dispatch(&state, user_id, &text).await;
+                        dispatch(&state, user_id, &text, &mut joined_calls).await;
                     }
                     Message::Ping(payload) => {
                         let _ = state
@@ -204,6 +211,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         let _ = forward_task.await;
         return;
     }
+    let left_calls: Vec<Uuid> = joined_calls.into_iter().collect();
     let disconnect_epoch = state.advance_presence_epoch(user_id).await;
     state.begin_offline_grace(user_id).await;
     let delayed_state = state.clone();
@@ -219,6 +227,12 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         }
         if !delayed_state.finish_offline_grace(user_id).await {
             return;
+        }
+        // The socket is genuinely gone (not a refresh): drop this user from every
+        // voice roster they were still listed in. LiveKit's webhook would get
+        // here too, eventually — this just makes it immediate and certain.
+        for channel_id in left_calls {
+            evict_voice_participant(&delayed_state, channel_id, user_id).await;
         }
         // ACT-FR-006: clear this user's activity in the same grace window,
         // and close any playtime rows left open (ACT-FR-031).
@@ -432,7 +446,12 @@ async fn teardown_spectator_subscriptions(state: &AppState, user_id: Uuid) {
 }
 */
 
-async fn dispatch(state: &AppState, user_id: Uuid, text: &str) {
+async fn dispatch(
+    state: &AppState,
+    user_id: Uuid,
+    text: &str,
+    joined_calls: &mut HashSet<Uuid>,
+) {
     let env = match serde_json::from_str::<InboundEnvelope>(text) {
         Ok(e) => e,
         Err(e) => {
@@ -528,6 +547,34 @@ async fn dispatch(state: &AppState, user_id: Uuid, text: &str) {
                         serde_json::json!({ "channel_id": data.channel_id, "user_id": user_id }),
                     )).await;
                 }
+            }
+        }
+        "voice.presence.enter" => {
+            let data: VoicePresence = parse_or_reject!(VoicePresence);
+            // A client can only be in one voice channel at a time: switching
+            // channels must clear the old roster row now, not whenever LiveKit
+            // decides to send `participant_left`.
+            for previous in joined_calls.clone() {
+                if previous == data.channel_id {
+                    continue;
+                }
+                joined_calls.remove(&previous);
+                evict_voice_participant(state, previous, user_id).await;
+            }
+            if joined_calls.insert(data.channel_id) {
+                state
+                    .hub
+                    .calls
+                    .write()
+                    .await
+                    .apply_participant(data.channel_id, user_id, true);
+                broadcast_voice_roster(state, data.channel_id).await;
+            }
+        }
+        "voice.presence.leave" => {
+            let data: VoicePresence = parse_or_reject!(VoicePresence);
+            if joined_calls.remove(&data.channel_id) {
+                evict_voice_participant(state, data.channel_id, user_id).await;
             }
         }
         "call.state.update" => {
@@ -1128,6 +1175,40 @@ pub(crate) async fn broadcast_voice_roster(state: &AppState, channel_id: Uuid) {
     .await;
 }
 
+/// Removes `user_id` from a voice channel's roster and re-broadcasts it. When
+/// only the music bot is left behind, tears the bot down too (matching the
+/// LiveKit `participant_left` webhook, which does the same reconciliation from
+/// the other direction). Safe to call for a user who is not currently listed.
+pub(crate) async fn evict_voice_participant(state: &AppState, channel_id: Uuid, user_id: Uuid) {
+    {
+        let mut calls = state.hub.calls.write().await;
+        calls.apply_participant(channel_id, user_id, false);
+    }
+    let only_bot_left = {
+        let calls = state.hub.calls.read().await;
+        calls.participant_ids(channel_id) == vec![MUSIC_BOT_ID]
+    };
+    if only_bot_left {
+        state
+            .hub
+            .send_to(
+                MUSIC_BOT_ID,
+                OutboundEnvelope::new(
+                    "music.command",
+                    serde_json::json!({ "command": "stop", "voice_channel_id": channel_id, "reason": "empty" }),
+                ),
+            )
+            .await;
+        let _ = crate::livekit::remove_participant(
+            &state.config,
+            &channel_id.to_string(),
+            &MUSIC_BOT_ID.to_string(),
+        )
+        .await;
+    }
+    broadcast_voice_roster(state, channel_id).await;
+}
+
 /// One-shot roster snapshot for a freshly connected client: every voice
 /// channel with an active call that lives in a community the user belongs to.
 async fn send_voice_rooms_snapshot(state: &AppState, user_id: Uuid, connection_id: Uuid) {
@@ -1299,6 +1380,9 @@ async fn handle_voice_disconnect_member(state: &AppState, actor_id: Uuid, data: 
             tracing::warn!(%error, target = %data.user_id, "failed to remove LiveKit participant");
         }
     }
+    // Clear the roster row now — don't wait for LiveKit's webhook (or, for the
+    // bot, its own disconnect) to catch up.
+    evict_voice_participant(state, data.channel_id, data.user_id).await;
     tracing::info!(%actor_id, target = %data.user_id, channel_id = %data.channel_id, bot = is_bot, "voice.disconnect_member");
 }
 

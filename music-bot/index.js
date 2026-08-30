@@ -9,7 +9,7 @@ const WebSocket = require("ws");
 // first time an RTCPeerConnection / RTCAudioSource is created, which showed
 // up as the bot going offline mid-handshake ("target is not connected") and
 // no audio ever arriving. LiveKit now owns the WebRTC transport.
-const { AudioSource, AudioFrame, LocalAudioTrack, Room, TrackSource } = require("@livekit/rtc-node");
+const { AudioSource, AudioFrame, LocalAudioTrack, Room, TrackSource, TrackPublishOptions } = require("@livekit/rtc-node");
 const { spawn } = require("child_process");
 const crypto = require("crypto");
 const { HttpClient } = require("./src/infrastructure/http-client");
@@ -93,7 +93,14 @@ async function joinLiveKit(channelId) {
   const credentials = await response.json();
   const room = new Room();
   await room.connect(process.env.LIVEKIT_URL || credentials.url || LIVEKIT_URL, credentials.token);
-  await room.localParticipant.publishTrack(LocalAudioTrack.createAudioTrack("music", musicSource()), { source: TrackSource.MICROPHONE, metadata: JSON.stringify({ kind: "music" }) });
+  await room.localParticipant.publishTrack(
+    LocalAudioTrack.createAudioTrack("music", musicSource()),
+    // Publish as MICROPHONE: clients treat it as ordinary voice audio and just
+    // play it. (`TrackSource.MICROPHONE` does not exist on this enum — the
+    // member is `SOURCE_MICROPHONE`; the old name silently published as
+    // SOURCE_UNKNOWN.)
+    new TrackPublishOptions({ source: TrackSource.SOURCE_MICROPHONE }),
+  );
   livekitRoom = room;
 }
 
@@ -689,34 +696,8 @@ function leaveVoice() {
 }
 
 async function onEvent(op, data) {
-  /* Removed mesh event handling.
-  if (op === "legacy.call_snapshot") {
-    voiceChannel = data.channel_id;
-    startFeeder();
-    // Reconcile against the authoritative roster WITHOUT disturbing live
-    // connections: only add peers we're missing and drop peers who left.
-    // A flaky/`disconnected` peer is left to its own ICE-restart timer —
-    // tearing it down here caused audible gaps for that listener.
-    const present = new Set((data.participants || []).filter(p => !p.is_bot && p.user_id !== BOT_ID).map(p => p.user_id));
-    for (const uid of [...peers.keys()]) {
-      if (present.has(uid)) continue;
-      peers.get(uid)?.close(); peers.delete(uid);
-      const t = iceRestartTimers.get(uid); if (t) { clearTimeout(t); iceRestartTimers.delete(uid); }
-    }
-    for (const uid of present) {
-      if (peers.has(uid)) continue;
-      try { await offer(uid); } catch (error) { log(`offer to ${uid} failed: ${error.message}`); }
-    }
-  } else if (op === "legacy.call_peer_joined" && data.participant?.user_id !== BOT_ID && !data.participant?.is_bot) {
-    const uid = data.participant.user_id;
-    const pc = peers.get(uid);
-    // Already connected/connecting — a duplicate join event, leave it alone.
-    if (pc && pc.connectionState !== "failed" && pc.connectionState !== "closed") return;
-    if (pc) { pc.close(); peers.delete(uid); }
-    try { await offer(uid); } catch (error) { log(`offer to ${uid} failed: ${error.message}`); }
-  }
-  else if (op === "legacy.call_peer_left") { // LiveKit owns room membership.
-  */
+  // Mesh call events (legacy.call_*) are gone: LiveKit owns room membership and
+  // media now. The bot only reacts to music.command from the server.
   if (op === "music.command") {
     log(`music.command: ${data.command} ${JSON.stringify(data.query ?? "")}`);
     try {
