@@ -1,20 +1,19 @@
-# Otimização futura do deploy
+# Otimização do deploy
 
 ## Situação atual
 
 O código é enviado à Lightsail e o `docker compose up --build` compila Rust no
 VPS de 2 GB. O upload é pequeno; o build é a causa dos cerca de 11 minutos.
 
-## Plano recomendado
+## Implementado
 
-1. Construir `tupi-server` e `music-bot` para `linux/amd64` no GitHub Actions,
-   usando Buildx e cache, e publicar imagens imutáveis por SHA no GHCR.
-2. No deploy, transmitir só `infra/`, executar `docker compose pull` e depois
+1. O GitHub Actions constrói `tupi-server` e `music-bot` para `linux/amd64`,
+   com Buildx e cache, e publica imagens imutáveis por SHA no GHCR.
+2. A Lightsail recebe somente `infra/`, faz `docker compose pull` e sobe com
    `docker compose up -d --no-build`.
-3. Passar os nomes/digests das imagens ao compose por variáveis; não usar
-   `latest`.
-4. Criar um token de leitura de pacotes, limitado à Lightsail, e mantê-lo como
-   secret. As imagens permanecem privadas.
+3. Os nomes das imagens chegam ao Compose por variáveis; `latest` não é usado.
+4. A Lightsail recebe a credencial temporária do `GITHUB_TOKEN` só para o pull
+   daquele deploy e executa `docker logout` em seguida.
 
 ## Resultado esperado
 

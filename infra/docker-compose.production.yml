@@ -2,8 +2,7 @@ name: talkeando
 
 services:
   tupi-server:
-    build:
-      context: ../server
+    image: ${TUPI_SERVER_IMAGE:?set by the deployment workflow}
     restart: unless-stopped
     environment:
       DATABASE_URL: ${DATABASE_URL:?set the Neon production connection string}
@@ -21,8 +20,7 @@ services:
       - attachments_data:/var/lib/tupi/attachments
 
   music-bot:
-    build:
-      context: ../music-bot
+    image: ${MUSIC_BOT_IMAGE:?set by the deployment workflow}
     restart: unless-stopped
     depends_on:
       - tupi-server
