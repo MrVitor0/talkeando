@@ -16,6 +16,10 @@ pub struct Config {
     /// Shared only with the music-bot container. It authenticates a real
     /// WebSocket participant without creating an end-user session.
     pub music_bot_token: String,
+    pub livekit_url: Option<String>,
+    pub livekit_api_key: Option<String>,
+    pub livekit_api_secret: Option<String>,
+    pub livekit_token_ttl_seconds: i64,
 }
 
 impl Config {
@@ -61,6 +65,10 @@ impl Config {
             music_bot_token: env::var("MUSIC_BOT_TOKEN").ok().filter(|value| !value.is_empty()).unwrap_or_else(|| {
                 env::var("TURN_SHARED_SECRET").unwrap_or_else(|_| "insecure-dev-music-bot-token".to_string())
             }),
+            livekit_url: env::var("LIVEKIT_URL").ok().filter(|value| !value.is_empty()),
+            livekit_api_key: env::var("LIVEKIT_API_KEY").ok().filter(|value| !value.is_empty()),
+            livekit_api_secret: env::var("LIVEKIT_API_SECRET").ok().filter(|value| !value.is_empty()),
+            livekit_token_ttl_seconds: env::var("LIVEKIT_TOKEN_TTL_SECONDS").ok().and_then(|v| v.parse().ok()).unwrap_or(21_600),
         }
     }
 }

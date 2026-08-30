@@ -1,6 +1,5 @@
-# @roamhq/wrtc publishes prebuilt binaries for Node 18/20/22; 20 LTS is the
-# safe middle. (The old node:18 + unmaintained `wrtc` combo crash-looped.)
-FROM node:20-bookworm-slim
+# rtc-node requires native WebRTC runtime libraries supplied by bookworm.
+FROM node:20-bookworm
 # Debian Bookworm marks its system Python as externally managed (PEP 668), so
 # yt-dlp must live in its own virtual environment instead of `pip3 install`
 # into the OS package set.
@@ -13,13 +12,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg python3-
 # cache,library,soundcloud,audius). Deno is only needed if someone opts back
 # into the YouTube last-resort player with `PROVIDER_CHAIN=...,youtube` — it is
 # yt-dlp's JS runtime for YouTube's signature / `n` challenges.
-RUN curl -fsSL https://github.com/denoland/deno/releases/latest/download/deno-x86_64-unknown-linux-gnu.zip -o /tmp/deno.zip \
+ARG DENO_VERSION=2.2.0
+RUN curl -fsSL https://github.com/denoland/deno/releases/download/v${DENO_VERSION}/deno-x86_64-unknown-linux-gnu.zip -o /tmp/deno.zip \
     && unzip -q /tmp/deno.zip -d /usr/local/bin \
     && chmod +x /usr/local/bin/deno \
     && rm /tmp/deno.zip
 WORKDIR /app
-COPY package.json ./
-RUN npm install --omit=dev
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
 COPY index.js test.js ./
 COPY src ./src
 COPY scripts ./scripts

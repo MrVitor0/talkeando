@@ -1,0 +1,17 @@
+# DEV ONLY: never use these credentials outside a local machine.
+port: 7880
+rtc:
+  tcp_port: 7881
+  port_range_start: 50000
+  port_range_end: 50200
+keys:
+  devkey: devsecret_at_least_32_chars_long
+webhook:
+  api_key: devkey
+  urls:
+    - http://host.docker.internal:8080/api/livekit/webhook
+turn:
+  enabled: false
+room:
+  empty_timeout: 300
+  max_participants: 12

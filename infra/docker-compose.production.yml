@@ -10,6 +10,9 @@ services:
       BIND_ADDR: 0.0.0.0:8080
       TURN_SHARED_SECRET: ${TURN_SHARED_SECRET:?set in production env}
       MUSIC_BOT_TOKEN: ${MUSIC_BOT_TOKEN:-}
+      LIVEKIT_URL: ${LIVEKIT_URL:?set in production env}
+      LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:?set in production env}
+      LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:?set in production env}
       TURN_REALM: ${TURN_REALM:?set in production env}
       TURN_URIS: ${TURN_URIS:?set in production env}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:?set in production env}
@@ -27,6 +30,8 @@ services:
       - ./music-bot.env
     environment:
       TUPI_WS_URL: ws://tupi-server:8080/ws
+      TUPI_API_URL: http://tupi-server:8080
+      LIVEKIT_URL: ${LIVEKIT_URL:?set in production env}
       # Falls back to TURN_SHARED_SECRET in the bot for existing deployments;
       # set MUSIC_BOT_TOKEN in .env later to rotate it independently.
       MUSIC_BOT_TOKEN: ${MUSIC_BOT_TOKEN:-}
@@ -47,6 +52,10 @@ services:
       - tupi-server
     environment:
       API_DOMAIN: ${API_DOMAIN:?set in production env}
+    # LiveKit uses host networking for WebRTC.  Resolve this name to the
+    # Docker host so the reverse proxy can reach LiveKit's signal API.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "80:80"
       - "443:443"
@@ -73,6 +82,16 @@ services:
       - --min-port=49160
       - --max-port=49200
       - --external-ip=${TURN_EXTERNAL_IP:?set the Lightsail static public IP}/${TURN_PRIVATE_IP:?set the Lightsail private IP}
+
+  livekit:
+    image: livekit/livekit-server:v1.9.12
+    restart: unless-stopped
+    command: --config /etc/livekit.yaml
+    network_mode: host
+    volumes:
+      - ./livekit/livekit.yaml:/etc/livekit.yaml:ro
+    depends_on:
+      - tupi-server
 
 volumes:
   attachments_data:

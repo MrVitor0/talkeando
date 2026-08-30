@@ -7,7 +7,7 @@ mod invites;
 pub mod messages;
 mod media;
 mod profile;
-mod turn;
+mod livekit;
 
 use axum::{
     routing::{delete, get, patch, post},
@@ -57,5 +57,6 @@ pub fn router() -> Router<AppState> {
         .route("/api/activity-assets/:id", get(activity_assets::download))
         .route("/api/invites", post(invites::create).get(invites::list))
         .route("/api/invites/:id", delete(invites::revoke))
-        .route("/api/turn-credentials", get(turn::credentials))
+        .route("/api/livekit/token", post(livekit::token))
+        .route("/api/livekit/webhook", post(livekit::webhook))
 }

@@ -11,7 +11,7 @@ use crate::{
     db::{self, Channel, ChannelCategory},
     error::{AppError, AppResult},
     state::AppState,
-    ws::protocol::{CallPeerLeft, ChannelUpdated, OutboundEnvelope},
+    ws::protocol::{ChannelUpdated, OutboundEnvelope},
 };
 
 #[derive(Serialize)]
@@ -285,21 +285,7 @@ pub async fn delete(
     .await?;
     let Some((_id, kind)) = deleted else { return Err(AppError::NotFound); };
     if kind == "voice" {
-        let participants = state.hub.calls.write().await.terminate(channel_id);
-        for departed_user_id in &participants {
-            state.hub.broadcast_to(
-                &participants,
-                OutboundEnvelope::new(
-                    "call.peer_left",
-                    CallPeerLeft {
-                        channel_id,
-                        user_id: *departed_user_id,
-                        reason: "channel_deleted".to_string(),
-                        is_bot: false,
-                    },
-                ),
-            ).await;
-        }
+        state.hub.calls.write().await.clear_channel(channel_id);
     }
     tracing::info!(actor_user_id = %auth.user.id, %channel_id, "channel deleted");
     Ok(StatusCode::NO_CONTENT)

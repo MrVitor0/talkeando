@@ -1,7 +1,4 @@
-use std::{
-    collections::HashSet,
-    time::{Duration, Instant},
-};
+use std::{collections::HashSet, time::{Duration, Instant}};
 
 use axum::{
     extract::{
@@ -111,6 +108,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     user_id,
                     username: user.username.clone(),
                     display_name: user.display_name.clone(),
+                    livekit_url: state.config.livekit_url.clone(),
                 },
             ),
         )
@@ -155,8 +153,6 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         broadcast_presence_update(&state, user_id, "online").await;
     }
 
-    let mut joined_calls: HashSet<Uuid> = HashSet::new();
-
     // Application-level heartbeat: any inbound frame (including the Pong the
     // client sends in reply to our Ping) refreshes `last_seen`; if nothing
     // arrives for HEARTBEAT_TIMEOUT we drop the socket so the disconnect
@@ -177,7 +173,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 last_seen = Instant::now();
                 match msg {
                     Message::Text(text) => {
-                        dispatch(&state, user_id, &text, &mut joined_calls).await;
+                        dispatch(&state, user_id, &text).await;
                     }
                     Message::Ping(payload) => {
                         let _ = state
@@ -208,7 +204,6 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         let _ = forward_task.await;
         return;
     }
-    let channels: Vec<Uuid> = joined_calls.into_iter().collect();
     let disconnect_epoch = state.advance_presence_epoch(user_id).await;
     state.begin_offline_grace(user_id).await;
     let delayed_state = state.clone();
@@ -225,10 +220,6 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         if !delayed_state.finish_offline_grace(user_id).await {
             return;
         }
-        for channel_id in channels {
-            teardown_call_membership(&delayed_state, channel_id, user_id, "disconnected").await;
-        }
-        teardown_spectator_subscriptions(&delayed_state, user_id).await;
         // ACT-FR-006: clear this user's activity in the same grace window,
         // and close any playtime rows left open (ACT-FR-031).
         if delayed_state.hub.activities.write().await.clear(user_id) {
@@ -258,7 +249,6 @@ fn music_bot_user() -> db::User {
         created_at: chrono::Utc::now(),
     }
 }
-
 async fn broadcast_presence_update(state: &AppState, user_id: Uuid, status: &str) {
     match db::related_member_ids(&state.pool, user_id).await {
         Ok(user_ids) => state.hub.broadcast_to(
@@ -357,6 +347,7 @@ async fn enrich_playtime(state: &AppState, user_id: Uuid, activities: &mut [Acti
     }
 }
 
+/* Removed mesh call teardown and spectator subscriptions.
 async fn teardown_call_membership(
     state: &AppState,
     channel_id: Uuid,
@@ -399,22 +390,20 @@ async fn teardown_call_membership(
         .await;
     }
 
-    // The audio source lives on the DJ's client. If that client goes away,
-    // remove the virtual bot too rather than leaving a misleading presence.
-    let dj_left = {
-        let mut djs = state.hub.music_djs.write().await;
-        if djs.get(&channel_id).copied() == Some(user_id) { djs.remove(&channel_id); true } else { false }
-    };
-    if dj_left && state.hub.calls.read().await.is_participant(channel_id, MUSIC_BOT_ID) {
-        state.hub.send_to(MUSIC_BOT_ID, OutboundEnvelope::new(
-            "music.command",
-            serde_json::json!({ "command": "stop", "voice_channel_id": channel_id, "reason": "dj_left" }),
-        )).await;
-        state.hub.calls.write().await.leave(channel_id, MUSIC_BOT_ID);
-        let recipients = state.hub.calls.read().await.participant_ids(channel_id);
-        state.hub.broadcast_to(&recipients, OutboundEnvelope::new("call.peer_left", CallPeerLeft {
-            channel_id, user_id: MUSIC_BOT_ID, reason: "dj_left".into(), is_bot: true,
-        })).await;
+    // Pull the music bot only when the LAST human leaves — playback runs on the
+    // VPS now, not on whoever ran `/play`, so their leaving must not stop the
+    // music for everyone else. (The bot also self-exits on its own idle
+    // timeout as a backstop.)
+    if user_id != MUSIC_BOT_ID {
+        let only_bot_left = remaining == [MUSIC_BOT_ID];
+        if only_bot_left {
+            state.hub.music_djs.write().await.remove(&channel_id);
+            state.hub.send_to(MUSIC_BOT_ID, OutboundEnvelope::new(
+                "music.command",
+                serde_json::json!({ "command": "stop", "voice_channel_id": channel_id, "reason": "empty" }),
+            )).await;
+            state.hub.calls.write().await.leave(channel_id, MUSIC_BOT_ID);
+        }
     }
 
     broadcast_voice_roster(state, channel_id).await;
@@ -441,8 +430,9 @@ async fn teardown_spectator_subscriptions(state: &AppState, user_id: Uuid) {
             .await;
     }
 }
+*/
 
-async fn dispatch(state: &AppState, user_id: Uuid, text: &str, joined_calls: &mut HashSet<Uuid>) {
+async fn dispatch(state: &AppState, user_id: Uuid, text: &str) {
     let env = match serde_json::from_str::<InboundEnvelope>(text) {
         Ok(e) => e,
         Err(e) => {
@@ -540,15 +530,6 @@ async fn dispatch(state: &AppState, user_id: Uuid, text: &str, joined_calls: &mu
                 }
             }
         }
-        "call.join" => {
-            let data: CallJoin = parse_or_reject!(CallJoin);
-            handle_call_join(state, user_id, data, joined_calls).await;
-        }
-        "call.leave" => {
-            let data: CallLeave = parse_or_reject!(CallLeave);
-            joined_calls.remove(&data.channel_id);
-            teardown_call_membership(state, data.channel_id, user_id, "left").await;
-        }
         "call.state.update" => {
             let data: CallStateUpdate = parse_or_reject!(CallStateUpdate);
             handle_call_state_update(state, user_id, data).await;
@@ -560,38 +541,6 @@ async fn dispatch(state: &AppState, user_id: Uuid, text: &str, joined_calls: &mu
         "voice.disconnect_member" => {
             let data: VoiceDisconnectMember = parse_or_reject!(VoiceDisconnectMember);
             handle_voice_disconnect_member(state, user_id, data).await;
-        }
-        "rtc.offer" => {
-            let data: RtcOffer = parse_or_reject!(RtcOffer);
-            relay_rtc(state, user_id, data.channel_id, data.to, "rtc.offer", data).await;
-        }
-        "rtc.answer" => {
-            let data: RtcAnswer = parse_or_reject!(RtcAnswer);
-            relay_rtc(state, user_id, data.channel_id, data.to, "rtc.answer", data).await;
-        }
-        "rtc.ice" => {
-            let data: RtcIce = parse_or_reject!(RtcIce);
-            relay_rtc(state, user_id, data.channel_id, data.to, "rtc.ice", data).await;
-        }
-        "rtc.connection_state" => {
-            let data: RtcConnectionState = parse_or_reject!(RtcConnectionState);
-            tracing::info!(%user_id, to = %data.to, channel_id = %data.channel_id, state = %data.state, "rtc connection state");
-        }
-        "stream.publish" => {
-            let data: StreamPublish = parse_or_reject!(StreamPublish);
-            handle_stream_publish(state, user_id, data).await;
-        }
-        "stream.unpublish" => {
-            let data: StreamUnpublish = parse_or_reject!(StreamUnpublish);
-            handle_stream_unpublish(state, user_id, data).await;
-        }
-        "stream.subscribe" => {
-            let data: StreamSubscribe = parse_or_reject!(StreamSubscribe);
-            handle_stream_subscribe(state, user_id, data).await;
-        }
-        "stream.unsubscribe" => {
-            let data: StreamUnsubscribe = parse_or_reject!(StreamUnsubscribe);
-            handle_stream_unsubscribe(state, user_id, data).await;
         }
         "music.command" => {
             let data: MusicCommand = parse_or_reject!(MusicCommand);
@@ -644,6 +593,7 @@ async fn handle_music_command(state: &AppState, user_id: Uuid, data: MusicComman
         state.hub.send_to(user_id, OutboundEnvelope::error("service_unavailable", "o Tupi Música está iniciando; tente novamente em instantes", None)).await;
         return;
     }
+    /* Removed local-DJ bookkeeping: LiveKit webhook owns room lifecycle.
     // Remember who summoned the bot into this voice channel: teardown_call_
     // membership uses it to yank the bot when that DJ leaves, so a finished
     // session can't strand "Tupi Música" in an empty room.
@@ -655,6 +605,7 @@ async fn handle_music_command(state: &AppState, user_id: Uuid, data: MusicComman
             _ => {}
         }
     }
+    */
     state.hub.send_to(MUSIC_BOT_ID, OutboundEnvelope::new("music.command", serde_json::json!({
         "channel_id": data.channel_id, "voice_channel_id": data.voice_channel_id,
         "command": data.command, "query": data.query, "requested_by": user_id
@@ -1030,6 +981,7 @@ async fn handle_chat_delete(state: &AppState, user_id: Uuid, data: ChatMessageDe
     };
 }
 
+/* Removed mesh call join and peer snapshot flow.
 async fn handle_call_join(
     state: &AppState,
     user_id: Uuid,
@@ -1140,7 +1092,8 @@ async fn handle_call_join(
     broadcast_voice_roster(state, data.channel_id).await;
 }
 
-async fn broadcast_to_community(state: &AppState, community_id: Uuid, event: OutboundEnvelope) {
+*/
+pub(crate) async fn broadcast_to_community(state: &AppState, community_id: Uuid, event: OutboundEnvelope) {
     match db::community_member_ids(&state.pool, community_id).await {
         Ok(user_ids) => state.hub.broadcast_to(&user_ids, event).await,
         Err(error) => tracing::error!(%community_id, %error, "failed to resolve community realtime recipients"),
@@ -1151,7 +1104,7 @@ async fn broadcast_to_community(state: &AppState, community_id: Uuid, event: Out
 /// every member's sidebar stays live — even members who have not joined that
 /// call. Call after any change to a call's membership, mute/deafen state, or
 /// stream set. Sends an empty roster when the call has ended so stale rows clear.
-async fn broadcast_voice_roster(state: &AppState, channel_id: Uuid) {
+pub(crate) async fn broadcast_voice_roster(state: &AppState, channel_id: Uuid) {
     let community_id = match db::channel_community(&state.pool, channel_id).await {
         Ok(Some(community_id)) => community_id,
         Ok(None) => return,
@@ -1331,7 +1284,6 @@ async fn handle_voice_disconnect_member(state: &AppState, actor_id: Uuid, data: 
     if is_bot {
         // Full reset — the bot's `music.command stop` handler stops yt-dlp /
         // ffmpeg / any playlist and leaves the channel.
-        state.hub.music_djs.write().await.remove(&data.channel_id);
         state.hub.send_to(MUSIC_BOT_ID, OutboundEnvelope::new(
             "music.command", serde_json::json!({ "command": "stop", "voice_channel_id": data.channel_id, "reason": "disconnected" }),
         )).await;
@@ -1342,12 +1294,15 @@ async fn handle_voice_disconnect_member(state: &AppState, actor_id: Uuid, data: 
         )).await;
     }
 
-    // Remove from the registry now so the roster clears immediately even if
-    // the target's client is slow to react.
-    teardown_call_membership(state, data.channel_id, data.user_id, "disconnected").await;
+    if !is_bot {
+        if let Err(error) = crate::livekit::remove_participant(&state.config, &data.channel_id.to_string(), &data.user_id.to_string()).await {
+            tracing::warn!(%error, target = %data.user_id, "failed to remove LiveKit participant");
+        }
+    }
     tracing::info!(%actor_id, target = %data.user_id, channel_id = %data.channel_id, bot = is_bot, "voice.disconnect_member");
 }
 
+/* Removed mesh RTC relay and stream subscription handlers.
 async fn relay_rtc(
     state: &AppState,
     from: Uuid,
@@ -1585,3 +1540,4 @@ async fn handle_stream_unsubscribe(state: &AppState, user_id: Uuid, data: Stream
             .await;
     }
 }
+*/

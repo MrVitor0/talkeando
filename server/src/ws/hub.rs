@@ -25,8 +25,6 @@ pub struct Hub {
     /// single value `"busy"` (Do Not Disturb). Cleared when the user's last
     /// socket drops, so a reconnect starts back at plain "online".
     statuses: RwLock<HashMap<Uuid, String>>,
-    /// Voice channel -> client currently acting as the local DJ.
-    pub music_djs: RwLock<HashMap<Uuid, Uuid>>,
 }
 
 impl Hub {
@@ -36,7 +34,6 @@ impl Hub {
             calls: RwLock::new(CallRegistry::default()),
             activities: RwLock::new(ActivityRegistry::default()),
             statuses: RwLock::new(HashMap::new()),
-            music_djs: RwLock::new(HashMap::new()),
         }
     }
 

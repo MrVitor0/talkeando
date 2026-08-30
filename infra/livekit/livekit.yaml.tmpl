@@ -1,0 +1,17 @@
+port: 7880
+rtc:
+  tcp_port: 7881
+  port_range_start: 50000
+  port_range_end: 50200
+  use_external_ip: true
+keys:
+  ${LIVEKIT_API_KEY}: ${LIVEKIT_API_SECRET}
+webhook:
+  api_key: ${LIVEKIT_API_KEY}
+  urls:
+    - https://${API_DOMAIN}/api/livekit/webhook
+turn:
+  enabled: false
+room:
+  empty_timeout: 300
+  max_participants: 12

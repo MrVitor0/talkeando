@@ -13,3 +13,7 @@
 
     respond "Talkeando server is running" 200
 }
+
+sfu.{$TALKEANDO_DOMAIN} {
+    reverse_proxy host.docker.internal:7880
+}

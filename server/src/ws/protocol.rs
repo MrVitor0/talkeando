@@ -62,6 +62,8 @@ pub struct AuthOk {
     pub user_id: Uuid,
     pub username: String,
     pub display_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub livekit_url: Option<String>,
 }
 
 // ---- presence.* ----
@@ -269,20 +271,6 @@ pub struct ChatTyping {
 }
 
 // ---- call.* ----
-
-#[derive(Debug, Deserialize)]
-pub struct CallJoin {
-    pub channel_id: Uuid,
-    #[serde(default)]
-    pub muted: bool,
-    #[serde(default)]
-    pub deafened: bool,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct CallLeave {
-    pub channel_id: Uuid,
-}
 
 #[derive(Debug, Deserialize)]
 pub struct CallStateUpdate {

@@ -1361,9 +1361,6 @@ export function App() {
         else next[event.data.user_id] = list;
         return next;
       });
-      if (event.op === "call.snapshot") setCall({ channelId: event.data.channel_id, participants: event.data.participants ?? [] });
-      if (event.op === "call.peer_joined") { if (event.data.channel_id === callChannelIdRef.current && event.data.participant?.user_id !== selfIdRef.current && Date.now() - joinedAtRef.current > 1500) playSound("joinCall"); setCall(current => !current || current.channelId !== event.data.channel_id ? current : { channelId: current.channelId, participants: [...current.participants.filter(participant => participant.user_id !== event.data.participant.user_id), event.data.participant] }); }
-      if (event.op === "call.peer_left") { if (event.data.channel_id === callChannelIdRef.current && event.data.user_id !== selfIdRef.current && Date.now() - joinedAtRef.current > 1500) playSound("leaveCall"); setCall(current => !current || current.channelId !== event.data.channel_id ? current : { channelId: current.channelId, participants: current.participants.filter(participant => participant.user_id !== event.data.user_id) }); }
       if (event.op === "call.state.update") setCall(current => !current || current.channelId !== event.data.channel_id ? current : { channelId: current.channelId, participants: current.participants.map(participant => participant.user_id === event.data.user_id ? { ...participant, muted: event.data.muted, deafened: event.data.deafened } : participant) });
       // The owner dragged us (or we dragged ourselves) into another voice
       // channel — join it, reusing the normal join path.
@@ -1392,29 +1389,13 @@ export function App() {
           return next;
         });
         setVoiceRoomStreams(current => ({ ...current, [channel_id]: roomStreams ?? [] }));
+        if (channel_id === callChannelIdRef.current) {
+          setCall({ channelId: channel_id, participants: participants ?? [] });
+          setStreams(roomStreams ?? []);
+        }
         // If the share we're peeking just disappeared, drop the preview.
         if (peekMetaRef.current && (roomStreams ?? []).every(s => s.stream_id !== peekMetaRef.current!.streamId)) {
           endPeek();
-        }
-      }
-      if (event.op === "call.snapshot") setStreams(event.data.streams ?? []);
-      if (event.op === "stream.published") setStreams(current => [...current.filter(stream => stream.stream_id !== event.data.stream_id), event.data]);
-      if (event.op === "stream.unpublished") setStreams(current => {
-        const removed = current.find(stream => stream.stream_id === event.data.stream_id);
-        if (removed) setWatching(watch => { const next = { ...watch }; delete next[removed.owner]; return next; });
-        return current.filter(stream => stream.stream_id !== event.data.stream_id);
-      });
-      if (event.op === "music.command") {
-        const command: string = event.data.command;
-        const voiceChannelId: string = event.data.voice_channel_id;
-        if (command === "play" && event.data.query) {
-          const streamId = crypto.randomUUID(); musicStreamRef.current = streamId; setMyMusicStreamId(streamId);
-          void rtc.playMusic(voiceChannelId, streamId, event.data.query).catch(error => console.error("[music] play failed", error));
-        } else if (command === "pause") rtc.setMusicPaused(true);
-        else if (command === "resume") rtc.setMusicPaused(false);
-        else if (command === "stop" || command === "skip") {
-          const streamId = musicStreamRef.current;
-          if (streamId) { void rtc.stopMusic(voiceChannelId, streamId); musicStreamRef.current = null; setMyMusicStreamId(null); }
         }
       }
       // The music bot's status cards now arrive as ordinary persisted messages

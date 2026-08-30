@@ -1,6 +1,6 @@
 # Beta em produção
 
-Este compose hospeda a API, o proxy TLS e o TURN. O PostgreSQL fica no Neon.
+Este compose hospeda a API, o proxy TLS, o TURN e o LiveKit SFU. O PostgreSQL fica no Neon.
 
 ## Na VPS
 
@@ -9,7 +9,8 @@ Este compose hospeda a API, o proxy TLS e o TURN. O PostgreSQL fica no Neon.
 3. Copie `.env.production.example` para `.env` e substitua todos os valores de exemplo.
 4. Em deploy manual, copie `music-bot.env.example` para `music-bot.env` e preencha as credenciais dos providers. No deploy automatizado, o GitHub Actions cria esse arquivo com os secrets do environment `production`.
 5. Abra TCP `80`, `443` e `3478`; abra UDP `3478` e `49160-49200` no firewall da AWS e no UFW.
-6. Depois de apontar `API_DOMAIN` e `TURN_DOMAIN` para `TURN_EXTERNAL_IP`, execute:
+6. Depois de apontar `API_DOMAIN`, `TURN_DOMAIN` e `sfu.<API_DOMAIN>` para
+   `TURN_EXTERNAL_IP`, abra `7881/TCP` e `50000-50200/UDP` no firewall e execute:
 
 ```sh
 docker compose -f docker-compose.production.yml up -d --build

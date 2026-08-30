@@ -41,7 +41,6 @@ public sealed class IpcBridge : IDisposable
     private readonly NetworkClient _network;
     private readonly ScreenCapture _screen = new();
     private readonly AudioCapture _audio = new();
-    private readonly MusicPlayback _music = new();
     private readonly ActivityMonitor _activity;
     private readonly UpdateChecker _updater = new();
     private readonly GlobalHotkeyHook _hotkey = new();
@@ -209,19 +208,10 @@ public sealed class IpcBridge : IDisposable
                 // Everything below is a pure relay to the authenticated
                 // WebSocket — the JS RTC engine (client/ui/src/rtc.ts) owns
                 // all of the actual call/screen-share semantics now.
-                case "call.join":
-                case "call.leave":
                 case "call.state.update":
                 case "voice.move_member":
                 case "voice.disconnect_member":
-                case "stream.publish":
-                case "stream.unpublish":
-                case "stream.subscribe":
-                case "stream.unsubscribe":
                 case "music.command":
-                case "rtc.offer":
-                case "rtc.answer":
-                case "rtc.ice":
                 case "chat.message.create":
                 case "chat.message.edit":
                 case "chat.message.delete":
@@ -267,27 +257,18 @@ public sealed class IpcBridge : IDisposable
                     _screen.Stop();
                     _audio.Stop();
                     break;
-                case "music.play":
-                {
-                    var query = RequiredString(root, "query");
-                    _ = _music.PlayAsync(query, pcm =>
-                    {
-                        var slot = (int)((uint)System.Threading.Interlocked.Increment(ref _audioSeq) % (uint)AudioSlotCount);
-                        WriteAudioSlot?.Invoke(pcm, slot);
-                        Publish("music.pcm", new { slot, len = pcm.Length });
-                    }, title => Publish("music.started", new { title }), error => Publish("music.failed", new { message = error }));
-                    break;
-                }
-                case "music.pause": _music.Pause(root.GetProperty("data").TryGetProperty("paused", out var paused) && paused.GetBoolean()); break;
-                case "music.stop": _music.Stop(); break;
                 case "activity.config":
                     _activity.SetEnabled(root.GetProperty("data").GetProperty("enabled").GetBoolean());
                     break;
-                case "rtc.turn_credentials.request":
-                    var requestId = root.GetProperty("data").GetProperty("request_id").GetString();
-                    var turn = await _network.GetTurnCredentialsAsync();
-                    Publish("rtc.turn_credentials", new { request_id = requestId, username = turn.Username, credential = turn.Credential, uris = turn.Uris });
+                case "livekit.token.request":
+                {
+                    var d = root.GetProperty("data");
+                    var requestId = d.GetProperty("request_id").GetString();
+                    var mode = d.TryGetProperty("mode", out var modeValue) ? modeValue.GetString() ?? "participant" : "participant";
+                    var roomToken = await _network.GetLiveKitTokenAsync(d.GetProperty("channel_id").GetGuid(), mode);
+                    Publish("livekit.token", new { request_id = requestId, token = roomToken });
                     break;
+                }
                 case "host.title":
                     HostTitleChanged?.Invoke(this,
                         root.GetProperty("data").TryGetProperty("text", out var titleText)
@@ -500,5 +481,5 @@ public sealed class IpcBridge : IDisposable
         });
     }
 
-    public void Dispose() { _hotkey.Dispose(); _music.Dispose(); _screen.Dispose(); _audio.Dispose(); _activity.Dispose(); }
+    public void Dispose() { _hotkey.Dispose(); _screen.Dispose(); _audio.Dispose(); _activity.Dispose(); }
 }

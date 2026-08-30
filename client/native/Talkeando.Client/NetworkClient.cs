@@ -157,6 +157,20 @@ public sealed class NetworkClient
         );
     }
 
+    /// Mints a LiveKit room token while keeping the session bearer token out
+    /// of the WebView. The UI receives only the short-lived room credential.
+    public async Task<JsonElement> GetLiveKitTokenAsync(Guid channelId, string mode)
+    {
+        using var request = new HttpRequestMessage(HttpMethod.Post, "livekit/token")
+        {
+            Content = new StringContent(JsonSerializer.Serialize(new { channel_id = channelId, mode }), Encoding.UTF8, "application/json"),
+        };
+        AddAuthorization(request);
+        using var response = await _http.SendAsync(request);
+        using var result = await ReadJsonAsync(response);
+        return result.RootElement.Clone();
+    }
+
     public async Task<JsonElement> UploadAttachmentAsync(Guid channelId, string filePath)
     {
         if (!File.Exists(filePath)) throw new FileNotFoundException("Arquivo não encontrado.", filePath);

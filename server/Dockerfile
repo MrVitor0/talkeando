@@ -1,6 +1,20 @@
-FROM rust:1.88-bookworm AS build
+FROM rust:1.88-bookworm AS chef
+RUN cargo install cargo-chef --locked
+
+FROM chef AS planner
 WORKDIR /src
-COPY Cargo.toml Cargo.lock* ./
+COPY Cargo.toml Cargo.lock ./
+COPY migrations ./migrations
+COPY src ./src
+RUN cargo chef prepare --recipe-path recipe.json
+
+FROM chef AS build
+WORKDIR /src
+COPY --from=planner /src/recipe.json recipe.json
+# This layer changes only when Cargo dependencies change. Source-only deploys
+# reuse the expensive compilation of the Rust dependency graph on the VPS.
+RUN cargo chef cook --release --locked --recipe-path recipe.json
+COPY Cargo.toml Cargo.lock ./
 COPY migrations ./migrations
 COPY src ./src
 RUN cargo build --release --locked

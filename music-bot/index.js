@@ -4,13 +4,12 @@
 // carries its own long-lived track spun off that one source (wrtc only feeds a
 // track to a single PC), so changing songs still never renegotiates.
 const WebSocket = require("ws");
-// `wrtc` (node-webrtc) has been unmaintained since 2020 and has no working
+// The former node-webrtc implementation had no working
 // prebuilt binaries for Node >= 16 — on node:18 it crashes the process the
 // first time an RTCPeerConnection / RTCAudioSource is created, which showed
 // up as the bot going offline mid-handshake ("target is not connected") and
-// no audio ever arriving. `@roamhq/wrtc` is the maintained community fork
-// with the same API surface (including `nonstandard.RTCAudioSource`).
-const wrtc = require("@roamhq/wrtc");
+// no audio ever arriving. LiveKit now owns the WebRTC transport.
+const { AudioSource, AudioFrame, LocalAudioTrack, Room, TrackSource } = require("@livekit/rtc-node");
 const { spawn } = require("child_process");
 const crypto = require("crypto");
 const { HttpClient } = require("./src/infrastructure/http-client");
@@ -32,6 +31,8 @@ const { MusicStatusReporter } = require("./src/status/music-status-reporter");
 
 const BOT_ID = "00000000-0000-0000-0000-000000000001";
 const WS_URL = process.env.TUPI_WS_URL || "ws://tupi-server:8080/ws";
+const LIVEKIT_URL = process.env.LIVEKIT_URL || "ws://livekit:7880";
+const API_URL = process.env.TUPI_API_URL || WS_URL.replace(/^ws/, "http").replace(/\/ws$/, "");
 const token = process.env.MUSIC_BOT_TOKEN || process.env.TURN_SHARED_SECRET;
 if (!token) throw new Error("MUSIC_BOT_TOKEN is required");
 
@@ -76,49 +77,40 @@ let publishedStreamId = null;
 // to leave the channel after IDLE_TIMEOUT_MS so it never sits there forever.
 let idleSince = 0;
 let paused = false;
-const peers = new Map();
-const iceRestartTimers = new Map();   // userId -> pending ICE-restart timeout
+let livekitRoom = null;
 
 function send(op, data) { ws?.readyState === WebSocket.OPEN && ws.send(JSON.stringify({ v: 1, op, data })); }
 const statusReporter = new MusicStatusReporter({ send, createId: () => crypto.randomUUID() });
 
 // ------------------------------------------------------------- peer plumbing
-function iceServers() {
-  const expiry = Math.floor(Date.now() / 1000) + 3600;
-  const username = `${expiry}:${BOT_ID}`;
-  const credential = crypto.createHmac("sha1", process.env.TURN_SHARED_SECRET || "").update(username).digest("base64");
-  const turnUris = (process.env.TURN_URIS || "").split(",").map(s => s.trim()).filter(Boolean);
-  const servers = [{ urls: "stun:stun.l.google.com:19302" }];
-  if (turnUris.length) servers.push({ urls: turnUris, username, credential });
-  return servers;
+let audioSource = null;
+function musicSource() { return audioSource || (audioSource = new AudioSource(SAMPLE_RATE, CHANNELS)); }
+async function joinLiveKit(channelId) {
+  if (livekitRoom && voiceChannel === channelId) return;
+  livekitRoom?.disconnect();
+  const response = await fetch(`${API_URL}/api/livekit/token`, { method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: JSON.stringify({ channel_id: channelId }) });
+  if (!response.ok) throw new Error(`LiveKit token request failed (${response.status})`);
+  const credentials = await response.json();
+  const room = new Room();
+  await room.connect(process.env.LIVEKIT_URL || credentials.url || LIVEKIT_URL, credentials.token);
+  await room.localParticipant.publishTrack(LocalAudioTrack.createAudioTrack("music", musicSource()), { source: TrackSource.MICROPHONE, metadata: JSON.stringify({ kind: "music" }) });
+  livekitRoom = room;
 }
 
 // One RTCAudioSource for the process lifetime — every song's PCM is fed into
 // it (see the feeder). Songs come and go through the source; the tracks don't,
 // so changing songs is still free (no addTrack, no renegotiation).
 //
-// One track PER peer, though: `@roamhq/wrtc` only delivers a given
+// The former per-peer track model delivered a given
 // RTCAudioSource track to a single RTCPeerConnection, so a shared track meant
 // exactly one listener heard the music and everyone else got a connected-but-
 // silent transceiver. `createTrack()` can be called any number of times and
 // every track it returns receives the same `onData` frames.
-let audioSource = null;
-function musicSource() {
-  if (!audioSource) {
-    audioSource = new wrtc.nonstandard.RTCAudioSource();
-    log("created the persistent music source");
-  }
-  return audioSource;
-}
-function newMusicTrack() {
-  return musicSource().createTrack();
-}
+function newMusicTrack() { return null; }
 
+/* Removed mesh peer implementation (kept only as migration history).
 async function peer(userId) {
-  if (peers.has(userId)) return peers.get(userId);
-  const pc = new wrtc.RTCPeerConnection({ iceServers: iceServers() }); peers.set(userId, pc);
-  pc.onicecandidate = ({ candidate }) => candidate && send("rtc.ice", { channel_id: voiceChannel, to: userId, candidate: candidate.toJSON() });
-  pc.oniceconnectionstatechange = () => log(`peer ${userId}: iceConnectionState=${pc.iceConnectionState}`);
+  throw new Error(`legacy peer connection requested for ${userId}`);
   pc.onconnectionstatechange = () => {
     log(`peer ${userId}: connectionState=${pc.connectionState}`);
     const pending = iceRestartTimers.get(userId);
@@ -144,13 +136,14 @@ async function restartPeerIce(userId, pc) {
   try {
     const description = await pc.createOffer({ iceRestart: true });
     await pc.setLocalDescription(description);
-    send("rtc.offer", { channel_id: voiceChannel, to: userId, sdp: description.sdp });
+    log(`obsolete direct peer offer suppressed for ${userId}`);
   } catch (error) { log(`ICE restart for ${userId} failed: ${error.message}`); }
 }
 async function offer(userId) {
   const pc = await peer(userId); const description = await pc.createOffer(); await pc.setLocalDescription(description);
-  send("rtc.offer", { channel_id: voiceChannel, to: userId, sdp: description.sdp });
+  log(`obsolete direct peer offer suppressed for ${userId}`);
 }
+*/
 
 // ------------------------------------------------------------------ PCM ring
 // A chunk list rather than one growing Buffer: `Buffer.concat` on every ffmpeg
@@ -185,6 +178,7 @@ let feederTimer = null, nextFrameAt = 0;
 
 function startFeeder() {
   if (feederTimer) return;
+  if (!livekitRoom) return;
   musicSource();
   nextFrameAt = Date.now();
   feederTimer = setTimeout(tick, FRAME_MS);
@@ -211,7 +205,7 @@ function newFrame() {
 function pushFrame(frame) {
   if (!audioSource) return;
   try {
-    audioSource.onData({ samples: frame.samples, sampleRate: SAMPLE_RATE, bitsPerSample: 16, channelCount: CHANNELS, numberOfFrames: FRAME_SAMPLES });
+    void audioSource.captureFrame(new AudioFrame(frame.samples, SAMPLE_RATE, CHANNELS, FRAME_SAMPLES)).catch(error => log(`captureFrame failed: ${error.message}`));
   } catch (error) {
     // Never let a bad frame kill the process — that turned one hiccup into a
     // container restart loop that dropped everyone out of the call.
@@ -674,15 +668,12 @@ async function join(channelId) {
     // at this channel, so `call.peer_joined` for anyone who joined since never
     // reached us and they hear nothing. Re-announcing is a server-side upsert:
     // it hands back a fresh `call.snapshot` that the handler reconciles against.
-    send("call.join", { channel_id: channelId, muted: true, deafened: false });
-    startFeeder();
+    await joinLiveKit(channelId); startFeeder();
     return;
   }
-  if (voiceChannel) send("call.leave", { channel_id: voiceChannel });
-  for (const pc of peers.values()) pc.close(); peers.clear();
-  for (const t of iceRestartTimers.values()) clearTimeout(t); iceRestartTimers.clear();
+  livekitRoom?.disconnect(); livekitRoom = null;
   voiceChannel = channelId;
-  send("call.join", { channel_id: channelId, muted: true, deafened: false });
+  await joinLiveKit(channelId);
   startFeeder();
 }
 function leaveVoice() {
@@ -690,9 +681,7 @@ function leaveVoice() {
   queue.length = 0;
   unpublishCurrent();
   stopFeeder();
-  if (voiceChannel) send("call.leave", { channel_id: voiceChannel });
-  for (const pc of peers.values()) pc.close(); peers.clear();
-  for (const t of iceRestartTimers.values()) clearTimeout(t); iceRestartTimers.clear();
+  livekitRoom?.disconnect(); livekitRoom = null;
   voiceChannel = null;
   paused = false;
   idleSince = 0;
@@ -700,35 +689,44 @@ function leaveVoice() {
 }
 
 async function onEvent(op, data) {
-  if (op === "call.snapshot") {
+  /* Removed mesh event handling.
+  if (op === "legacy.call_snapshot") {
     voiceChannel = data.channel_id;
     startFeeder();
-    // Reconcile against the authoritative roster: drop peers who left, and
-    // (re)offer to everyone we have no healthy connection to. One bad offer
-    // must not stop the rest — that used to leave later participants silent.
+    // Reconcile against the authoritative roster WITHOUT disturbing live
+    // connections: only add peers we're missing and drop peers who left.
+    // A flaky/`disconnected` peer is left to its own ICE-restart timer —
+    // tearing it down here caused audible gaps for that listener.
     const present = new Set((data.participants || []).filter(p => !p.is_bot && p.user_id !== BOT_ID).map(p => p.user_id));
     for (const uid of [...peers.keys()]) {
-      if (!present.has(uid)) { peers.get(uid)?.close(); peers.delete(uid); }
+      if (present.has(uid)) continue;
+      peers.get(uid)?.close(); peers.delete(uid);
+      const t = iceRestartTimers.get(uid); if (t) { clearTimeout(t); iceRestartTimers.delete(uid); }
     }
     for (const uid of present) {
-      const pc = peers.get(uid);
-      if (pc && !["failed", "closed", "disconnected"].includes(pc.connectionState)) continue;
-      if (pc) { pc.close(); peers.delete(uid); }
+      if (peers.has(uid)) continue;
       try { await offer(uid); } catch (error) { log(`offer to ${uid} failed: ${error.message}`); }
     }
-  } else if (op === "call.peer_joined" && data.participant?.user_id !== BOT_ID && !data.participant?.is_bot) {
-    try { await offer(data.participant.user_id); }
-    catch (error) { log(`offer to ${data.participant.user_id} failed: ${error.message}`); }
+  } else if (op === "legacy.call_peer_joined" && data.participant?.user_id !== BOT_ID && !data.participant?.is_bot) {
+    const uid = data.participant.user_id;
+    const pc = peers.get(uid);
+    // Already connected/connecting — a duplicate join event, leave it alone.
+    if (pc && pc.connectionState !== "failed" && pc.connectionState !== "closed") return;
+    if (pc) { pc.close(); peers.delete(uid); }
+    try { await offer(uid); } catch (error) { log(`offer to ${uid} failed: ${error.message}`); }
   }
-  else if (op === "call.peer_left") { peers.get(data.user_id)?.close(); peers.delete(data.user_id); const t = iceRestartTimers.get(data.user_id); if (t) { clearTimeout(t); iceRestartTimers.delete(data.user_id); } }
-  else if (op === "rtc.offer") { const pc = await peer(data.from); await pc.setRemoteDescription({ type: "offer", sdp: data.sdp }); const answer = await pc.createAnswer(); await pc.setLocalDescription(answer); send("rtc.answer", { channel_id: voiceChannel, to: data.from, sdp: answer.sdp }); }
-  else if (op === "rtc.answer") { const pc = peers.get(data.from); if (pc) await pc.setRemoteDescription({ type: "answer", sdp: data.sdp }); }
-  else if (op === "rtc.ice") { const pc = await peer(data.from); await pc.addIceCandidate(data.candidate); }
-  else if (op === "music.command") {
+  else if (op === "legacy.call_peer_left") { /* LiveKit owns room membership. */ }
+  */
+  if (op === "music.command") {
     log(`music.command: ${data.command} ${JSON.stringify(data.query ?? "")}`);
     try {
       if (data.command === "play") {
-        await join(data.voice_channel_id);
+        // Only (re)join when the channel actually changes. Re-announcing on
+        // every /play made the server re-broadcast our join and re-send a
+        // snapshot, which churned peer connections mid-playback. A real
+        // reconnect is handled by the auth.ok handler instead.
+        if (voiceChannel !== data.voice_channel_id) await join(data.voice_channel_id);
+        else startFeeder();
         await enqueue(data.query, { channelId: data.channel_id, requestedBy: data.requested_by });
       } else if (data.command === "pause") {
         if (current && !paused) {

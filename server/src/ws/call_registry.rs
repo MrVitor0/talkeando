@@ -75,6 +75,38 @@ pub enum CallOpError {
 }
 
 impl CallRegistry {
+    /// Applies the authoritative participant lifecycle delivered by LiveKit.
+    /// Websocket clients no longer mutate call membership directly.
+    pub fn apply_participant(&mut self, channel_id: ChannelId, user_id: UserId, joined: bool) {
+        if joined {
+            let is_bot = user_id == Uuid::from_u128(1);
+            self.calls.entry(channel_id).or_default().participants.entry(user_id).or_insert(ParticipantState { user_id, muted: is_bot, deafened: false, is_bot });
+        } else {
+            self.leave(channel_id, user_id);
+        }
+    }
+
+    /// Tracks only whether a participant currently publishes camera/screen
+    /// media. Track identities remain owned by LiveKit and are not mirrored.
+    pub fn apply_track(&mut self, channel_id: ChannelId, user_id: UserId, source: &str, published: bool) {
+        let Some(call) = self.calls.get_mut(&channel_id) else { return; };
+        let kind = match source.to_ascii_lowercase().as_str() {
+            "screen_share" | "screen_share_audio" => "screen",
+            "camera" => "camera",
+            _ => return,
+        };
+        if published {
+            if !call.streams.values().any(|stream| stream.owner == user_id && stream.kind == kind) {
+                let id = Uuid::new_v4();
+                call.streams.insert(id, PublishedStream { id, owner: user_id, kind: kind.into(), label: None, has_audio: source.eq_ignore_ascii_case("screen_share_audio"), msid: None, viewers: HashSet::new() });
+            }
+        } else {
+            let ids: Vec<_> = call.streams.iter().filter(|(_, stream)| stream.owner == user_id && stream.kind == kind).map(|(id, _)| *id).collect();
+            for id in ids { call.streams.remove(&id); }
+        }
+    }
+
+    pub fn clear_channel(&mut self, channel_id: ChannelId) { self.calls.remove(&channel_id); }
     pub fn join(
         &mut self,
         channel_id: ChannelId,

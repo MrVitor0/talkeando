@@ -5,7 +5,7 @@
 [![Rust](https://img.shields.io/badge/backend-Rust%20%7C%20Axum-orange.svg)](https://www.rust-lang.org/)
 [![React](https://img.shields.io/badge/frontend-React%20%7C%20TypeScript-blue.svg)](https://reactjs.org/)
 [![.NET](https://img.shields.io/badge/desktop-.NET%206%20WPF-purple.svg)](https://dotnet.microsoft.com/)
-[![WebRTC](https://img.shields.io/badge/media-WebRTC%20Mesh-green.svg)](https://webrtc.org/)
+[![LiveKit](https://img.shields.io/badge/media-WebRTC%20SFU%20(LiveKit)-green.svg)](https://livekit.io/)
 [![License](https://img.shields.io/badge/license-MIT-informational.svg)](LICENSE)
 
 Talkeando is a modern, privacy-focused, Discord-inspired community platform designed for high fidelity, ultra-low latency communication. It combines a blazing fast Rust backend, an interactive React frontend, and a native Windows desktop client with native game capture, AI noise reduction, push-to-talk, and an integrated YouTube music bot.
@@ -14,7 +14,7 @@ Talkeando is a modern, privacy-focused, Discord-inspired community platform desi
 
 ## ✨ Features
 
-- 🎙️ **Ultra-Low Latency Voice Chat**: Peer-to-peer WebRTC audio mesh with RNNoise ML noise suppression and automatic gain control.
+- 🎙️ **Ultra-Low Latency Voice Chat**: LiveKit SFU voice with RNNoise ML noise suppression and automatic gain control.
 - ⌨️ **Push-to-Talk (PTT) & Voice Modes**: Switch between Voice Activity, Push-to-Talk (with custom keybindings and silent operation), or Toggle mode.
 - 🖥️ **Fullscreen Game & Screen Sharing**: High-FPS screen capture (including borderless/fullscreen games) with dedicated system loopback audio.
 - 📹 **Live Webcams & Video Stages**: Synchronized video tiles with camera previews and device selectors.
@@ -133,7 +133,8 @@ docker compose -f docker-compose.production.yml up -d --build
 Services included:
 - `tupi-server`: Production Rust backend binary.
 - `tupi-music-bot`: Containerized music bot with `yt-dlp` and `ffmpeg`.
-- `coturn`: TURN/STUN server for WebRTC NAT traversal.
+- `livekit`: self-hosted SFU for voice, camera, screen sharing, and music.
+- `coturn`: TURN/STUN server for NAT traversal (relay range 49160-49200; LiveKit uses 50000-50200).
 
 ---
 

@@ -154,18 +154,36 @@ jobs:
       - name: Upload and apply release
         env:
           DEPLOY_HOST: ${{ secrets.LIGHTSAIL_HOST }}
+          LIVEKIT_API_KEY: ${{ secrets.LIVEKIT_API_KEY }}
+          LIVEKIT_API_SECRET: ${{ secrets.LIVEKIT_API_SECRET }}
+          LIVEKIT_URL: ${{ secrets.LIVEKIT_URL }}
+          API_DOMAIN: ${{ secrets.API_DOMAIN }}
         run: |
+          test -n "$LIVEKIT_API_KEY" && test -n "$LIVEKIT_API_SECRET" && test -n "$LIVEKIT_URL"
+          export LIVEKIT_API_KEY LIVEKIT_API_SECRET API_DOMAIN
+          envsubst < infra/livekit/livekit.yaml.tmpl | ssh -i ~/.ssh/talkeando-production "ubuntu@$DEPLOY_HOST" 'set -eu; install -d -m 755 /opt/talkeando/infra/livekit; umask 077; cat > /opt/talkeando/infra/livekit/livekit.yaml'
+          {
+            printf 'LIVEKIT_URL=%s\n' "$LIVEKIT_URL"
+            printf 'LIVEKIT_API_KEY=%s\n' "$LIVEKIT_API_KEY"
+            printf 'LIVEKIT_API_SECRET=%s\n' "$LIVEKIT_API_SECRET"
+            printf 'API_DOMAIN=%s\n' "$API_DOMAIN"
+          } | ssh -i ~/.ssh/talkeando-production "ubuntu@$DEPLOY_HOST" 'set -eu; umask 077; cat > /opt/talkeando/infra/livekit.env'
           tar -czf - \
             --exclude='server/target' \
+            --exclude='music-bot/node_modules' \
             --exclude='infra/.env' \
             server \
             music-bot \
             infra/Caddyfile \
+            infra/livekit \
             infra/docker-compose.production.yml \
           | ssh -i ~/.ssh/talkeando-production "ubuntu@$DEPLOY_HOST" '
               set -eu
               tar -xzf - -C /opt/talkeando
               cd /opt/talkeando/infra
+              set -a
+              . ./livekit.env
+              set +a
               docker compose -f docker-compose.production.yml up -d --build --remove-orphans
               # `up` does not recreate caddy when only the bind-mounted Caddyfile
               # changed (compose hashes the service def, not the file contents),

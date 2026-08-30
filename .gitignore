@@ -8,6 +8,8 @@ client/native/**/obj/
 
 # Node / Vite
 client/ui/node_modules/
+music-bot/node_modules/
+infra/livekit.env
 client/ui/dist/
 
 # Env files with real secrets (see .env.example templates)

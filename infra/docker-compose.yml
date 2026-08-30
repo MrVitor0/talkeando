@@ -31,5 +31,16 @@ services:
       - ./coturn/turnserver.conf:/etc/coturn/turnserver.conf:ro
     command: ["-c", "/etc/coturn/turnserver.conf"]
 
+  livekit:
+    image: livekit/livekit-server:v1.9.12
+    restart: unless-stopped
+    command: --config /etc/livekit.yaml
+    ports:
+      - "7880:7880"
+      - "7881:7881"
+      - "50000-50200:50000-50200/udp"
+    volumes:
+      - ./livekit/livekit.dev.yaml:/etc/livekit.yaml:ro
+
 volumes:
   talkeando_pg_data:
