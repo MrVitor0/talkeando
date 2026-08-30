@@ -506,7 +506,12 @@ function beginStream(meta, attempt = 0) {
     // there and keep the opus-preferring selector for YouTube.
     const format = meta.provider === "youtube"
       ? AUDIO_FORMAT
-      : "bestaudio[protocol^=http]/bestaudio[protocol^=https]/bestaudio/best";
+      // SoundCloud exposes licensed excerpts as format ids such as
+      // `http_mp3_1_0_preview`. A preview is not a playable song: do not
+      // silently fall back to it, even if it is the only audio format. This
+      // makes yt-dlp fail cleanly so the provider chain can try Audius (or
+      // report that no complete source exists).
+      : "bestaudio[format_id!*=preview][protocol^=http]/bestaudio[format_id!*=preview]";
     yt = spawn("yt-dlp", [...mediaArgs(meta.provider, clients), "-f", format, "-o", "-", meta.url], { stdio: ["ignore", "pipe", "pipe"] });
     ffmpeg = spawn("ffmpeg", [
       "-hide_banner", "-loglevel", "warning", "-nostdin",
