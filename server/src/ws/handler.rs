@@ -577,6 +577,31 @@ async fn dispatch(
                 evict_voice_participant(state, data.channel_id, user_id).await;
             }
         }
+        "voice.track.published" => {
+            let data: VoiceTrack = parse_or_reject!(VoiceTrack);
+            // Only a participant of the channel can announce a share into it.
+            if joined_calls.contains(&data.channel_id) {
+                state.hub.calls.write().await.apply_track(
+                    data.channel_id,
+                    user_id,
+                    &data.source,
+                    true,
+                    data.track_sid,
+                );
+                broadcast_voice_roster(state, data.channel_id).await;
+            }
+        }
+        "voice.track.unpublished" => {
+            let data: VoiceTrack = parse_or_reject!(VoiceTrack);
+            state.hub.calls.write().await.apply_track(
+                data.channel_id,
+                user_id,
+                &data.source,
+                false,
+                data.track_sid,
+            );
+            broadcast_voice_roster(state, data.channel_id).await;
+        }
         "call.state.update" => {
             let data: CallStateUpdate = parse_or_reject!(CallStateUpdate);
             handle_call_state_update(state, user_id, data).await;

@@ -86,23 +86,52 @@ impl CallRegistry {
         }
     }
 
-    /// Tracks only whether a participant currently publishes camera/screen
-    /// media. Track identities remain owned by LiveKit and are not mirrored.
-    pub fn apply_track(&mut self, channel_id: ChannelId, user_id: UserId, source: &str, published: bool) {
+    /// Reflects a participant's camera / screen publications so the community
+    /// roster can show who is sharing. Track *media* stays owned by LiveKit;
+    /// this only mirrors existence + the publication sid (`msid`) the client
+    /// needs to tell a peer's camera feed apart from their screen feed.
+    ///
+    /// `screen_share_audio` is not its own row — it rides on the screen row as
+    /// `has_audio`, and may arrive before or after the screen video publish.
+    pub fn apply_track(
+        &mut self,
+        channel_id: ChannelId,
+        user_id: UserId,
+        source: &str,
+        published: bool,
+        track_sid: Option<String>,
+    ) {
         let Some(call) = self.calls.get_mut(&channel_id) else { return; };
-        let kind = match source.to_ascii_lowercase().as_str() {
+        let src = source.to_ascii_lowercase();
+        let is_screen_audio = src == "screen_share_audio";
+        let kind = match src.as_str() {
             "screen_share" | "screen_share_audio" => "screen",
             "camera" => "camera",
             _ => return,
         };
-        if published {
-            if !call.streams.values().any(|stream| stream.owner == user_id && stream.kind == kind) {
+        let existing = call
+            .streams
+            .values_mut()
+            .find(|stream| stream.owner == user_id && stream.kind == kind);
+        match (published, is_screen_audio, existing) {
+            (true, true, Some(stream)) => stream.has_audio = true,
+            (true, true, None) => {
                 let id = Uuid::new_v4();
-                call.streams.insert(id, PublishedStream { id, owner: user_id, kind: kind.into(), label: None, has_audio: source.eq_ignore_ascii_case("screen_share_audio"), msid: None, viewers: HashSet::new() });
+                call.streams.insert(id, PublishedStream { id, owner: user_id, kind: "screen".into(), label: None, has_audio: true, msid: None, viewers: HashSet::new() });
             }
-        } else {
-            let ids: Vec<_> = call.streams.iter().filter(|(_, stream)| stream.owner == user_id && stream.kind == kind).map(|(id, _)| *id).collect();
-            for id in ids { call.streams.remove(&id); }
+            (true, false, Some(stream)) => {
+                if stream.msid.is_none() { stream.msid = track_sid; }
+            }
+            (true, false, None) => {
+                let id = Uuid::new_v4();
+                call.streams.insert(id, PublishedStream { id, owner: user_id, kind: kind.into(), label: None, has_audio: false, msid: track_sid, viewers: HashSet::new() });
+            }
+            (false, true, Some(stream)) => stream.has_audio = false,
+            (false, true, None) => {}
+            (false, false, _) => {
+                let ids: Vec<_> = call.streams.iter().filter(|(_, stream)| stream.owner == user_id && stream.kind == kind).map(|(id, _)| *id).collect();
+                for id in ids { call.streams.remove(&id); }
+            }
         }
     }
 

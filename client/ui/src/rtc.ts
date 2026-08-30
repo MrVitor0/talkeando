@@ -101,6 +101,19 @@ function bind(room: Room) {
   });
 }
 
+// Tell the server about a local camera/screen publication so every other
+// member's sidebar learns who is sharing — the server no longer waits on
+// LiveKit's `track_*` webhooks for this. `source` matches LiveKit's names:
+// "camera" | "screen_share" | "screen_share_audio".
+function reportTrack(published: boolean, source: string, trackSid?: string) {
+  if (!presentChannelId) return;
+  send(published ? "voice.track.published" : "voice.track.unpublished", {
+    channel_id: presentChannelId,
+    source,
+    track_sid: trackSid ?? null,
+  });
+}
+
 export function init(_: string) {}
 export async function joinCall(id: string, isMuted: boolean, _: boolean) {
   active?.disconnect(); active = null;
@@ -135,17 +148,33 @@ export async function startCamera(_: string, __: string, deviceId?: string) {
   await active.localParticipant.setCameraEnabled(true, { deviceId, resolution: { width: 1280, height: 720 } });
   const publication = [...active.localParticipant.videoTrackPublications.values()].find(item => item.source === Track.Source.Camera);
   cameras.forEach(listener => listener(publication?.track ? new MediaStream([publication.track.mediaStreamTrack]) : null));
+  if (publication) reportTrack(true, "camera", publication.trackSid);
 }
-export async function stopCamera(_: string, __: string) { await active?.localParticipant.setCameraEnabled(false); cameras.forEach(listener => listener(null)); }
+export async function stopCamera(_: string, __: string) {
+  const trackSid = active
+    ? [...active.localParticipant.videoTrackPublications.values()].find(item => item.source === Track.Source.Camera)?.trackSid
+    : undefined;
+  await active?.localParticipant.setCameraEnabled(false);
+  cameras.forEach(listener => listener(null));
+  reportTrack(false, "camera", trackSid);
+}
 export async function switchCamera(deviceId: string) { await stopCamera("", ""); await startCamera("", "", deviceId); }
 export function onLocalCamera(listener: (stream: MediaStream | null) => void) { cameras.add(listener); return () => { cameras.delete(listener); }; }
 export async function publishScreen(_: string, __: string, source: string, height: number, fps: number, withAudio: boolean) {
   if (!active) return;
   screenSource = source; screenAudioEnabled = withAudio; screen = startNativeScreen(source, height, fps, withAudio);
-  for (const track of screen.getTracks()) await active.localParticipant.publishTrack(track, { source: track.kind === "audio" ? Track.Source.ScreenShareAudio : Track.Source.ScreenShare, simulcast: track.kind === "video" });
+  for (const track of screen.getTracks()) {
+    const isAudio = track.kind === "audio";
+    const publication = await active.localParticipant.publishTrack(track, { source: isAudio ? Track.Source.ScreenShareAudio : Track.Source.ScreenShare, simulcast: !isAudio });
+    reportTrack(true, isAudio ? "screen_share_audio" : "screen_share", publication?.trackSid);
+  }
 }
 export async function unpublishScreen(_: string, __: string) {
-  if (active) for (const publication of active.localParticipant.trackPublications.values()) if ((publication.source === Track.Source.ScreenShare || publication.source === Track.Source.ScreenShareAudio) && publication.track) await active.localParticipant.unpublishTrack(publication.track);
+  if (active) for (const publication of active.localParticipant.trackPublications.values()) if ((publication.source === Track.Source.ScreenShare || publication.source === Track.Source.ScreenShareAudio) && publication.track) {
+    const isAudio = publication.source === Track.Source.ScreenShareAudio;
+    await active.localParticipant.unpublishTrack(publication.track);
+    reportTrack(false, isAudio ? "screen_share_audio" : "screen_share", publication.trackSid);
+  }
   stopNativeScreen(); screen?.getTracks().forEach(track => track.stop()); screen = null;
 }
 export function reconfigureScreen(height: number, fps: number) { reconfigureNativeScreen(screenSource, height, fps, screenAudioEnabled); }

@@ -211,6 +211,8 @@ public sealed class IpcBridge : IDisposable
                 case "call.state.update":
                 case "voice.presence.enter":
                 case "voice.presence.leave":
+                case "voice.track.published":
+                case "voice.track.unpublished":
                 case "voice.move_member":
                 case "voice.disconnect_member":
                 case "music.command":

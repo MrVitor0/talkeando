@@ -43,7 +43,7 @@ pub struct Room { pub name: String }
 #[derive(Debug, Deserialize)]
 pub struct Participant { pub identity: String }
 #[derive(Debug, Deserialize)]
-pub struct Track { pub source: String }
+pub struct Track { pub source: String, #[serde(default)] pub sid: Option<String> }
 
 #[derive(Deserialize)]
 struct WebhookClaims { iss: String, sha256: String }

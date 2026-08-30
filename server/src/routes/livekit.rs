@@ -45,8 +45,8 @@ pub async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: St
     match event.event.as_str() {
         "participant_joined" => if let Some(user) = participant { state.hub.calls.write().await.apply_participant(room, user, true); broadcast_voice_roster(&state, room).await; },
         "participant_left" => if let Some(user) = participant { state.hub.calls.write().await.apply_participant(room, user, false); let only_bot = { let calls = state.hub.calls.read().await; calls.participant_ids(room) == vec![MUSIC_BOT_ID] }; if only_bot { state.hub.send_to(MUSIC_BOT_ID, OutboundEnvelope::new("music.command", serde_json::json!({"command":"stop","voice_channel_id":room,"reason":"empty"}))).await; let _ = livekit::remove_participant(&state.config, &room.to_string(), &MUSIC_BOT_ID.to_string()).await; } broadcast_voice_roster(&state, room).await; },
-        "track_published" => if let (Some(user), Some(track)) = (participant, event.track) { state.hub.calls.write().await.apply_track(room, user, &track.source, true); broadcast_voice_roster(&state, room).await; },
-        "track_unpublished" => if let (Some(user), Some(track)) = (participant, event.track) { state.hub.calls.write().await.apply_track(room, user, &track.source, false); broadcast_voice_roster(&state, room).await; },
+        "track_published" => if let (Some(user), Some(track)) = (participant, event.track) { state.hub.calls.write().await.apply_track(room, user, &track.source, true, track.sid.clone()); broadcast_voice_roster(&state, room).await; },
+        "track_unpublished" => if let (Some(user), Some(track)) = (participant, event.track) { state.hub.calls.write().await.apply_track(room, user, &track.source, false, track.sid.clone()); broadcast_voice_roster(&state, room).await; },
         "room_finished" => { state.hub.calls.write().await.clear_channel(room); state.hub.send_to(MUSIC_BOT_ID, OutboundEnvelope::new("music.command", serde_json::json!({"command":"stop","voice_channel_id":room,"reason":"room_finished"}))).await; broadcast_voice_roster(&state, room).await; },
         _ => {}
     }

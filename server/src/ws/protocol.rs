@@ -289,6 +289,21 @@ pub struct VoicePresence {
     pub channel_id: Uuid,
 }
 
+/// Inbound `voice.track.published` / `voice.track.unpublished` — the client
+/// reporting that it just (un)published a camera or screen track to LiveKit.
+/// This is what tells every other member's sidebar who is sharing, without
+/// depending on LiveKit's `track_*` webhooks landing. `track_sid` is LiveKit's
+/// publication sid; the client keys a peer's camera feed vs their screen feed
+/// off it.
+#[derive(Debug, Deserialize)]
+pub struct VoiceTrack {
+    pub channel_id: Uuid,
+    /// `"camera"`, `"screen_share"`, or `"screen_share_audio"`.
+    pub source: String,
+    #[serde(default)]
+    pub track_sid: Option<String>,
+}
+
 /// Inbound `voice.move_member` — a community owner dragging another member's
 /// row onto a different voice channel in the sidebar. The server only tells
 /// the target to move; the target's own client performs the `call.join`, so
