@@ -12,3 +12,6 @@ assert.ok(track, "one named music track can be created from the PCM source");
 assert.ok(new Room(), "SDK can create a room before connecting");
 void track.close(true);
 console.log("music-bot LiveKit adapter contract checks passed");
+// rtc-node owns native worker handles even without a connection. This is an
+// offline contract test, so terminate once every assertion has run.
+process.exit(0);
