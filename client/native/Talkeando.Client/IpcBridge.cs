@@ -65,11 +65,17 @@ public sealed class IpcBridge : IDisposable
 
     public async void HandleWebMessage(object? sender, CoreWebView2WebMessageReceivedEventArgs args)
     {
+        string? op = null;
+        string? requestId = null;
         try
         {
             using var document = JsonDocument.Parse(args.WebMessageAsJson);
             var root = document.RootElement;
-            var op = root.GetProperty("op").GetString();
+            op = root.GetProperty("op").GetString();
+            if (op == "chat.message.create"
+                && root.TryGetProperty("data", out var requestData)
+                && requestData.TryGetProperty("req_id", out var request))
+                requestId = request.GetString();
             switch (op)
             {
                 case "auth.session.restore":
@@ -267,12 +273,12 @@ public sealed class IpcBridge : IDisposable
                 case "livekit.token.request":
                 {
                     var d = root.GetProperty("data");
-                    var requestId = d.GetProperty("request_id").GetString();
+                    var tokenRequestId = d.GetProperty("request_id").GetString();
                     var mode = d.TryGetProperty("mode", out var modeValue) ? modeValue.GetString() ?? "participant" : "participant";
                     var roomToken = await _network.GetLiveKitTokenAsync(d.GetProperty("channel_id").GetGuid(), mode);
                     Publish("livekit.token", new
                     {
-                        request_id = requestId,
+                        request_id = tokenRequestId,
                         url = roomToken.GetProperty("url").GetString(),
                         access_token = roomToken.GetProperty("token").GetString(),
                     });
@@ -339,7 +345,7 @@ public sealed class IpcBridge : IDisposable
         catch (Exception exception)
         {
             DebugLog.Write($"FAILED: {exception}");
-            Publish("error", new { code = "ipc_request_failed", message = exception.Message });
+            Publish("error", new { code = "ipc_request_failed", message = exception.Message, in_reply_to = requestId });
         }
     }
 

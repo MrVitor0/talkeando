@@ -68,11 +68,139 @@ pub fn verify_webhook(cfg: &Config, auth_header: &str, body: &str) -> Result<Web
     Ok(serde_json::from_str(body)?)
 }
 
+fn http_base(cfg: &Config) -> Result<String> {
+    Ok(cfg
+        .livekit_url
+        .as_deref()
+        .ok_or_else(|| anyhow!("LiveKit URL is not configured"))?
+        .replace("wss://", "https://")
+        .replace("ws://", "http://"))
+}
+
+/// Signs a short-lived RoomService admin JWT. The `video` grant differs per
+/// call — `roomList` for ListRooms, `roomAdmin` + `room` for the room-scoped
+/// endpoints (ListParticipants, RemoveParticipant).
+fn admin_token(cfg: &Config, video_grant: serde_json::Value) -> Result<String> {
+    let (key, secret) = credentials(cfg)?;
+    let now = Utc::now();
+    let claims = serde_json::json!({
+        "iss": key,
+        "sub": "tupi-server",
+        "nbf": now.timestamp(),
+        "exp": (now + Duration::seconds(60)).timestamp(),
+        "video": video_grant,
+    });
+    let header = URL_SAFE_NO_PAD.encode(r#"{"alg":"HS256","typ":"JWT"}"#);
+    let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims)?);
+    let signing_input = format!("{header}.{payload}");
+    let mut mac = Hmac::<Sha256>::new_from_slice(secret.as_bytes())?;
+    mac.update(signing_input.as_bytes());
+    Ok(format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes())))
+}
+
 pub async fn remove_participant(cfg: &Config, room: &str, identity: &str) -> Result<()> {
-    let (key, _) = credentials(cfg)?;
-    let base = cfg.livekit_url.as_deref().ok_or_else(|| anyhow!("LiveKit URL is not configured"))?.replace("wss://", "https://").replace("ws://", "http://");
-    let token = access_token(cfg, key, "server", room, Mode::Participant, serde_json::json!({}))?;
+    let base = http_base(cfg)?;
+    let token = admin_token(cfg, serde_json::json!({ "roomAdmin": true, "room": room }))?;
     let response = reqwest::Client::new().post(format!("{base}/twirp/livekit.RoomService/RemoveParticipant")).bearer_auth(token).json(&serde_json::json!({"room": room, "identity": identity})).send().await?;
     if !response.status().is_success() { return Err(anyhow!("LiveKit RemoveParticipant failed: {}", response.status())); }
     Ok(())
+}
+
+/// One participant as LiveKit currently sees them, reduced to the fields the
+/// call registry mirrors: identity plus the publication sids for their camera
+/// and screen tracks (screen audio is a boolean that rides on the screen row).
+#[derive(Debug, Clone)]
+pub struct RoomParticipant {
+    pub identity: String,
+    pub camera_sid: Option<String>,
+    pub screen_sid: Option<String>,
+    pub has_screen_audio: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct ListRoomsResponse {
+    #[serde(default)]
+    rooms: Vec<RoomInfo>,
+}
+#[derive(Debug, Deserialize)]
+struct RoomInfo {
+    name: String,
+}
+#[derive(Debug, Deserialize)]
+struct ListParticipantsResponse {
+    #[serde(default)]
+    participants: Vec<ParticipantInfo>,
+}
+#[derive(Debug, Deserialize)]
+struct ParticipantInfo {
+    identity: String,
+    #[serde(default)]
+    state: Option<String>,
+    #[serde(default)]
+    tracks: Vec<TrackInfo>,
+}
+#[derive(Debug, Deserialize)]
+struct TrackInfo {
+    sid: String,
+    #[serde(default)]
+    source: Option<String>,
+}
+
+/// Authoritative snapshot of every live room and its non-disconnected
+/// participants. Used to rebuild the ephemeral call registry after a server
+/// restart or a dropped webhook — LiveKit never replays `participant_joined`
+/// for members already in a room, so this is the only way that state comes
+/// back without waiting on each client to re-announce itself.
+pub async fn room_snapshot(cfg: &Config) -> Result<Vec<(String, Vec<RoomParticipant>)>> {
+    let base = http_base(cfg)?;
+    let client = reqwest::Client::new();
+
+    let rooms_token = admin_token(cfg, serde_json::json!({ "roomList": true }))?;
+    let rooms: ListRoomsResponse = client
+        .post(format!("{base}/twirp/livekit.RoomService/ListRooms"))
+        .bearer_auth(rooms_token)
+        .json(&serde_json::json!({}))
+        .send()
+        .await?
+        .error_for_status()?
+        .json()
+        .await?;
+
+    let mut out = Vec::with_capacity(rooms.rooms.len());
+    for room in rooms.rooms {
+        let token = admin_token(cfg, serde_json::json!({ "roomAdmin": true, "room": room.name }))?;
+        let response: ListParticipantsResponse = client
+            .post(format!("{base}/twirp/livekit.RoomService/ListParticipants"))
+            .bearer_auth(token)
+            .json(&serde_json::json!({ "room": room.name }))
+            .send()
+            .await?
+            .error_for_status()?
+            .json()
+            .await?;
+        let participants = response
+            .participants
+            .into_iter()
+            .filter(|p| p.state.as_deref() != Some("DISCONNECTED"))
+            .map(|p| {
+                let mut mapped = RoomParticipant {
+                    identity: p.identity,
+                    camera_sid: None,
+                    screen_sid: None,
+                    has_screen_audio: false,
+                };
+                for track in p.tracks {
+                    match track.source.as_deref().map(str::to_ascii_uppercase).as_deref() {
+                        Some("CAMERA") => mapped.camera_sid = Some(track.sid),
+                        Some("SCREEN_SHARE") => mapped.screen_sid = Some(track.sid),
+                        Some("SCREEN_SHARE_AUDIO") => mapped.has_screen_audio = true,
+                        _ => {}
+                    }
+                }
+                mapped
+            })
+            .collect();
+        out.push((room.name, participants));
+    }
+    Ok(out)
 }

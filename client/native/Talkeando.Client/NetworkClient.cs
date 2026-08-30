@@ -21,10 +21,14 @@ public sealed record TurnCredentials(string Username, string Credential, IReadOn
 public sealed class NetworkClient
 {
     private const int ProfileImageMaxPixels = 256;
+    private static readonly TimeSpan WebSocketSendTimeout = TimeSpan.FromSeconds(6);
     private readonly SessionStore _sessions;
     private readonly HttpClient _http;
     private readonly ConcurrentDictionary<string, string> _profileImageCache = new(StringComparer.Ordinal);
     private readonly SemaphoreSlim _webSocketGate = new(1, 1);
+    // ClientWebSocket permits one concurrent send only. Activity reporting,
+    // chat, voice control and reconnect authentication all share this socket.
+    private readonly SemaphoreSlim _webSocketSendGate = new(1, 1);
     private ClientWebSocket? _webSocket;
     private Action<string, JsonElement>? _onWebSocketEvent;
     private int _reconnectAttempt;
@@ -383,9 +387,26 @@ public sealed class NetworkClient
 
     public async Task SendWebSocketAsync(string op, JsonElement data)
     {
-        if (_webSocket?.State != WebSocketState.Open) throw new InvalidOperationException("Conexão em tempo real indisponível.");
-        var bytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(new { v = 1, op, data }));
-        await _webSocket.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, CancellationToken.None);
+        await _webSocketSendGate.WaitAsync();
+        try
+        {
+            var socket = _webSocket;
+            if (socket?.State != WebSocketState.Open)
+                throw new InvalidOperationException("Conexão em tempo real indisponível.");
+            var bytes = Encoding.UTF8.GetBytes(JsonSerializer.Serialize(new { v = 1, op, data }));
+            using var timeout = new CancellationTokenSource(WebSocketSendTimeout);
+            await socket.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, timeout.Token);
+            if (op is "chat.message.create" or "auth.hello")
+                DebugLog.Write($"WebSocket sent {op} ({bytes.Length} bytes)");
+        }
+        catch (Exception exception)
+        {
+            if (op == "chat.message.create")
+                DebugLog.Write($"WebSocket send {op} FAILED: {exception}");
+            BeginReconnect(exception.Message);
+            throw;
+        }
+        finally { _webSocketSendGate.Release(); }
     }
 
     private async Task ReceiveWebSocketAsync(ClientWebSocket socket, int generation)
@@ -416,14 +437,18 @@ public sealed class NetworkClient
             // so it doesn't kick off a competing reconnect and make the UI
             // bounce between "connected" and "reconnecting".
             if (generation != _connectionGeneration) return;
-            // Logout (or any state where we no longer hold a token) tore the
-            // socket down on purpose — don't fight it with a reconnect.
-            if (!_sessions.HasToken) return;
-            // Single-flight: only the first failing socket starts the loop.
-            if (Interlocked.CompareExchange(ref _reconnecting, 1, 0) != 0) return;
-            _onWebSocketEvent?.Invoke("connection.state", JsonSerializer.SerializeToElement(new { state = "reconnecting" }));
-            _ = ReconnectWebSocketAsync(exception.Message);
+            BeginReconnect(exception.Message);
         }
+    }
+
+    private void BeginReconnect(string reason)
+    {
+        // Logout deliberately tears the socket down; all other send/receive
+        // failures get exactly one reconnect loop, including a send timeout.
+        if (!_sessions.HasToken) return;
+        if (Interlocked.CompareExchange(ref _reconnecting, 1, 0) != 0) return;
+        _onWebSocketEvent?.Invoke("connection.state", JsonSerializer.SerializeToElement(new { state = "reconnecting" }));
+        _ = ReconnectWebSocketAsync(reason);
     }
 
     private async Task ReconnectWebSocketAsync(string lastError)

@@ -622,6 +622,13 @@ a:hover {
 .voice-panel__grid.cols-3 {
   grid-template-columns: repeat(3, 1fr);
 }
+.voice-panel__noise-state {
+  grid-column: 1 / -1;
+  color: var(--text-muted);
+  font-size: 10px;
+  text-align: center;
+  min-height: 12px;
+}
 .vp-btn {
   height: 32px;
   border-radius: 8px;

@@ -9,6 +9,7 @@ import { SettingsModal, ProfileUpdateData } from "./SettingsModal";
 import { UserProfileModal, UserProfileData, AnchorRect } from "./UserProfileModal";
 import { BANNER_PRESETS, getBannerPreset } from "./banners";
 import { matchesVoiceShortcut, type VoiceInputMode } from "./voiceShortcut";
+import type { AudioPipelineStatus, NoiseSuppressionMode } from "./audioPipeline";
 import logoUrl from "../icons/logo.webp";
 
 type Channel = { id: string; name: string; kind: "text" | "voice"; topic?: string | null };
@@ -1140,8 +1141,9 @@ export function App() {
   // independent of the sharer's microphone (rtc.ts routes it to its own sink).
   const [screenMutedPeers, setScreenMutedPeers] = useState<Record<string, boolean>>({});
   const [screenVolumes, setScreenVolumes] = useState<Record<string, number>>(() => rtc.getScreenAudioVolumes());
-  const [noiseSup, setNoiseSup] = useState(() => {
-    try { return localStorage.getItem("tk.noiseSuppression") !== "off"; } catch { return true; }
+  const [noiseSuppressionMode, setNoiseSuppressionMode] = useState<NoiseSuppressionMode>(() => rtc.getNoiseSuppressionMode());
+  const [noisePipelineStatus, setNoisePipelineStatus] = useState<AudioPipelineStatus>({
+    state: "idle", requestedMode: rtc.getNoiseSuppressionMode(), effectiveMode: rtc.getNoiseSuppressionMode(), generation: 0,
   });
   const [showSharingToast, setShowSharingToast] = useState(false);
   const [updateInfo, setUpdateInfo] = useState<{
@@ -1543,6 +1545,12 @@ export function App() {
         // doesn't know yet — e.g. `activity.report` against a server without
         // rich presence. Not user-actionable, so don't raise a banner.
         const code = event.data?.code;
+        const reqId: string | undefined = event.data?.in_reply_to;
+        if (reqId && pendingTimers.current[reqId]) {
+          clearTimeout(pendingTimers.current[reqId]);
+          delete pendingTimers.current[reqId];
+          setMessages(current => current.map(message => message.reqId === reqId ? { ...message, pending: false, failed: true } : message));
+        }
         if (code !== "unknown_op" && code !== "unknown_ipc_op") {
           setError(event.data.message ?? "Não foi possível concluir a operação.");
         } else {
@@ -1790,10 +1798,15 @@ export function App() {
   useEffect(() => rtc.onMediaError(message => setError(message)), []);
 
   useEffect(() => { setSoundsMuted(deafened); }, [deafened]);
+  useEffect(() => rtc.onAudioPipelineStatus(status => {
+    setNoisePipelineStatus(status);
+    setNoiseSuppressionMode(status.requestedMode);
+  }), []);
   useEffect(() => {
-    rtc.setNoiseSuppression(noiseSup);
-    try { localStorage.setItem("tk.noiseSuppression", noiseSup ? "on" : "off"); } catch { /* private mode */ }
-  }, [noiseSup]);
+    void rtc.setNoiseSuppressionMode(noiseSuppressionMode).catch(error => {
+      setError(`Não foi possível trocar a redução de ruído: ${error instanceof Error ? error.message : String(error)}`);
+    });
+  }, [noiseSuppressionMode]);
   // ACT-FR-008: the native ActivityMonitor stays idle until the UI opts it
   // in. It keeps its enabled state across WS reconnects (it is not tied to
   // the socket lifecycle), so sending this once per toggle is enough.
@@ -2591,7 +2604,7 @@ export function App() {
     setPeerVolumes(current => ({ ...current, [userId]: clamped }));
   }
   function toggleNoiseSuppression() {
-    setNoiseSup(value => !value);
+    setNoiseSuppressionMode(current => current === "browser" ? "rnnoise" : current === "rnnoise" ? "off" : "browser");
   }
   function toggleFocus(userId: string) {
     setFocusedUser(current => (current === userId ? null : userId));
@@ -3219,12 +3232,23 @@ export function App() {
                 {renderSharePopover()}
               </div>
               <button
-                className={noiseSup ? "vp-btn is-on" : "vp-btn"}
+                className={noiseSuppressionMode === "rnnoise" && noisePipelineStatus.effectiveMode === "rnnoise" && noisePipelineStatus.state === "ready" ? "vp-btn is-on" : "vp-btn"}
                 onClick={toggleNoiseSuppression}
-                title={noiseSup ? "Supressão de ruído: ligada" : "Supressão de ruído: desligada"}
+                title={noisePipelineStatus.state === "loading"
+                  ? "Carregando processamento avançado…"
+                  : noisePipelineStatus.state === "fallback"
+                    ? "Processamento avançado indisponível; usando modo padrão"
+                    : noiseSuppressionMode === "rnnoise"
+                      ? "Redução de ruído: Avançada (RNNoise)"
+                      : noiseSuppressionMode === "off"
+                        ? "Redução de ruído: Desativada"
+                        : "Redução de ruído: Padrão do dispositivo"}
               >
-                <Icon name={noiseSup ? "crisp-nois-cenaceling-on" : "crisp-off"} size={18} />
+                <Icon name={noiseSuppressionMode === "rnnoise" ? "crisp-nois-cenaceling-on" : "crisp-off"} size={18} />
               </button>
+              <span className="voice-panel__noise-state" aria-live="polite">
+                {noisePipelineStatus.state === "loading" ? "Processando…" : noisePipelineStatus.state === "fallback" ? "Padrão (fallback)" : noiseSuppressionMode === "rnnoise" ? "RNNoise" : noiseSuppressionMode === "off" ? "Sem supressão" : "Padrão"}
+              </span>
               <button className="vp-btn" title="Efeitos sonoros"><Icon name="sound-effects" size={18} /></button>
             </div>
           </div>

@@ -20,6 +20,10 @@ pub struct AppState {
     /// may act only if no newer authenticated connection superseded it.
     pub presence_epochs: Arc<Mutex<HashMap<Uuid, u64>>>,
     pub pending_offline: Arc<Mutex<HashSet<Uuid>>>,
+    /// When the voice roster was last reconciled against LiveKit. Throttles
+    /// the on-connect reconcile so a server restart (every client reconnects
+    /// within a second) doesn't fan out into one LiveKit sweep per client.
+    pub last_voice_reconcile: Arc<Mutex<Option<Instant>>>,
 }
 
 impl AppState {
@@ -31,6 +35,22 @@ impl AppState {
             login_limiter: Arc::new(Mutex::new(HashMap::new())),
             presence_epochs: Arc::new(Mutex::new(HashMap::new())),
             pending_offline: Arc::new(Mutex::new(HashSet::new())),
+            last_voice_reconcile: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Returns true (and stamps "now") when the voice roster has not been
+    /// reconciled against LiveKit within `min_gap`. Pass `Duration::ZERO`
+    /// from the periodic task to always run; the WS-connect path passes a
+    /// few seconds so a reconnect storm coalesces into one sweep.
+    pub async fn should_reconcile_voice(&self, min_gap: Duration) -> bool {
+        let mut guard = self.last_voice_reconcile.lock().await;
+        let now = Instant::now();
+        if guard.map_or(true, |last| now.duration_since(last) >= min_gap) {
+            *guard = Some(now);
+            true
+        } else {
+            false
         }
     }
 

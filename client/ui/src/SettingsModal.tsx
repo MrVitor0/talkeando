@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef } from "react";
 import { Icon } from "./Icon";
 import { send } from "./ipc";
 import * as rtc from "./rtc";
+import type { AudioPipelineStatus, NoiseSuppressionMode } from "./audioPipeline";
 import { BANNER_PRESETS, getBannerPreset } from "./banners";
 
 function Avatar({ label, size, imageUrl }: { label: string; size: number; imageUrl?: string | null }) {
@@ -81,6 +82,8 @@ export function SettingsModal({
 
   const [inputVol, setInputVol] = useState<number>(() => Math.round(rtc.getInputVolume() * 100));
   const [outputVol, setOutputVol] = useState<number>(() => Math.round(rtc.getOutputVolume() * 100));
+  const [noiseMode, setNoiseMode] = useState<NoiseSuppressionMode>(() => rtc.getNoiseSuppressionMode());
+  const [noiseStatus, setNoiseStatus] = useState<AudioPipelineStatus>({ state: "idle", requestedMode: rtc.getNoiseSuppressionMode(), effectiveMode: rtc.getNoiseSuppressionMode(), generation: 0 });
 
   // PTT State
   const [inputMode, setInputMode] = useState<InputMode>(() => {
@@ -291,6 +294,15 @@ export function SettingsModal({
     rtc.setInputVolumeLevel(val / 100);
   };
 
+  useEffect(() => rtc.onAudioPipelineStatus(status => {
+    setNoiseStatus(status);
+    setNoiseMode(status.requestedMode);
+  }), []);
+  const handleNoiseModeChange = (mode: NoiseSuppressionMode) => {
+    setNoiseMode(mode);
+    void rtc.setNoiseSuppressionMode(mode).catch(error => console.error("Noise suppression mode switch failed", error));
+  };
+
   const handleOutputVolChange = (val: number) => {
     setOutputVol(val);
     rtc.setOutputVolumeLevel(val / 100);
@@ -434,6 +446,18 @@ export function SettingsModal({
                       onChange={e => handleOutputVolChange(parseInt(e.target.value, 10))}
                       className="settings-slider"
                     />
+                  </div>
+                </div>
+
+                <div className="settings-field" style={{ marginTop: "20px" }}>
+                  <label className="settings-label">Redução de ruído</label>
+                  <select className="settings-select" value={noiseMode} onChange={event => handleNoiseModeChange(event.target.value as NoiseSuppressionMode)}>
+                    <option value="browser">Padrão do dispositivo (AEC + supressão + ganho)</option>
+                    <option value="rnnoise">Avançada (RNNoise local)</option>
+                    <option value="off">Desativada (mantém cancelamento de eco)</option>
+                  </select>
+                  <div className="settings-radio-desc" aria-live="polite">
+                    {noiseStatus.state === "loading" ? "Carregando processamento avançado…" : noiseStatus.state === "fallback" ? "Processamento avançado indisponível; usando modo padrão." : noiseStatus.state === "failed" ? "Falha ao alterar o processamento de áudio." : noiseStatus.effectiveMode === "rnnoise" ? "RNNoise ativo na track publicada." : noiseStatus.effectiveMode === "off" ? "Sem supressão de ruído nativa ou avançada." : "Usando o processamento nativo do dispositivo."}
                   </div>
                 </div>
 

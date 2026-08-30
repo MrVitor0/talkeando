@@ -1,7 +1,7 @@
 /** SFU media adapter. WebSocket remains control-plane only; media connects directly to LiveKit. */
 import { Room, RoomEvent, Track } from "livekit-client";
 import { startNativeScreen, stopNativeScreen, reconfigureNativeScreen } from "./nativeScreen";
-import * as noiseSuppression from "./noiseSuppression";
+import { AudioPipelineManager, type AudioPipelineStatus, type NoiseSuppressionMode } from "./audioPipeline";
 import { send, subscribe } from "./ipc";
 
 export type ConnQuality = "good" | "medium" | "poor";
@@ -40,6 +40,10 @@ let localAnalyser: AnalyserNode | null = null;
 let localSpeechFrame = 0;
 const qualities = new Set<(quality: ConnQuality) => void>();
 const mediaErrors = new Set<(message: string) => void>();
+const audioPipelineStatusListeners = new Set<(status: AudioPipelineStatus) => void>();
+const microphone = new AudioPipelineManager();
+let noiseSuppressionMode: NoiseSuppressionMode = storedNoiseSuppressionMode();
+let localMuted = false;
 const volumes = new Map<string, number>(Object.entries(stored("tk.peerVolumes")));
 const screenVolumes = new Map<string, number>(Object.entries(stored("tk.screenVolumes")));
 const muted = new Map<string, boolean>(), screenMuted = new Map<string, boolean>();
@@ -55,8 +59,20 @@ function storedNumber(key: string, fallback: number): number {
     return Number.isFinite(value) ? value : fallback;
   } catch { return fallback; }
 }
+function storedNoiseSuppressionMode(): NoiseSuppressionMode {
+  try {
+    const value = localStorage.getItem("tk.noiseSuppressionMode");
+    if (value === "browser" || value === "rnnoise" || value === "off") return value;
+    // Preserve the only legacy choice: old "off" meant no suppression.
+    return localStorage.getItem("tk.noiseSuppression") === "off" ? "off" : "browser";
+  } catch { return "browser"; }
+}
 function persist(key: string, values: Map<string, number>) { try { localStorage.setItem(key, JSON.stringify(Object.fromEntries(values))); } catch {} }
 function persistValue(key: string, value: string | number) { try { localStorage.setItem(key, String(value)); } catch {} }
+
+microphone.onStatus(status => audioPipelineStatusListeners.forEach(listener => listener(status)));
+
+function logAudio(event: string, fields: Record<string, unknown> = {}) { console.info(`[audio] ${event}`, fields); }
 
 function emitSpeaking() {
   const ids = new Set(remoteSpeakers);
@@ -174,8 +190,11 @@ function bind(room: Room) {
     if (active === room) active = null;
     if (connecting === room) connecting = null;
     stopLocalSpeechMonitor();
+    void microphone.dispose();
     if (presentChannelId) { send("voice.presence.leave", { channel_id: presentChannelId }); presentChannelId = null; }
   });
+  room.on(RoomEvent.Reconnecting, () => logAudio("audio.livekit.reconnect.started"));
+  room.on(RoomEvent.Reconnected, () => logAudio("audio.livekit.reconnect.completed"));
 }
 
 // Tell the server about a local camera/screen publication so every other
@@ -248,11 +267,23 @@ export async function joinCall(id: string, isMuted: boolean, _: boolean) {
     // were previously in, so switching channels never shows us in two at once.
     send("voice.presence.enter", { channel_id: id });
     presentChannelId = id;
-    await room.localParticipant.setMicrophoneEnabled(!isMuted, audioInputDeviceId ? { deviceId: audioInputDeviceId } : undefined);
+    localMuted = isMuted;
+    await microphone.start({ mode: noiseSuppressionMode, deviceId: audioInputDeviceId }, async (track, pipeline) => {
+      logAudio("audio.track.publishing", { origin: pipeline.origin, processed: pipeline.isProcessed });
+      await room.localParticipant.publishTrack(track, { source: Track.Source.Microphone });
+      logAudio("audio.track.published", { origin: pipeline.origin, processed: pipeline.isProcessed });
+      if (localMuted) {
+        const publication = [...room.localParticipant.audioTrackPublications.values()]
+          .find(item => item.source === Track.Source.Microphone);
+        await publication?.track?.mute();
+      }
+    });
     startLocalSpeechMonitor(room);
   } catch (error) {
     if (connecting === room) connecting = null;
+    await unpublishMicrophone(room);
     room.disconnect();
+    await microphone.dispose();
     throw error;
   }
 }
@@ -262,11 +293,19 @@ export async function leaveCall() {
   const room = active ?? connecting;
   active = null; connecting = null;
   stopLocalSpeechMonitor();
+  await unpublishMicrophone(room);
+  await microphone.dispose();
   room?.disconnect();
   screen?.getTracks().forEach(track => track.stop()); screen = null;
 }
 export async function setLocalAudioState(isMuted: boolean, _: boolean) {
-  await active?.localParticipant.setMicrophoneEnabled(!isMuted);
+  localMuted = isMuted;
+  const publication = active && [...active.localParticipant.audioTrackPublications.values()]
+    .find(item => item.source === Track.Source.Microphone);
+  if (publication?.track) {
+    if (isMuted) await publication.track.mute();
+    else await publication.track.unmute();
+  }
   if (!isMuted && active) startLocalSpeechMonitor(active);
 }
 export async function startCamera(_: string, __: string, deviceId?: string) {
@@ -324,11 +363,58 @@ export async function listCameras(): Promise<MediaDeviceInfo[]> { return (await 
 export async function listAllMediaDevices(): Promise<DeviceLists> { const devices = await navigator.mediaDevices.enumerateDevices(); return { audioInputs: devices.filter(device => device.kind === "audioinput"), audioOutputs: devices.filter(device => device.kind === "audiooutput"), videoInputs: devices.filter(device => device.kind === "videoinput") }; }
 export function getAudioInputDeviceId() { return audioInputDeviceId; }
 export function getAudioOutputDeviceId() { return audioOutputDeviceId; }
-export async function setAudioInputDevice(deviceId: string) { audioInputDeviceId = deviceId || undefined; if (deviceId) persistValue("tk.audioInputDeviceId", deviceId); await active?.switchActiveDevice("audioinput", deviceId).catch(() => {}); if (active) startLocalSpeechMonitor(active); }
 export async function setAudioOutputDevice(deviceId: string) { audioOutputDeviceId = deviceId || undefined; if (deviceId) persistValue("tk.audioOutputDeviceId", deviceId); await active?.switchActiveDevice("audiooutput", deviceId).catch(() => {}); for (const items of [...audio.values(), ...screenAudio.values()]) for (const element of items) void setSink(element); }
 export function getInputVolume() { return inputVolume; }
 export function getOutputVolume() { return outputVolume; }
 export function setInputVolumeLevel(value: number) { inputVolume = Math.max(0, Math.min(1, value)); persistValue("tk.inputVolume", inputVolume); }
 export function setOutputVolumeLevel(value: number) { outputVolume = Math.max(0, Math.min(1, value)); persistValue("tk.outputVolume", outputVolume); for (const id of audio.keys()) apply(id); for (const id of screenAudio.keys()) apply(id, true); }
-export function setNoiseSuppression(value: boolean) { noiseSuppression.setEnabled(value); }
+export function getNoiseSuppressionMode() { return noiseSuppressionMode; }
+export function onAudioPipelineStatus(listener: (status: AudioPipelineStatus) => void) { audioPipelineStatusListeners.add(listener); return () => { audioPipelineStatusListeners.delete(listener); }; }
+export async function setNoiseSuppressionMode(mode: NoiseSuppressionMode) {
+  noiseSuppressionMode = mode;
+  try { localStorage.setItem("tk.noiseSuppressionMode", mode); } catch {}
+  if (!active || !microphone.current) {
+    microphone.setDesiredMode(mode);
+    return;
+  }
+  await microphone.switchMode(mode, async (track, pipeline) => replaceMicrophoneTrack(active!, track, pipeline));
+  if (!localMuted) startLocalSpeechMonitor(active);
+}
+async function replaceMicrophoneTrack(room: Room, track: MediaStreamTrack, pipeline: { origin: string; isProcessed: boolean }) {
+  const publication = [...room.localParticipant.audioTrackPublications.values()]
+    .find(item => item.source === Track.Source.Microphone);
+  if (!publication?.track) {
+    logAudio("audio.track.publishing", { origin: pipeline.origin, processed: pipeline.isProcessed });
+    await room.localParticipant.publishTrack(track, { source: Track.Source.Microphone });
+    logAudio("audio.track.published", { origin: pipeline.origin, processed: pipeline.isProcessed });
+    return;
+  }
+  logAudio("audio.track.replacing", { origin: pipeline.origin, processed: pipeline.isProcessed });
+  await publication.track.replaceTrack(track, true);
+  if (localMuted) await publication.track.mute();
+  logAudio("audio.track.replaced", { origin: pipeline.origin, processed: pipeline.isProcessed });
+}
+async function unpublishMicrophone(room: Room | null) {
+  const publication = room && [...room.localParticipant.audioTrackPublications.values()]
+    .find(item => item.source === Track.Source.Microphone);
+  if (!publication?.track || !room) return;
+  // The pipeline owns stop(); do not let LiveKit stop a source that is about
+  // to be disposed by the manager, especially while a replacement is queued.
+  await room.localParticipant.unpublishTrack(publication.track, false).catch(() => {});
+  logAudio("audio.track.unpublished");
+}
+export async function setAudioInputDevice(deviceId: string) {
+  audioInputDeviceId = deviceId || undefined;
+  if (deviceId) persistValue("tk.audioInputDeviceId", deviceId);
+  if (!active || !microphone.current) return;
+  try {
+    logAudio("audio.device.switch.started", { hasDeviceSelection: !!deviceId });
+    await microphone.switchDevice(audioInputDeviceId, async (track, pipeline) => replaceMicrophoneTrack(active!, track, pipeline));
+    if (!localMuted) startLocalSpeechMonitor(active);
+    logAudio("audio.device.switch.completed");
+  } catch (error) {
+    logAudio("audio.device.switch.failed", { reason: error instanceof Error ? error.message : String(error) });
+    throw error;
+  }
+}
 export function ensureChannel(_: string) {}

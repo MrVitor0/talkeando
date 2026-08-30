@@ -123,6 +123,7 @@ async fn serve(pool: sqlx::PgPool, config: Config) -> anyhow::Result<()> {
     }
     let state = AppState::new(pool, config);
     spawn_attachment_cleanup(state.clone());
+    spawn_voice_reconcile(state.clone());
 
     let app = build_app(state);
 
@@ -168,6 +169,28 @@ fn spawn_attachment_cleanup(state: AppState) {
                     Ok(_) => {}
                     Err(error) => tracing::warn!(%id, %error, "failed to delete orphaned attachment row"),
                 }
+            }
+        }
+    });
+}
+
+/// Keeps the ephemeral voice roster pinned to LiveKit's authoritative room
+/// list. A server restart wipes the in-memory registry and LiveKit never
+/// replays `participant_joined` for people already in a room, so without this
+/// the sidebar stays empty (and screen-share indicators stale) until every
+/// client re-announces itself.
+fn spawn_voice_reconcile(state: AppState) {
+    if state.config.livekit_url.is_none() {
+        return;
+    }
+    tokio::spawn(async move {
+        // Let the process settle and accept a few reconnects first.
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(15));
+        loop {
+            ticker.tick().await;
+            if state.should_reconcile_voice(std::time::Duration::ZERO).await {
+                tupi_server::ws::handler::reconcile_voice_rooms(&state).await;
             }
         }
     });

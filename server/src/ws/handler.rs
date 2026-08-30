@@ -795,6 +795,7 @@ fn is_http_url(value: &str) -> bool {
 }
 
 async fn handle_chat_create(state: &AppState, user_id: Uuid, data: ChatMessageCreate) {
+    tracing::info!(%user_id, channel_id = %data.channel_id, has_request_id = data.req_id.is_some(), "chat.message.create received");
     let Ok(Some(channel)) = db::channel_if_member(&state.pool, data.channel_id, user_id).await else {
         state
             .hub
@@ -969,6 +970,7 @@ async fn handle_chat_create(state: &AppState, user_id: Uuid, data: ChatMessageCr
                         in_reply_to: data.req_id,
                     },
                 )).await;
+            tracing::info!(%user_id, channel_id = %m.channel_id, "chat.message.created broadcast");
             crate::link_preview::spawn_unfurl_task(
                 state.clone(),
                 m.id,
@@ -1277,9 +1279,56 @@ async fn handle_music_stream_unpublish(state: &AppState, user_id: Uuid, data: St
     }
 }
 
+/// Pulls LiveKit's authoritative room list and forces the ephemeral registry
+/// to match it, rebroadcasting every roster that changed. This is what
+/// rebuilds voice presence after a server restart or a dropped webhook —
+/// LiveKit never replays `participant_joined` for members already in a room,
+/// so the socket-authoritative path alone leaves the sidebar empty until each
+/// client happens to re-announce itself.
+pub async fn reconcile_voice_rooms(state: &AppState) {
+    if state.config.livekit_url.is_none() {
+        return;
+    }
+    let snapshot = match crate::livekit::room_snapshot(&state.config).await {
+        Ok(rooms) => rooms,
+        Err(error) => {
+            tracing::warn!(%error, "livekit voice reconcile skipped");
+            return;
+        }
+    };
+    let mapped: Vec<(Uuid, Vec<crate::ws::call_registry::ReconcileParticipant>)> = snapshot
+        .into_iter()
+        .filter_map(|(room, participants)| {
+            let channel_id = Uuid::parse_str(&room).ok()?;
+            let participants = participants
+                .into_iter()
+                .filter_map(|participant| {
+                    Some(crate::ws::call_registry::ReconcileParticipant {
+                        user_id: Uuid::parse_str(&participant.identity).ok()?,
+                        camera_sid: participant.camera_sid,
+                        screen_sid: participant.screen_sid,
+                        has_screen_audio: participant.has_screen_audio,
+                    })
+                })
+                .collect();
+            Some((channel_id, participants))
+        })
+        .collect();
+    let changed = state.hub.calls.write().await.reconcile(mapped);
+    for channel_id in changed {
+        broadcast_voice_roster(state, channel_id).await;
+    }
+}
+
 /// One-shot roster snapshot for a freshly connected client: every voice
 /// channel with an active call that lives in a community the user belongs to.
 async fn send_voice_rooms_snapshot(state: &AppState, user_id: Uuid, connection_id: Uuid) {
+    // A fresh connection right after a restart is exactly when the in-memory
+    // registry is stale; refresh it from LiveKit first (throttled so a whole
+    // community reconnecting at once triggers just one sweep).
+    if state.should_reconcile_voice(std::time::Duration::from_secs(5)).await {
+        reconcile_voice_rooms(state).await;
+    }
     let active = state.hub.calls.read().await.active_channel_ids();
     let rooms = if active.is_empty() {
         vec![]

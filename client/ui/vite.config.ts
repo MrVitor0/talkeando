@@ -12,4 +12,8 @@ export default defineConfig({
     // shaving a few requests.
     assetsInlineLimit: 0,
   },
+  test: {
+    environment: "node",
+    include: ["src/**/*.test.ts"],
+  },
 });
