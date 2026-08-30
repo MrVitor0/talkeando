@@ -616,11 +616,11 @@ async fn dispatch(
         // the TOCANDO badge while LiveKit delivers the actual audio track.
         "stream.publish" => {
             let data: StreamPublish = parse_or_reject!(StreamPublish);
-            handle_stream_publish(state, user_id, data).await;
+            handle_music_stream_publish(state, user_id, data).await;
         }
         "stream.unpublish" => {
             let data: StreamUnpublish = parse_or_reject!(StreamUnpublish);
-            handle_stream_unpublish(state, user_id, data).await;
+            handle_music_stream_unpublish(state, user_id, data).await;
         }
         "call.state.update" => {
             let data: CallStateUpdate = parse_or_reject!(CallStateUpdate);
@@ -1229,6 +1229,48 @@ pub(crate) async fn evict_voice_participant(state: &AppState, channel_id: Uuid, 
         calls.apply_participant(channel_id, user_id, false);
     }
     broadcast_voice_roster(state, channel_id).await;
+}
+
+/// The bot's LiveKit audio publication has no screen/camera counterpart, so
+/// its `music` row is retained in the app registry solely for the TOCANDO
+/// sidebar badge. The old generic stream handlers were mesh-only and are kept
+/// commented below; this narrow handler is the SFU control-plane equivalent.
+async fn handle_music_stream_publish(state: &AppState, user_id: Uuid, data: StreamPublish) {
+    if user_id != MUSIC_BOT_ID || data.kind != "music" {
+        state.hub.send_to(user_id, OutboundEnvelope::error("validation_error", "only the music bot may publish this stream", None)).await;
+        return;
+    }
+    let result = state.hub.calls.write().await.publish(
+        data.channel_id,
+        user_id,
+        data.stream_id,
+        data.kind,
+        data.label,
+        true,
+        None,
+    );
+    if let Err(error) = result {
+        let (code, message) = match error {
+            CallOpError::NotInCall => ("forbidden", "join the call before publishing"),
+            CallOpError::StreamAlreadyPublished => ("conflict", "music is already playing in this channel"),
+            _ => ("validation_error", "unable to publish music"),
+        };
+        state.hub.send_to(user_id, OutboundEnvelope::error(code, message, None)).await;
+        return;
+    }
+    broadcast_voice_roster(state, data.channel_id).await;
+}
+
+async fn handle_music_stream_unpublish(state: &AppState, user_id: Uuid, data: StreamUnpublish) {
+    match state.hub.calls.write().await.unpublish(data.channel_id, user_id, data.stream_id) {
+        Ok(_) => broadcast_voice_roster(state, data.channel_id).await,
+        Err(CallOpError::NotStreamOwner) => {
+            state.hub.send_to(user_id, OutboundEnvelope::error("forbidden", "you do not own this stream", None)).await;
+        }
+        Err(_) => {
+            state.hub.send_to(user_id, OutboundEnvelope::error("not_found", "music stream not found", None)).await;
+        }
+    }
 }
 
 /// One-shot roster snapshot for a freshly connected client: every voice
