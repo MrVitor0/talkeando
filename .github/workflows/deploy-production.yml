@@ -44,6 +44,10 @@ jobs:
         with:
           node-version: 20
 
+      - name: Install music bot dependencies
+        working-directory: music-bot
+        run: npm ci
+
       - name: Test music bot
         working-directory: music-bot
         run: npm test
