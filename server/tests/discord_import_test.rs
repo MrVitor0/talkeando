@@ -25,6 +25,10 @@ fn test_config(attachment_storage_path: String) -> Config {
         allowed_origins: vec!["http://localhost:5173".to_string()],
         unattached_attachment_ttl_hours: 24,
         music_bot_token: "test-music-bot-token".to_string(),
+        livekit_url: Some("ws://localhost:7880".to_string()),
+        livekit_api_key: Some("APItestkey".to_string()),
+        livekit_api_secret: Some("test-livekit-secret".to_string()),
+        livekit_token_ttl_seconds: 21_600,
     }
 }
 
