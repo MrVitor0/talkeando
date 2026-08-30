@@ -9,6 +9,8 @@ type Remote = (id: string, stream: MediaStream | null, id2: string | null) => vo
 type DeviceLists = { audioInputs: MediaDeviceInfo[]; audioOutputs: MediaDeviceInfo[]; videoInputs: MediaDeviceInfo[] };
 
 let active: Room | null = null;
+let connecting: Room | null = null;
+let connectAttempt = 0;
 // The voice channel the server currently lists us in. Mirrors `active`, but
 // outlives a `RoomEvent.Disconnected` long enough to send the matching
 // `voice.presence.leave` — the server roster is driven by these signals, not
@@ -96,7 +98,9 @@ function bind(room: Room) {
     if (!room.canPlaybackAudio) mediaErrors.forEach(listener => listener("O aplicativo bloqueou a reprodução de áudio. Clique novamente no canal para ativá-la."));
   });
   room.on(RoomEvent.Disconnected, () => {
-    active = null;
+    if (active !== room && connecting !== room) return;
+    if (active === room) active = null;
+    if (connecting === room) connecting = null;
     if (presentChannelId) { send("voice.presence.leave", { channel_id: presentChannelId }); presentChannelId = null; }
   });
 }
@@ -116,9 +120,14 @@ function reportTrack(published: boolean, source: string, trackSid?: string) {
 
 export function init(_: string) {}
 export async function joinCall(id: string, isMuted: boolean, _: boolean) {
-  active?.disconnect(); active = null;
+  const attempt = ++connectAttempt;
+  const previous = active ?? connecting;
+  active = null; connecting = null;
+  if (presentChannelId) { send("voice.presence.leave", { channel_id: presentChannelId }); presentChannelId = null; }
+  previous?.disconnect();
   screen?.getTracks().forEach(track => track.stop()); screen = null;
   const room = new Room({ adaptiveStream: true, dynacast: true });
+  connecting = room;
   bind(room);
   // Invoke this while handling the channel click. Some WebViews require a user
   // gesture before they allow remote audio to play.
@@ -126,20 +135,31 @@ export async function joinCall(id: string, isMuted: boolean, _: boolean) {
   try {
     const credential = await credentials(id);
     await room.connect(credential.url, credential.token);
+    if (attempt !== connectAttempt) {
+      room.disconnect();
+      const cancelled = new Error("Voice connection superseded by a newer channel");
+      cancelled.name = "AbortError";
+      throw cancelled;
+    }
     active = room;
+    connecting = null;
     // Tell the server we're a participant now. It evicts us from any channel we
     // were previously in, so switching channels never shows us in two at once.
     send("voice.presence.enter", { channel_id: id });
     presentChannelId = id;
     await room.localParticipant.setMicrophoneEnabled(!isMuted, audioInputDeviceId ? { deviceId: audioInputDeviceId } : undefined);
   } catch (error) {
+    if (connecting === room) connecting = null;
     room.disconnect();
     throw error;
   }
 }
 export async function leaveCall() {
+  ++connectAttempt;
   if (presentChannelId) { send("voice.presence.leave", { channel_id: presentChannelId }); presentChannelId = null; }
-  active?.disconnect(); active = null;
+  const room = active ?? connecting;
+  active = null; connecting = null;
+  room?.disconnect();
   screen?.getTracks().forEach(track => track.stop()); screen = null;
 }
 export async function setLocalAudioState(isMuted: boolean, _: boolean) { await active?.localParticipant.setMicrophoneEnabled(!isMuted); }

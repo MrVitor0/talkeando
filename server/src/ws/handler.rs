@@ -551,6 +551,15 @@ async fn dispatch(
         }
         "voice.presence.enter" => {
             let data: VoicePresence = parse_or_reject!(VoicePresence);
+            let allowed = if user_id == MUSIC_BOT_ID {
+                matches!(db::channel_by_id(&state.pool, data.channel_id).await, Ok(Some(channel)) if channel.kind == "voice")
+            } else {
+                matches!(db::channel_if_member(&state.pool, data.channel_id, user_id).await, Ok(Some(channel)) if channel.kind == "voice")
+            };
+            if !allowed {
+                state.hub.send_to(user_id, OutboundEnvelope::error("forbidden", "not allowed to join this voice channel", None)).await;
+                return;
+            }
             // A client can only be in one voice channel at a time: switching
             // channels must clear the old roster row now, not whenever LiveKit
             // decides to send `participant_left`.

@@ -86,13 +86,17 @@ const statusReporter = new MusicStatusReporter({ send, createId: () => crypto.ra
 let audioSource = null;
 function musicSource() { return audioSource || (audioSource = new AudioSource(SAMPLE_RATE, CHANNELS)); }
 async function joinLiveKit(channelId) {
-  if (livekitRoom && voiceChannel === channelId) return;
+  if (livekitRoom && voiceChannel === channelId) {
+    send("voice.presence.enter", { channel_id: channelId });
+    return;
+  }
   livekitRoom?.disconnect();
   const response = await fetch(`${API_URL}/api/livekit/token`, { method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: JSON.stringify({ channel_id: channelId }) });
   if (!response.ok) throw new Error(`LiveKit token request failed (${response.status})`);
   const credentials = await response.json();
   const room = new Room();
   await room.connect(process.env.LIVEKIT_URL || credentials.url || LIVEKIT_URL, credentials.token);
+  send("voice.presence.enter", { channel_id: channelId });
   await room.localParticipant.publishTrack(
     LocalAudioTrack.createAudioTrack("music", musicSource()),
     // Publish as MICROPHONE: clients treat it as ordinary voice audio and just
@@ -678,6 +682,7 @@ async function join(channelId) {
     await joinLiveKit(channelId); startFeeder();
     return;
   }
+  if (voiceChannel) send("voice.presence.leave", { channel_id: voiceChannel });
   livekitRoom?.disconnect(); livekitRoom = null;
   voiceChannel = channelId;
   await joinLiveKit(channelId);
@@ -688,6 +693,7 @@ function leaveVoice() {
   queue.length = 0;
   unpublishCurrent();
   stopFeeder();
+  if (voiceChannel) send("voice.presence.leave", { channel_id: voiceChannel });
   livekitRoom?.disconnect(); livekitRoom = null;
   voiceChannel = null;
   paused = false;

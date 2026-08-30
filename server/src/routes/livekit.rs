@@ -2,7 +2,7 @@ use axum::{extract::{State, Json}, http::{header, HeaderMap}, Json as AxumJson};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::{auth::{authenticate_token, AuthUser}, db, error::{AppError, AppResult}, livekit::{self, Mode}, state::AppState, ws::{handler::broadcast_voice_roster, protocol::OutboundEnvelope}};
+use crate::{auth::{authenticate_token, AuthUser}, db, error::{AppError, AppResult}, livekit::{self, Mode}, state::AppState, ws::protocol::OutboundEnvelope};
 
 const MUSIC_BOT_ID: Uuid = Uuid::from_u128(1);
 
@@ -30,10 +30,9 @@ pub async fn token(State(state): State<AppState>, headers: HeaderMap, Json(reque
     // disconnect); this add is just reconciled by it. The bot has no WS
     // presence flow, so for the bot this is the only "joined" signal — it is
     // removed again by the "only the bot is left" check / the webhook.
-    if request.mode == Mode::Participant {
-        state.hub.calls.write().await.apply_participant(request.channel_id, identity, true);
-        broadcast_voice_roster(&state, request.channel_id).await;
-    }
+    // A token only authorizes a possible room connection. Recording presence
+    // here made rapid clicks on two channels create two roster entries; the
+    // authenticated WebSocket announces presence only after it connects.
     Ok(AxumJson(TokenResponse { url, room: request.channel_id, token }))
 }
 

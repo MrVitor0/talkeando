@@ -2122,6 +2122,8 @@ export function App() {
     }
   }
   function joinCall(channel: Channel) {
+    setCall({ channelId: channel.id, participants: [] });
+    setStreams([]);
     const mode = readVoiceShortcutConfig().mode;
     const initialMuted = mode === "push_to_talk";
     shortcutPressedRef.current = false;
@@ -2156,9 +2158,11 @@ export function App() {
         setVoiceConnState("connected");
       })
       .catch(error => {
+        if (error instanceof Error && error.name === "AbortError") return;
         voiceConnTimers.current.forEach(id => window.clearTimeout(id));
         voiceConnTimers.current = [];
         setVoiceConnState("disconnected");
+        setCall(current => current?.channelId === channel.id ? null : current);
         console.error("[ui] LiveKit voice connection failed", error);
         setError(`Não foi possível conectar o áudio: ${error instanceof Error ? error.message : "erro desconhecido"}`);
       });
