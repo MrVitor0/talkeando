@@ -611,6 +611,17 @@ async fn dispatch(
             );
             broadcast_voice_roster(state, data.channel_id).await;
         }
+        // Music has no camera/screen publication to mirror. Its bot-owned
+        // playback row remains a control-plane stream so the roster can show
+        // the TOCANDO badge while LiveKit delivers the actual audio track.
+        "stream.publish" => {
+            let data: StreamPublish = parse_or_reject!(StreamPublish);
+            handle_stream_publish(state, user_id, data).await;
+        }
+        "stream.unpublish" => {
+            let data: StreamUnpublish = parse_or_reject!(StreamUnpublish);
+            handle_stream_unpublish(state, user_id, data).await;
+        }
         "call.state.update" => {
             let data: CallStateUpdate = parse_or_reject!(CallStateUpdate);
             handle_call_state_update(state, user_id, data).await;
@@ -1209,36 +1220,13 @@ pub(crate) async fn broadcast_voice_roster(state: &AppState, channel_id: Uuid) {
     .await;
 }
 
-/// Removes `user_id` from a voice channel's roster and re-broadcasts it. When
-/// only the music bot is left behind, tears the bot down too (matching the
-/// LiveKit `participant_left` webhook, which does the same reconciliation from
-/// the other direction). Safe to call for a user who is not currently listed.
+/// Removes `user_id` from a voice channel's roster and re-broadcasts it. The
+/// bot intentionally keeps playing when the last human leaves; it stops only
+/// through an explicit command or its own idle timeout.
 pub(crate) async fn evict_voice_participant(state: &AppState, channel_id: Uuid, user_id: Uuid) {
     {
         let mut calls = state.hub.calls.write().await;
         calls.apply_participant(channel_id, user_id, false);
-    }
-    let only_bot_left = {
-        let calls = state.hub.calls.read().await;
-        calls.participant_ids(channel_id) == vec![MUSIC_BOT_ID]
-    };
-    if only_bot_left {
-        state
-            .hub
-            .send_to(
-                MUSIC_BOT_ID,
-                OutboundEnvelope::new(
-                    "music.command",
-                    serde_json::json!({ "command": "stop", "voice_channel_id": channel_id, "reason": "empty" }),
-                ),
-            )
-            .await;
-        let _ = crate::livekit::remove_participant(
-            &state.config,
-            &channel_id.to_string(),
-            &MUSIC_BOT_ID.to_string(),
-        )
-        .await;
     }
     broadcast_voice_roster(state, channel_id).await;
 }
