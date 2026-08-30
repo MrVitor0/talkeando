@@ -24,6 +24,13 @@ pub async fn token(State(state): State<AppState>, headers: HeaderMap, Json(reque
     let url = state.config.livekit_url.clone().ok_or_else(|| AppError::ServiceUnavailable("LiveKit is not configured".into()))?;
     let token = livekit::access_token(&state.config, &identity.to_string(), &name, &request.channel_id.to_string(), request.mode, serde_json::json!({"is_bot": is_bot}))
         .map_err(|_| AppError::ServiceUnavailable("LiveKit is not configured".into()))?;
+    // Publishing this projection when the participant token is minted keeps the
+    // community sidebar responsive. LiveKit's signed participant_left webhook
+    // remains responsible for removing a disconnected participant.
+    if request.mode == Mode::Participant {
+        state.hub.calls.write().await.apply_participant(request.channel_id, identity, true);
+        broadcast_voice_roster(&state, request.channel_id).await;
+    }
     Ok(AxumJson(TokenResponse { url, room: request.channel_id, token }))
 }
 
