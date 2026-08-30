@@ -715,7 +715,7 @@ async function onEvent(op, data) {
     if (pc) { pc.close(); peers.delete(uid); }
     try { await offer(uid); } catch (error) { log(`offer to ${uid} failed: ${error.message}`); }
   }
-  else if (op === "legacy.call_peer_left") { /* LiveKit owns room membership. */ }
+  else if (op === "legacy.call_peer_left") { // LiveKit owns room membership.
   */
   if (op === "music.command") {
     log(`music.command: ${data.command} ${JSON.stringify(data.query ?? "")}`);
