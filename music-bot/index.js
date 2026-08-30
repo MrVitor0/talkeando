@@ -1,8 +1,8 @@
 // A real, headless WebRTC participant. Media stays on the VPS: yt-dlp pipes
 // the source into ffmpeg, ffmpeg emits raw 48 kHz stereo PCM, and a paced
-// 10 ms feeder hands that to node-webrtc's RTCAudioSource. That source owns a
-// single long-lived track which every caller's PeerConnection carries, so
-// changing songs never renegotiates and never stacks extra senders.
+// 10 ms feeder hands that to node-webrtc's RTCAudioSource. Each PeerConnection
+// carries its own long-lived track spun off that one source (wrtc only feeds a
+// track to a single PC), so changing songs still never renegotiates.
 const WebSocket = require("ws");
 // `wrtc` (node-webrtc) has been unmaintained since 2020 and has no working
 // prebuilt binaries for Node >= 16 — on node:18 it crashes the process the
@@ -77,6 +77,7 @@ let publishedStreamId = null;
 let idleSince = 0;
 let paused = false;
 const peers = new Map();
+const iceRestartTimers = new Map();   // userId -> pending ICE-restart timeout
 
 function send(op, data) { ws?.readyState === WebSocket.OPEN && ws.send(JSON.stringify({ v: 1, op, data })); }
 const statusReporter = new MusicStatusReporter({ send, createId: () => crypto.randomUUID() });
@@ -92,18 +93,25 @@ function iceServers() {
   return servers;
 }
 
-// One RTCAudioSource for the process lifetime. Songs come and go through it;
-// the track never does. That is what makes song changes free: no addTrack, no
-// second offer, and no SDP that grows by an audio m-line per song (which is
-// what kept pushing the signalling payload towards the 64 KiB limit).
-let audioSource = null, audioTrack = null;
-function musicTrack() {
-  if (!audioTrack) {
+// One RTCAudioSource for the process lifetime — every song's PCM is fed into
+// it (see the feeder). Songs come and go through the source; the tracks don't,
+// so changing songs is still free (no addTrack, no renegotiation).
+//
+// One track PER peer, though: `@roamhq/wrtc` only delivers a given
+// RTCAudioSource track to a single RTCPeerConnection, so a shared track meant
+// exactly one listener heard the music and everyone else got a connected-but-
+// silent transceiver. `createTrack()` can be called any number of times and
+// every track it returns receives the same `onData` frames.
+let audioSource = null;
+function musicSource() {
+  if (!audioSource) {
     audioSource = new wrtc.nonstandard.RTCAudioSource();
-    audioTrack = audioSource.createTrack();
-    log("created the persistent music track");
+    log("created the persistent music source");
   }
-  return audioTrack;
+  return audioSource;
+}
+function newMusicTrack() {
+  return musicSource().createTrack();
 }
 
 async function peer(userId) {
@@ -113,10 +121,31 @@ async function peer(userId) {
   pc.oniceconnectionstatechange = () => log(`peer ${userId}: iceConnectionState=${pc.iceConnectionState}`);
   pc.onconnectionstatechange = () => {
     log(`peer ${userId}: connectionState=${pc.connectionState}`);
-    if (pc.connectionState === "failed") log(`peer ${userId}: ICE FAILED — check TURN reachability from the container`);
+    const pending = iceRestartTimers.get(userId);
+    if (pending) { clearTimeout(pending); iceRestartTimers.delete(userId); }
+    // `failed` is definitive — a datacenter<->NAT path can lose the first
+    // connectivity check (candidate timing, relay warm-up), so re-offer with
+    // an ICE restart instead of leaving that listener silent until the next
+    // /play. `disconnected` is usually a transient blip; give it a grace
+    // window to recover on its own first.
+    if (pc.connectionState === "failed") {
+      void restartPeerIce(userId, pc);
+    } else if (pc.connectionState === "disconnected") {
+      iceRestartTimers.set(userId, setTimeout(() => { void restartPeerIce(userId, pc); }, 5000));
+    }
   };
-  pc.addTrack(musicTrack());
+  pc.addTrack(newMusicTrack());
   return pc;
+}
+async function restartPeerIce(userId, pc) {
+  iceRestartTimers.delete(userId);
+  if (peers.get(userId) !== pc || !voiceChannel || pc.connectionState === "connected" || pc.connectionState === "closed") return;
+  log(`peer ${userId}: restarting ICE`);
+  try {
+    const description = await pc.createOffer({ iceRestart: true });
+    await pc.setLocalDescription(description);
+    send("rtc.offer", { channel_id: voiceChannel, to: userId, sdp: description.sdp });
+  } catch (error) { log(`ICE restart for ${userId} failed: ${error.message}`); }
 }
 async function offer(userId) {
   const pc = await peer(userId); const description = await pc.createOffer(); await pc.setLocalDescription(description);
@@ -156,7 +185,7 @@ let feederTimer = null, nextFrameAt = 0;
 
 function startFeeder() {
   if (feederTimer) return;
-  musicTrack();
+  musicSource();
   nextFrameAt = Date.now();
   feederTimer = setTimeout(tick, FRAME_MS);
 }
@@ -651,6 +680,7 @@ async function join(channelId) {
   }
   if (voiceChannel) send("call.leave", { channel_id: voiceChannel });
   for (const pc of peers.values()) pc.close(); peers.clear();
+  for (const t of iceRestartTimers.values()) clearTimeout(t); iceRestartTimers.clear();
   voiceChannel = channelId;
   send("call.join", { channel_id: channelId, muted: true, deafened: false });
   startFeeder();
@@ -662,6 +692,7 @@ function leaveVoice() {
   stopFeeder();
   if (voiceChannel) send("call.leave", { channel_id: voiceChannel });
   for (const pc of peers.values()) pc.close(); peers.clear();
+  for (const t of iceRestartTimers.values()) clearTimeout(t); iceRestartTimers.clear();
   voiceChannel = null;
   paused = false;
   idleSince = 0;
@@ -689,7 +720,7 @@ async function onEvent(op, data) {
     try { await offer(data.participant.user_id); }
     catch (error) { log(`offer to ${data.participant.user_id} failed: ${error.message}`); }
   }
-  else if (op === "call.peer_left") { peers.get(data.user_id)?.close(); peers.delete(data.user_id); }
+  else if (op === "call.peer_left") { peers.get(data.user_id)?.close(); peers.delete(data.user_id); const t = iceRestartTimers.get(data.user_id); if (t) { clearTimeout(t); iceRestartTimers.delete(data.user_id); } }
   else if (op === "rtc.offer") { const pc = await peer(data.from); await pc.setRemoteDescription({ type: "offer", sdp: data.sdp }); const answer = await pc.createAnswer(); await pc.setLocalDescription(answer); send("rtc.answer", { channel_id: voiceChannel, to: data.from, sdp: answer.sdp }); }
   else if (op === "rtc.answer") { const pc = peers.get(data.from); if (pc) await pc.setRemoteDescription({ type: "answer", sdp: data.sdp }); }
   else if (op === "rtc.ice") { const pc = await peer(data.from); await pc.addIceCandidate(data.candidate); }

@@ -13,8 +13,9 @@ const fixture = name => JSON.parse(fs.readFileSync(path.join(__dirname, "test", 
 // ---------------------------------------------------------------- wrtc stub
 const received = [];          // every Int16Array handed to onData, in order
 let badFrames = 0;
+let audioTracksCreated = 0;
 class RTCAudioSourceStub {
-  createTrack() { return { kind: "audio", stop() { } }; }
+  createTrack() { audioTracksCreated++; return { kind: "audio", stop() { } }; }
   onData({ samples, sampleRate, bitsPerSample, channelCount, numberOfFrames }) {
     if (samples.byteLength !== 1920 || sampleRate !== 48000 || bitsPerSample !== 16 || channelCount !== 2 || numberOfFrames !== 480) {
       badFrames++;
@@ -168,9 +169,12 @@ async function main() {
   deliver("auth.ok", {});
   await sleep(30);
   check("re-announces call membership after a reconnect", sent.slice(afterFirstPlay).some(m => m.op === "call.join" && m.data.channel_id === "chan-1"));
-  deliver("call.snapshot", { channel_id: "chan-1", participants: [{ user_id: "listener-9" }] });
+  const tracksBefore = audioTracksCreated;
+  deliver("call.snapshot", { channel_id: "chan-1", participants: [{ user_id: "listener-9" }, { user_id: "listener-8" }] });
   await sleep(30);
-  check("offers music to a listener from the reconciled snapshot", sent.slice(afterFirstPlay).some(m => m.op === "rtc.offer" && m.data.to === "listener-9"));
+  check("offers music to every listener from the reconciled snapshot",
+    ["listener-9", "listener-8"].every(id => sent.slice(afterFirstPlay).some(m => m.op === "rtc.offer" && m.data.to === id)));
+  check("each peer gets its own music track (wrtc fan-out)", audioTracksCreated - tracksBefore === 2, `${audioTracksCreated - tracksBefore} tracks for 2 peers`);
   check("YouTube status carries the provider brand", sent.some(m => m.op === "music.status" && m.data.kind === "playing" && m.data.origin === "youtube"));
 
   // Queue a second track while the first plays: it must not restart playback.
