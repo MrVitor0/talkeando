@@ -82,7 +82,16 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           New-Item -ItemType Directory -Force release/velopack | Out-Null
-          try { gh release download $env:UPDATE_FEED_TAG --dir release/velopack --clobber } catch { Write-Host 'The update feed does not exist yet; creating its first package.' }
+          # PowerShell's try/catch does not catch a non-zero exit code from
+          # `gh`. The first Velopack release has no feed to download yet, so
+          # detect it explicitly and let the following package step create it.
+          gh release view $env:UPDATE_FEED_TAG 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host 'The update feed does not exist yet; creating its first package.'
+            exit 0
+          }
+          gh release download $env:UPDATE_FEED_TAG --dir release/velopack --clobber
+          if ($LASTEXITCODE -ne 0) { throw 'Could not download the existing Velopack update feed.' }
 
       - name: Package Velopack release
         shell: pwsh
