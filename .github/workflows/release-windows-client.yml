@@ -57,7 +57,12 @@ jobs:
 
       - uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: '8.0.x'
+          # The publisher/Velopack tooling uses the current SDK, while the
+          # desktop app and its testhost still target net6. Installing both
+          # supplies Microsoft.NETCore.App 6.x on windows-latest.
+          dotnet-version: |
+            8.0.x
+            6.0.x
 
       - name: Test native client
         run: dotnet test client/native/Talkeando.Client.Tests/Talkeando.Client.Tests.csproj --configuration Release
