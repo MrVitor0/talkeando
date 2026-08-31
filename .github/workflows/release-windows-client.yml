@@ -1,0 +1,123 @@
+name: Release Windows client (Velopack)
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'SemVer without v (example: 1.0.1)'
+        required: true
+      channel:
+        description: 'Release channel'
+        type: choice
+        options: [stable, beta]
+        default: beta
+
+# The legacy bridge remains GitHub's latest release forever. Modern clients
+# read only the private update-feed release below, never /releases/latest.
+permissions:
+  contents: write
+
+env:
+  VELOPACK_VERSION: '1.2.0'
+  PACK_ID: Tupi.Client
+  UPDATE_FEED_TAG: tupi-update-feed
+
+jobs:
+  release:
+    if: github.event_name == 'workflow_dispatch' || github.ref_name != 'v0.1.999'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve release metadata
+        id: release
+        shell: pwsh
+        run: |
+          $version = if ('${{ github.event_name }}' -eq 'workflow_dispatch') { '${{ inputs.version }}' } else { '${{ github.ref_name }}'.TrimStart('v') }
+          if ($version -notmatch '^\d+\.\d+\.\d+(-[0-9A-Za-z.-]+)?$') { throw "Invalid SemVer: $version" }
+          $channel = if ('${{ github.event_name }}' -eq 'workflow_dispatch') { '${{ inputs.channel }}' } elseif ($version -match '-') { 'beta' } else { 'stable' }
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "channel=$channel" >> $env:GITHUB_OUTPUT
+          "velopack_channel=win-x64-$channel" >> $env:GITHUB_OUTPUT
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: client/ui/package-lock.json
+
+      - name: Build web interface
+        working-directory: client/ui
+        run: |
+          npm ci
+          npm run build
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Test native client
+        run: dotnet test client/native/Talkeando.Client.Tests/Talkeando.Client.Tests.csproj --configuration Release
+
+      - name: Publish application payload
+        shell: pwsh
+        run: |
+          dotnet publish client/native/Talkeando.Client/Talkeando.Client.csproj --configuration Release --runtime win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:Version="${{ steps.release.outputs.version }}" -p:AssemblyVersion="${{ steps.release.outputs.version }}.0" -p:FileVersion="${{ steps.release.outputs.version }}.0" --output release/Tupi-win-x64
+
+      - name: Install Velopack CLI
+        shell: pwsh
+        run: dotnet tool install --global vpk --version $env:VELOPACK_VERSION
+
+      - name: Restore current update feed for delta packages
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          New-Item -ItemType Directory -Force release/velopack | Out-Null
+          try { gh release download $env:UPDATE_FEED_TAG --dir release/velopack --clobber } catch { Write-Host 'The update feed does not exist yet; creating its first package.' }
+
+      - name: Package Velopack release
+        shell: pwsh
+        run: |
+          @"
+          # Tupi ${{ steps.release.outputs.version }}
+
+          Canal: ${{ steps.release.outputs.channel }}
+          Commit: ${{ github.sha }}
+          "@ | Set-Content release/release-notes.md
+          vpk pack --packId $env:PACK_ID --packVersion "${{ steps.release.outputs.version }}" --packDir release/Tupi-win-x64 --mainExe Tupi.exe --outputDir release/velopack --channel "${{ steps.release.outputs.velopack_channel }}" --packTitle Tupi --icon client/native/Talkeando.Client/assets/tupi.ico --framework webview2 --releaseNotes release/release-notes.md
+
+      - name: Write checksums for release artifacts
+        shell: pwsh
+        run: |
+          Get-ChildItem release/velopack -File | Get-FileHash -Algorithm SHA256 | ForEach-Object { "{0}  {1}" -f $_.Hash.ToLowerInvariant(), $_.Path.Substring((Resolve-Path release/velopack).Path.Length + 1) } | Set-Content release/velopack/SHA256SUMS.txt
+
+      - name: Publish immutable update feed
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view $env:UPDATE_FEED_TAG 2>$null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $env:UPDATE_FEED_TAG --title 'Tupi update feed (machine managed)' --notes 'Do not install assets from this release manually.' --prerelease
+          }
+          gh release upload $env:UPDATE_FEED_TAG release/velopack/* --clobber
+
+      - name: Create human-facing GitHub release without changing legacy latest
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = 'v${{ steps.release.outputs.version }}'
+          $notes = "Tupi $tag (${{ steps.release.outputs.channel }}).`n`nThis release is delivered automatically to Velopack clients. The legacy v0.1.999 bridge intentionally remains the GitHub latest release for old clients."
+          $pre = if ('${{ steps.release.outputs.channel }}' -eq 'beta') { '--prerelease' } else { '' }
+          gh release create $tag release/velopack/$env:PACK_ID-Setup.exe release/velopack/SHA256SUMS.txt --title "Tupi $tag" --notes $notes --latest=false $pre
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Tupi-${{ steps.release.outputs.version }}-${{ steps.release.outputs.channel }}
+          path: release/velopack
+          if-no-files-found: error

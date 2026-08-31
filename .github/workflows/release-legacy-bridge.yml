@@ -1,0 +1,49 @@
+name: Release final legacy bridge
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type RELEASE-LEGACY-BRIDGE to publish the one-way bridge'
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  bridge:
+    if: github.event.inputs.confirm == 'RELEASE-LEGACY-BRIDGE'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: client/ui/package-lock.json
+      - name: Build web interface
+        working-directory: client/ui
+        run: |
+          npm ci
+          npm run build
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '6.0.x'
+      - name: Publish the Inno-compatible bridge payload
+        run: dotnet publish client/native/Talkeando.Client/Talkeando.Client.csproj --configuration Release --runtime win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:TupiLegacyBridge=true -p:Version=0.1.999 -p:AssemblyVersion=0.1.999.0 -p:FileVersion=0.1.999.0 --output release/Tupi-legacy-bridge
+      - name: Download WebView2 bootstrapper
+        shell: pwsh
+        run: Invoke-WebRequest -Uri 'https://go.microsoft.com/fwlink/p/?LinkId=2124703' -OutFile client/native/installer/MicrosoftEdgeWebview2Setup.exe
+      - name: Build final Inno installer
+        shell: pwsh
+        run: iscc /DAppVersion="0.1.999" /DPublishDir="${{ github.workspace }}\release\Tupi-legacy-bridge" client/native/installer/Tupi.iss
+      - name: Publish pinned GitHub latest release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download tupi-update-feed --pattern 'Tupi.Client-Setup.exe' --dir release/feed 2>$null
+          if ($LASTEXITCODE -ne 0) { throw 'Publish the first Velopack stable package to tupi-update-feed before releasing the bridge.' }
+          $setup = 'client/native/installer/output/Tupi-Setup-0.1.999-x64.exe'
+          Get-FileHash $setup -Algorithm SHA256 | ForEach-Object { "{0}  {1}" -f $_.Hash.ToLowerInvariant(), (Split-Path $_.Path -Leaf) } | Set-Content SHA256SUMS.txt
+          gh release create v0.1.999 $setup SHA256SUMS.txt --title 'Tupi v0.1.999 — Legacy Bridge' --notes 'Final Inno release. It silently migrates this installation to the new automatic updater.' --latest=true

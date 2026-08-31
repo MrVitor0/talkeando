@@ -1,33 +1,36 @@
 using System;
 using System.Diagnostics;
 using System.IO;
+using System.Linq;
 using System.Net.Http;
-using System.Net.Http.Headers;
 using System.Reflection;
-using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
+using Velopack;
 
 namespace Tupi.Client;
 
+/// <summary>
+/// The updater used by every post-bridge build. It intentionally never calls
+/// GitHub's <c>/releases/latest</c>: that endpoint stays reserved for the
+/// final Inno release so legacy clients cannot download a package they do not
+/// understand.
+/// </summary>
 public sealed record UpdateInfo(
     string CurrentVersion,
     string LatestVersion,
     string ReleaseNotes,
-    string DownloadUrl,
     long FileSizeBytes
 );
 
 public sealed class UpdateChecker
 {
-    private readonly HttpClient _http = new();
-    private readonly string _repo;
-    private string? _downloadedSetupPath;
+    private readonly UpdateManager _manager;
+    private Velopack.UpdateInfo? _available;
 
-    public UpdateChecker(string repo = "MrVitor0/talkeando")
+    public UpdateChecker()
     {
-        _repo = string.IsNullOrWhiteSpace(repo) ? "MrVitor0/talkeando" : repo;
-        _http.DefaultRequestHeaders.UserAgent.Add(new ProductInfoHeaderValue("TupiApp", "1.0"));
+        _manager = new UpdateManager(ReleaseConfiguration.UpdateFeedUrl);
     }
 
     public static string GetCurrentVersion()
@@ -40,153 +43,106 @@ public sealed class UpdateChecker
     {
         try
         {
-            var url = $"https://api.github.com/repos/{_repo}/releases/latest";
-            using var response = await _http.GetAsync(url);
-            if (!response.IsSuccessStatusCode)
-            {
-                DebugLog.Write($"Update check returned status: {response.StatusCode}");
+            _available = await _manager.CheckForUpdatesAsync();
+            if (_available == null)
                 return null;
-            }
 
-            var json = await response.Content.ReadAsStringAsync();
-            using var doc = JsonDocument.Parse(json);
-            var root = doc.RootElement;
-
-            var tagName = root.GetProperty("tag_name").GetString() ?? "";
-            var currentVersion = GetCurrentVersion();
-
-            if (!IsNewerVersion(tagName, currentVersion))
-            {
-                DebugLog.Write($"Update check: current version ({currentVersion}) is up to date with latest ({tagName})");
-                return null;
-            }
-
-            var body = root.TryGetProperty("body", out var b) ? b.GetString() ?? "" : "";
-
-            string downloadUrl = "";
-            long size = 0;
-            if (root.TryGetProperty("assets", out var assets) && assets.ValueKind == JsonValueKind.Array)
-            {
-                foreach (var asset in assets.EnumerateArray())
-                {
-                    var name = asset.GetProperty("name").GetString() ?? "";
-                    if (name.EndsWith(".exe", StringComparison.OrdinalIgnoreCase))
-                    {
-                        downloadUrl = asset.GetProperty("browser_download_url").GetString() ?? "";
-                        size = asset.TryGetProperty("size", out var s) ? s.GetInt64() : 0;
-                        break;
-                    }
-                }
-            }
-
-            if (string.IsNullOrEmpty(downloadUrl))
-            {
-                DebugLog.Write("Update check: no .exe installer asset found in latest release.");
-                return null;
-            }
-
-            DebugLog.Write($"Update check: new version available! {tagName} ({size} bytes)");
-            return new UpdateInfo(currentVersion, tagName, body, downloadUrl, size);
+            var target = _available.TargetFullRelease;
+            return new UpdateInfo(
+                _manager.CurrentVersion?.ToString() ?? GetCurrentVersion(),
+                target.Version.ToString(),
+                target.NotesMarkdown ?? string.Empty,
+                target.Size
+            );
         }
         catch (Exception ex)
         {
-            DebugLog.Write($"Update check failed: {ex.Message}");
+            // A dotnet/dev run is not a Velopack installation. It must stay
+            // quiet rather than turning local development into an error modal.
+            DebugLog.Write($"Velopack update check skipped/failed: {ex.Message}");
             return null;
         }
     }
 
-    public async Task<string> DownloadUpdateAsync(string downloadUrl, Action<int, long, long> onProgress, CancellationToken ct = default)
+    public async Task DownloadUpdateAsync(Action<int> onProgress, CancellationToken ct = default)
     {
-        var tempFile = Path.Combine(Path.GetTempPath(), $"Tupi-Update-{Guid.NewGuid():N}.exe");
-        using var response = await _http.GetAsync(downloadUrl, HttpCompletionOption.ResponseHeadersRead, ct);
-        response.EnsureSuccessStatusCode();
+        if (_available == null)
+            throw new InvalidOperationException("Nenhuma atualizaÃ§Ã£o pendente para baixar.");
 
-        var totalBytes = response.Content.Headers.ContentLength ?? -1L;
-        using var stream = await response.Content.ReadAsStreamAsync(ct);
-        using var fileStream = new FileStream(tempFile, FileMode.Create, FileAccess.Write, FileShare.None);
-
-        var buffer = new byte[81920];
-        long totalRead = 0;
-        int bytesRead;
-
-        while ((bytesRead = await stream.ReadAsync(buffer, 0, buffer.Length, ct)) > 0)
-        {
-            await fileStream.WriteAsync(buffer, 0, bytesRead, ct);
-            totalRead += bytesRead;
-            var percent = totalBytes > 0 ? (int)((totalRead * 100) / totalBytes) : -1;
-            onProgress(percent, totalRead, totalBytes);
-        }
-
-        _downloadedSetupPath = tempFile;
-        DebugLog.Write($"Update download complete: {tempFile} ({totalRead} bytes)");
-        return tempFile;
+        await _manager.DownloadUpdatesAsync(_available, onProgress, ct);
     }
 
-    public void ApplyUpdate(string? setupPath = null)
+    public void ApplyUpdate()
     {
-        var path = setupPath ?? _downloadedSetupPath;
-        if (string.IsNullOrEmpty(path) || !File.Exists(path))
-            throw new FileNotFoundException("Arquivo de instalação não encontrado.");
+        if (_available == null)
+            throw new InvalidOperationException("Nenhuma atualizaÃ§Ã£o baixada para aplicar.");
 
-        DebugLog.Write($"Applying update from: {path}");
-
-        try
-        {
-            Process.Start(new ProcessStartInfo
-            {
-                FileName = path,
-                UseShellExecute = true
-            });
-        }
-        catch (Exception ex)
-        {
-            DebugLog.Write($"Failed to launch setup: {ex.Message}");
-        }
-
-        Environment.Exit(0);
-    }
-
-    private static Version? ParseVersion(string raw)
-    {
-        if (string.IsNullOrWhiteSpace(raw)) return null;
-
-        var cleaned = raw.Trim().TrimStart('v', 'V');
-        if (Version.TryParse(cleaned, out var directVer))
-            return directVer;
-
-        var matches = System.Text.RegularExpressions.Regex.Matches(cleaned, @"\d+");
-        if (matches.Count >= 2)
-        {
-            var parts = new int[4];
-            for (int i = 0; i < matches.Count && i < 4; i++)
-            {
-                if (int.TryParse(matches[i].Value, out var num))
-                    parts[i] = num;
-            }
-            if (matches.Count == 2)
-                return new Version(parts[0], parts[1]);
-            if (matches.Count == 3)
-                return new Version(parts[0], parts[1], parts[2]);
-            return new Version(parts[0], parts[1], parts[2], parts[3]);
-        }
-        else if (matches.Count == 1 && int.TryParse(matches[0].Value, out var singleBuild))
-        {
-            return new Version(0, 1, singleBuild);
-        }
-
-        return null;
-    }
-
-    private static bool IsNewerVersion(string latestStr, string currentStr)
-    {
-        var latest = ParseVersion(latestStr);
-        var current = ParseVersion(currentStr);
-
-        if (latest != null && current != null)
-        {
-            return latest > current;
-        }
-
-        return false;
+        // Velopack starts its own updater process, waits for this process to
+        // end, atomically switches the package and launches the stable stub.
+        _manager.ApplyUpdatesAndRestart(_available);
     }
 }
+
+internal static class ReleaseConfiguration
+{
+    private const string DefaultFeed = "https://github.com/MrVitor0/tupi/releases/download/tupi-update-feed";
+    private const string DefaultBridgeSetup = DefaultFeed + "/Tupi.Client-Setup.exe";
+
+    public static string UpdateFeedUrl =>
+        Environment.GetEnvironmentVariable("TUPI_UPDATE_FEED_URL")
+        ?? Metadata("Tupi.UpdateFeedUrl")
+        ?? DefaultFeed;
+
+    public static string LegacyMigrationSetupUrl =>
+        Environment.GetEnvironmentVariable("TUPI_LEGACY_MIGRATION_SETUP_URL")
+        ?? Metadata("Tupi.LegacyMigrationSetupUrl")
+        ?? DefaultBridgeSetup;
+
+    private static string? Metadata(string key) =>
+        Assembly.GetExecutingAssembly()
+            .GetCustomAttributes<AssemblyMetadataAttribute>()
+            .FirstOrDefault(attribute => attribute.Key == key)?.Value;
+}
+
+#if TUPI_LEGACY_BRIDGE
+/// <summary>
+/// Runs only in v0.1.999. Old clients reach this executable through their
+/// existing Inno/GitHub-latest updater; this class then moves them to the
+/// separate Velopack installation without exposing the new package format to
+/// those old binaries.
+/// </summary>
+internal static class LegacyBridgeMigrator
+{
+    private static readonly HttpClient Http = new();
+
+    public static async Task MigrateAsync()
+    {
+        var installedStub = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "Tupi.Client", "Tupi.exe");
+        if (File.Exists(installedStub))
+        {
+            DebugLog.Write("Legacy bridge found the Velopack install; redirecting legacy shortcut.");
+            Process.Start(new ProcessStartInfo { FileName = installedStub, UseShellExecute = true });
+            Environment.Exit(0);
+            return;
+        }
+
+        var setupPath = Path.Combine(Path.GetTempPath(), "Tupi.Client-Setup.exe");
+        DebugLog.Write($"Legacy bridge downloading Velopack setup from {ReleaseConfiguration.LegacyMigrationSetupUrl}");
+        using var response = await Http.GetAsync(ReleaseConfiguration.LegacyMigrationSetupUrl, HttpCompletionOption.ResponseHeadersRead);
+        response.EnsureSuccessStatusCode();
+        await using (var source = await response.Content.ReadAsStreamAsync())
+        await using (var destination = new FileStream(setupPath, FileMode.Create, FileAccess.Write, FileShare.None))
+            await source.CopyToAsync(destination);
+
+        Process.Start(new ProcessStartInfo
+        {
+            FileName = setupPath,
+            Arguments = "--silent",
+            UseShellExecute = true,
+        });
+        Environment.Exit(0);
+    }
+}
+#endif

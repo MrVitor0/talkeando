@@ -11,6 +11,7 @@ import { BANNER_PRESETS, getBannerPreset } from "./banners";
 import { matchesVoiceShortcut, type VoiceInputMode } from "./voiceShortcut";
 import type { AudioPipelineStatus, NoiseSuppressionMode } from "./audioPipeline";
 import logoUrl from "../icons/logo.webp";
+import tupiOwlLogoUrl from "../icons/tupi-owl.png";
 
 type Channel = { id: string; name: string; kind: "text" | "voice"; topic?: string | null };
 type ChannelCategory = { id: string; name: string; position: number; channels: Channel[] };
@@ -1009,6 +1010,10 @@ export function App() {
   const uploadingFileRef = useRef<{ name: string; previewUrl?: string | null; type: string } | null>(null);
   uploadingFileRef.current = uploadingFile;
   const pendingUploadPreviewsRef = useRef<Map<string, string>>(new Map());
+  // A paste bubbles from the editor to the composer. Keep the upload entry
+  // point idempotent as a second line of defense against browser/native event
+  // duplication; File objects are short-lived and WeakSet does not retain them.
+  const queuedUploadFilesRef = useRef<WeakSet<File>>(new WeakSet());
   const [isDraggingFiles, setIsDraggingFiles] = useState(false);
   const dragCounterRef = useRef(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -1093,7 +1098,7 @@ export function App() {
   const peekOwnerRef = useRef<string | null>(null);
   // Set when "Assistir" is clicked for a channel we haven't joined: after the
   // join completes and the stream shows up, promote it to a full watch.
-  const pendingWatchRef = useRef<{ ownerId: string; streamId: string } | null>(null);
+  const pendingWatchRef = useRef<{ ownerId: string; streamId?: string } | null>(null);
   const voiceRowRefs = useRef<Record<string, HTMLElement>>({});
   const [remoteVideos, setRemoteVideos] = useState<Record<string, RemoteVid[]>>({});
   // Our own webcam publication (streamId for unpublish) + live preview stream.
@@ -1122,12 +1127,10 @@ export function App() {
     current_version: string;
     latest_version: string;
     release_notes: string;
-    download_url: string;
     file_size_bytes?: number;
   } | null>(null);
   const [updateProgress, setUpdateProgress] = useState<number | null>(null);
   const [updateReady, setUpdateReady] = useState(false);
-  const [updateReadyPath, setUpdateReadyPath] = useState<string | null>(null);
   const [updateDismissed, setUpdateDismissed] = useState(false);
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsInitialTab, setSettingsInitialTab] = useState<"voice" | "account" | "appearance">("voice");
@@ -1488,8 +1491,8 @@ export function App() {
         if (isImage && !preview) {
           preview = (att.filename && pendingUploadPreviewsRef.current.get(att.filename)) || uploadingFileRef.current?.previewUrl || null;
         }
-        setAttachmentIds(current => [...current, att.id]);
-        setReadyAttachments(current => [...current, {
+        setAttachmentIds(current => current.includes(att.id) ? current : [...current, att.id]);
+        setReadyAttachments(current => current.some(existing => existing.id === att.id) ? current : [...current, {
           id: att.id,
           name: att.filename || "anexo",
           previewUrl: preview,
@@ -1512,7 +1515,6 @@ export function App() {
       if (event.op === "update.ready") {
         setUpdateProgress(null);
         setUpdateReady(true);
-        setUpdateReadyPath(event.data?.file_path ?? null);
       }
       if (event.op === "update.error") {
         setUpdateProgress(null);
@@ -1738,10 +1740,11 @@ export function App() {
   useEffect(() => {
     const pending = pendingWatchRef.current;
     if (!pending || !call) return;
-    if (!streams.some(s => s.stream_id === pending.streamId)) return;
+    const stream = streams.find(s => s.owner === pending.ownerId && s.kind === "screen" && (!pending.streamId || s.stream_id === pending.streamId));
+    if (!stream) return;
     pendingWatchRef.current = null;
     if (!watching[pending.ownerId]) {
-      rtc.watchStream(call.channelId, pending.streamId, pending.ownerId);
+      rtc.watchStream(call.channelId, stream.stream_id, pending.ownerId);
       setWatching(current => ({ ...current, [pending.ownerId]: true }));
     }
   }, [streams, call, watching]);
@@ -1984,6 +1987,8 @@ export function App() {
 
   function uploadFileBlob(file: File) {
     if (!activeChannel) return;
+    if (queuedUploadFilesRef.current.has(file)) return;
+    queuedUploadFilesRef.current.add(file);
     const isImg = file.type.startsWith("image/");
     const preview = isImg ? URL.createObjectURL(file) : null;
     if (preview && file.name) {
@@ -2363,6 +2368,34 @@ export function App() {
     if (!call) return;
     rtc.stopWatchingStream(call.channelId, streamId, ownerId);
     setWatching(current => ({ ...current, [ownerId]: false }));
+  }
+  // AO VIVO is a one-way focus action: it opens the channel and keeps the
+  // screen on stage instead of toggling an existing watch off.
+  function focusLiveShare(channel: Channel, ownerId: string, stream?: StreamInfo) {
+    if (ownerId === currentUserId) return; // own share is already on the stage
+    cancelPeekHide();
+    endPeek();
+    // `call` can still point to Alpha while the user is reading a text
+    // channel. Always select the voice channel too: subscribing alone does
+    // not change the workspace from chat to the call stage.
+    setFocusedUser(ownerId);
+    setTheater(false);
+    chooseVoiceChannel(channel);
+    if (call?.channelId !== channel.id) {
+      // The roster can arrive before its stream list. Resolve the stream by
+      // owner after the new call completes in that case.
+      pendingWatchRef.current = { ownerId, streamId: stream?.stream_id };
+      return;
+    }
+    if (!stream) {
+      pendingWatchRef.current = { ownerId };
+      rtc.ensureChannel(channel.id);
+      return;
+    }
+    if (!watching[ownerId] || !pickRemoteVideo(ownerId, "screen")) {
+      rtc.watchStream(channel.id, stream.stream_id, ownerId);
+      setWatching(current => ({ ...current, [ownerId]: true }));
+    }
   }
   function toggleScreenAudioMute(ownerId: string) {
     setScreenMutedPeers(current => {
@@ -2847,7 +2880,7 @@ export function App() {
               ) : updateReady ? (
                 <button
                   className="update-modal-btn is-ready"
-                  onClick={() => send("update.apply", { file_path: updateReadyPath })}
+                  onClick={() => send("update.apply", {})}
                 >
                   Reiniciar e Atualizar Agora
                 </button>
@@ -2860,10 +2893,10 @@ export function App() {
                     className="update-modal-btn is-primary"
                     onClick={() => {
                       setUpdateProgress(0);
-                      send("update.download", { download_url: updateInfo.download_url });
+                      send("update.download", {});
                     }}
                   >
-                    Baixar e Instalar
+                    Baixar AtualizaÃ§Ã£o
                   </button>
                 </div>
               )}
@@ -2883,7 +2916,7 @@ export function App() {
         <div className="leftnav__cols">
           <nav className="guilds">
             <div
-              className={`guilds__pill ${navMode === "dm" ? "is-active" : "is-plain"}`}
+              className={`guilds__pill guilds__pill--tupi ${navMode === "dm" ? "is-active" : "is-plain"}`}
               onClick={() => {
                 setNavMode("dm");
                 if (activeDmUserId) {
@@ -2898,7 +2931,7 @@ export function App() {
               }}
               title="Mensagens Diretas"
             >
-              <Icon name="discord-icon" size={26} />
+              <img className="guilds__tupi-mark" src={tupiOwlLogoUrl} alt="Tupi" />
             </div>
             <div className="guilds__sep" />
             <div
@@ -3113,7 +3146,7 @@ export function App() {
                       const preview = canPeek && !watching[entry.user_id] && peekOwner === entry.user_id
                         ? pickRemoteVideo(entry.user_id, "screen")
                         : undefined;
-                      const promoteWatch = () => {
+                      const promoteWatch = () => focusLiveShare(channel, entry.user_id, share); /* legacy hover action:
                         cancelPeekHide();
                         if (here) {
                           endPeek();
@@ -3125,7 +3158,7 @@ export function App() {
                           endPeek();
                           chooseVoiceChannel(channel);
                         }
-                      };
+                      */
                       return (
                         <div
                           className={
@@ -3161,7 +3194,16 @@ export function App() {
                           {audioOff && <Icon name="headphone-muted" size={15} className="voice-member__flag" />}
                           {mutedPeers[entry.user_id] && <Icon name="headphone-muted" size={15} className="voice-member__flag voice-member__flag--local-muted" title="Silenciado só para você" />}
                           {hasCamera && <Icon name="camera" size={15} className="voice-member__flag voice-member__flag--cam" title="Câmera ligada" />}
-                          {isLive && <span className="voice-member__live-badge">AO VIVO</span>}
+                          {isLive && (
+                            <button
+                              type="button"
+                              className="voice-member__live-badge voice-member__live-badge--watch"
+                              title={`Assistir à tela de ${name}`}
+                              onClick={event => { event.stopPropagation(); focusLiveShare(channel, entry.user_id, share); }}
+                            >
+                              AO VIVO
+                            </button>
+                          )}
                           {botPlaying && (
                             <span className="voice-member__live-badge voice-member__live-badge--bot" style={{ display: "inline-flex", alignItems: "center", gap: "4px" }}>
                               <MusicNoteIcon size={11} />
@@ -3780,7 +3822,6 @@ export function App() {
                     value={content}
                     onChange={event => setContent(event.target.value)}
                     onKeyDown={onComposerKeyDown}
-                    onPaste={handlePaste}
                     placeholder={
                       navMode === "dm" && activeDmUserId
                         ? `Conversar em @${members.find(m => m.id === activeDmUserId)?.display_name || "membro"}`

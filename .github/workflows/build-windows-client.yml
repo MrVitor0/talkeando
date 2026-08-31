@@ -1,4 +1,4 @@
-name: Build Windows client
+name: Build Windows client (internal artifact)
 
 on:
   workflow_dispatch:
@@ -86,13 +86,6 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      - name: Create GitHub Release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: pwsh
-        run: |
-          # The updater compares semantic versions. Keep the channel label in
-          # the title/file name, but use one unambiguous numeric tag so a
-          # client can jump straight to the newest release.
-          $tag = "v0.1.${{ github.run_number }}"
-          gh release create $tag "release/Tupi-${{ inputs.version_label }}-win-x64.zip" "client/native/installer/output/Tupi-Setup-${{ inputs.version_label }}-x64.exe" --title "Tupi Client v${{ inputs.version_label }} (Build #${{ github.run_number }})" --notes "Manual release build from main branch."
+      # Deliberately no GitHub Release here. GitHub's global `latest` release
+      # is permanently reserved for v0.1.999, the Inno-to-Velopack bridge.
+      # Use release-windows-client.yml for every distributable version.

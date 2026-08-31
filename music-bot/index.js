@@ -60,6 +60,17 @@ const LOW_WATER_MS = Number(process.env.MUSIC_LOW_WATER_MS || 2000);
 const PREBUFFER_BYTES = PREBUFFER_MS * BYTES_PER_MS;
 const HIGH_WATER_BYTES = HIGH_WATER_MS * BYTES_PER_MS;
 const LOW_WATER_BYTES = LOW_WATER_MS * BYTES_PER_MS;
+function positiveEnv(name, fallback) {
+  const value = Number(process.env[name]);
+  return Number.isFinite(value) && value > 0 ? value : fallback;
+}
+// Resolve a few entries in parallel, but only ever download/decode one future
+// song. This makes skip fast even when the immediate next Spotify track has no
+// usable mirror, without turning a long playlist into dozens of yt-dlp jobs.
+const PREFETCH_RESOLVE_WINDOW = Math.floor(positiveEnv("MUSIC_PREFETCH_RESOLVE_WINDOW", 4));
+const PREFETCH_RESOLVE_CONCURRENCY = Math.floor(positiveEnv("MUSIC_PREFETCH_RESOLVE_CONCURRENCY", 2));
+const PREPARE_BUFFER_MS = Math.max(PREBUFFER_MS, positiveEnv("MUSIC_PREPARE_BUFFER_MS", 2500));
+const PREPARE_BUFFER_BYTES = PREPARE_BUFFER_MS * BYTES_PER_MS;
 // If the event loop stalls we resync the clock instead of firing a burst of
 // catch-up frames, which would arrive as a chipmunk blip.
 const MAX_CATCHUP_MS = 500;
@@ -185,6 +196,7 @@ class PcmQueue {
 // absolute deadline instead of `setInterval(fn, 10)`, which drifts by seconds
 // an hour on a busy event loop.
 let current = null;          // the track being decoded right now
+let prepared = null;         // one decoded, bounded next track ready to swap in
 let feederTimer = null, nextFrameAt = 0;
 
 function startFeeder() {
@@ -350,9 +362,10 @@ const queue = [];
 // first is mid-await. `pendingAdvance` makes the in-flight call re-check the
 // queue on the way out instead of leaving a just-queued song stranded.
 let advancing = false, pendingAdvance = false;
+let warmingQueue = false;
 
-/** The playable source is resolved lazily, and the next entry is warmed while this one
- *  plays so /skip lands in well under a second instead of ~8. */
+/** Sources stay lazy: only the bounded prefetch window resolves while playback
+ * continues, rather than expanding a large playlist into hundreds of requests. */
 function resolveEntry(entry) {
   if (entry.resolution !== undefined) return Promise.resolve(entry.resolution);
   if (!entry.pending) {
@@ -365,7 +378,36 @@ function resolveEntry(entry) {
   }
   return entry.pending;
 }
-function prefetchNext() { if (queue[0]) void resolveEntry(queue[0]).catch(() => { }); }
+async function resolveWindow(entries) {
+  let cursor = 0;
+  const workers = Array.from({ length: Math.min(PREFETCH_RESOLVE_CONCURRENCY, entries.length) }, async () => {
+    while (cursor < entries.length) {
+      const entry = entries[cursor++];
+      try { await resolveEntry(entry); } catch { /* playback retries or skips it */ }
+    }
+  });
+  await Promise.all(workers);
+}
+
+// Resolve a small window concurrently, then warm exactly one playable stream.
+// An unavailable track stays in queue order but can no longer make /skip wait
+// for each subsequent provider search serially.
+async function warmUpcoming() {
+  if (warmingQueue || !current || paused) return;
+  if (prepared && queue.includes(prepared.meta.entry)) return;
+  warmingQueue = true;
+  try {
+    const window = queue.slice(0, PREFETCH_RESOLVE_WINDOW);
+    await resolveWindow(window);
+    if (!current || paused || prepared || !window.length) return;
+    const entry = window.find(candidate => candidate.resolution);
+    if (entry) beginPrepared(streamMeta(entry, entry.resolution));
+  } finally {
+    warmingQueue = false;
+  }
+}
+
+function prefetchNext() { void warmUpcoming(); }
 
 function resetEntryResolution(entry) {
   entry.pending = null;
@@ -429,6 +471,16 @@ function totalDurationMs(intents) {
 function stopCurrent() {
   const track = current;
   current = null;
+  stopTrack(track);
+}
+
+function stopPrepared() {
+  const track = prepared;
+  prepared = null;
+  stopTrack(track);
+}
+
+function stopTrack(track) {
   if (!track) return;
   track.aborted = true;
   try { track.yt.kill("SIGKILL"); } catch { /* already gone */ }
@@ -473,6 +525,11 @@ async function playNext() {
       const entry = queue.shift();
       const resolution = await resolveEntry(entry);
       if (!resolution) { log(`skipping ${JSON.stringify(entryTitle(entry, { candidate: {} }))} — could not resolve it`); continue; }
+      if (prepared?.meta.entry === entry) {
+        const track = prepared;
+        prepared = null;
+        if (activatePrepared(track)) { prefetchNext(); return; }
+      }
       if (beginStream(streamMeta(entry, resolution))) { prefetchNext(); return; }
       resetEntryResolution(entry);
       queue.unshift(entry);
@@ -490,17 +547,15 @@ async function playNext() {
   }
 }
 
-/** Spawn yt-dlp | ffmpeg for one playable reference. Returns false only if the
- *  spawn itself was impossible. YouTube retains its client-set retries; other
- *  empty sources fail over to the next provider. */
-function beginStream(meta, attempt = 0) {
-  stopCurrent();
+/** Spawn yt-dlp | ffmpeg for an active or a bounded prepared stream. */
+function spawnStream(meta, { attempt = 0, isPrepared = false } = {}) {
+  if (!isPrepared) stopCurrent();
   // Never expose a playing indicator before the decoder has actually
   // produced audio. This also clears a stale indicator during failover.
-  unpublishCurrent();
+  if (!isPrepared) unpublishCurrent();
   const clients = CLIENT_SETS[Math.min(attempt, CLIENT_SETS.length - 1)];
   const clientDetails = meta.provider === "youtube" ? ` clients=${clients}${attempt ? ` attempt=${attempt + 1}` : ""}` : "";
-  log(`playing "${meta.title}" (${meta.url}) provider=${meta.provider}${clientDetails}`);
+  log(`${isPrepared ? "preparing" : "playing"} "${meta.title}" (${meta.url}) provider=${meta.provider}${clientDetails}`);
 
   let yt, ffmpeg;
   try {
@@ -528,17 +583,16 @@ function beginStream(meta, attempt = 0) {
     ], { stdio: ["pipe", "pipe", "pipe"] });
   } catch (error) {
     log(`spawn failed: ${error.message}`);
-    return false;
+    return null;
   }
 
   const track = {
     meta, title: meta.title, yt, ffmpeg, attempt,
     pcm: new PcmQueue(), eof: false, flowing: false, done: false, aborted: false,
     stdoutPaused: false, bytes: 0, underruns: 0, startedAt: Date.now(), announced: false,
-    playbackStartedAt: 0, pausedStartedAt: 0, accumulatedPausedMs: 0,
+    playbackStartedAt: 0, pausedStartedAt: 0, accumulatedPausedMs: 0, isPrepared,
   };
-  current = track;
-  idleSince = 0;
+  if (!isPrepared) { current = track; idleSince = 0; }
 
   yt.stdout.pipe(ffmpeg.stdin);
   // Killing yt-dlp mid-song EPIPEs ffmpeg's stdin; without these handlers the
@@ -553,31 +607,26 @@ function beginStream(meta, attempt = 0) {
   ffmpeg.stderr.on("data", d => process.stderr.write(`[ffmpeg] ${d}`));
 
   ffmpeg.stdout.on("data", chunk => {
-    if (current !== track) return;
+    if (track.isPrepared ? prepared !== track : current !== track) return;
     if (track.bytes === 0) {
-      track.playbackStartedAt = Date.now();
-      log(`first PCM from ffmpeg after ${Date.now() - track.startedAt}ms`);
-      if (!track.announced) {
-        track.announced = true;
-        lastStatusChannelId = meta.entry.channelId || lastStatusChannelId;
-        publishTrack(meta.title);
-        statusReporter.report(meta.entry.channelId, "playing", statusDetails(meta));
-      }
+      log(`${track.isPrepared ? "prepared" : "first"} PCM from ffmpeg after ${Date.now() - track.startedAt}ms`);
+      if (!track.isPrepared) announcePlayback(track);
     }
     track.bytes += chunk.length;
     track.pcm.push(chunk);
-    if (!track.stdoutPaused && track.pcm.bytes >= HIGH_WATER_BYTES) {
+    const highWater = track.isPrepared ? PREPARE_BUFFER_BYTES : HIGH_WATER_BYTES;
+    if (!track.stdoutPaused && track.pcm.bytes >= highWater) {
       track.stdoutPaused = true;
       ffmpeg.stdout.pause();
     }
   });
 
   ffmpeg.on("close", () => {
-    if (track.aborted || current !== track) return;
+    if (track.aborted || (track.isPrepared ? prepared !== track : current !== track)) return;
     if (track.bytes > 0) { track.eof = true; return; }   // the feeder drains the tail, then advances
     if (meta.provider === "youtube" && attempt + 1 < CLIENT_SETS.length) {
       log(`"${meta.title}" produced no audio with clients=${clients} — retrying`);
-      beginStream(meta, attempt + 1);
+      replaceStream(track, meta, { attempt: attempt + 1, isPrepared });
       return;
     }
     log(`"${meta.title}" produced no audio with provider=${meta.provider} — trying the next provider`);
@@ -587,9 +636,52 @@ function beginStream(meta, attempt = 0) {
       score: meta.candidateScore,
       reason: "no_pcm",
     });
-    void failoverSource(track);
+    void (track.isPrepared ? failoverPrepared(track) : failoverSource(track));
   });
 
+  return track;
+}
+
+function beginStream(meta, attempt = 0) {
+  return Boolean(spawnStream(meta, { attempt }));
+}
+
+// Node emits child-process data asynchronously, after this call assigns the
+// prepared slot; the ownership guard in spawnStream then keeps streams isolated.
+function beginPrepared(meta, options = {}) {
+  if (prepared) return false;
+  const track = spawnStream(meta, { ...options, isPrepared: true });
+  if (!track) return false;
+  prepared = track;
+  return true;
+}
+
+function replaceStream(track, meta, options) {
+  if (options.isPrepared) {
+    if (prepared !== track) return;
+    stopPrepared();
+    beginPrepared(meta, options);
+  } else {
+    if (current !== track) return;
+    spawnStream(meta, options);
+  }
+}
+
+function announcePlayback(track) {
+  if (track.announced || current !== track) return;
+  track.announced = true;
+  track.playbackStartedAt = Date.now();
+  lastStatusChannelId = track.meta.entry.channelId || lastStatusChannelId;
+  publishTrack(track.title);
+  statusReporter.report(track.meta.entry.channelId, "playing", statusDetails(track.meta));
+}
+
+function activatePrepared(track) {
+  if (track.aborted) return false;
+  track.isPrepared = false;
+  current = track;
+  idleSince = 0;
+  announcePlayback(track);
   return true;
 }
 
@@ -613,6 +705,20 @@ async function failoverSource(track) {
   track.done = true;
   current = null;
   void playNext();
+}
+
+async function failoverPrepared(track) {
+  const { entry, providerIndex } = track.meta;
+  if (prepared !== track || track.aborted) return;
+  stopPrepared();
+  resetEntryResolution(entry);
+  entry.providerIndex = providerIndex;
+  const resolution = await resolveEntry(entry);
+  if (!current || prepared || resolution === null || resolution === undefined) {
+    prefetchNext();
+    return;
+  }
+  beginPrepared(streamMeta(entry, resolution));
 }
 
 function audioFilter() {
@@ -700,6 +806,7 @@ async function join(channelId) {
 }
 function leaveVoice() {
   stopCurrent();
+  stopPrepared();
   queue.length = 0;
   unpublishCurrent();
   stopFeeder();

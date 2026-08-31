@@ -15,6 +15,14 @@
     <ApplicationIcon>assets\tupi.ico</ApplicationIcon>
     <Version>0.1.0</Version>
     <AssemblyVersion>0.1.0.0</AssemblyVersion>
+    <!-- The feed is deliberately independent from GitHub's /releases/latest.
+         That endpoint remains pinned to the final Inno "bridge" release so
+         old clients can never attempt to consume a Velopack package. -->
+    <TupiUpdateFeedUrl Condition="'$(TupiUpdateFeedUrl)' == ''">https://github.com/MrVitor0/tupi/releases/download/tupi-update-feed</TupiUpdateFeedUrl>
+    <TupiLegacyMigrationSetupUrl Condition="'$(TupiLegacyMigrationSetupUrl)' == ''">https://github.com/MrVitor0/tupi/releases/download/tupi-update-feed/Tupi.Client-Setup.exe</TupiLegacyMigrationSetupUrl>
+  </PropertyGroup>
+  <PropertyGroup Condition="'$(TupiLegacyBridge)' == 'true'">
+    <DefineConstants>$(DefineConstants);TUPI_LEGACY_BRIDGE</DefineConstants>
   </PropertyGroup>
   <ItemGroup>
     <!-- WebRTC (voice mesh + screen share) now runs inside WebView2's own
@@ -23,6 +31,11 @@
          System.Windows.Forms/System.Drawing (GDI screen capture) are no
          longer needed here at all. -->
     <PackageReference Include="Microsoft.Web.WebView2" Version="1.0.3485.44" />
+    <PackageReference Include="Velopack" Version="1.2.0" />
+  </ItemGroup>
+  <ItemGroup>
+    <AssemblyMetadata Include="Tupi.UpdateFeedUrl" Value="$(TupiUpdateFeedUrl)" />
+    <AssemblyMetadata Include="Tupi.LegacyMigrationSetupUrl" Value="$(TupiLegacyMigrationSetupUrl)" />
   </ItemGroup>
   <ItemGroup>
     <Content Include="..\..\ui\dist\**\*" Link="ui\%(RecursiveDir)%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />

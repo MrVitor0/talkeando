@@ -50,6 +50,10 @@ const screenVolumes = new Map<string, number>(Object.entries(stored("tk.screenVo
 const muted = new Map<string, boolean>(Object.entries(storedBooleans("tk.peerMuted")));
 const screenMuted = new Map<string, boolean>(Object.entries(storedBooleans("tk.screenMuted")));
 const audio = new Map<string, HTMLAudioElement[]>(), screenAudio = new Map<string, HTMLAudioElement[]>();
+// A sidebar action can arrive before LiveKit has announced the matching
+// remote publication. Keep the intent and apply it from TrackPublished so
+// "AO VIVO" never turns into a UI-only watch with no actual subscription.
+const wantedScreens = new Map<string, string>();
 let locallyDeafened = false;
 
 function stored(key: string): Record<string, number> { try { return JSON.parse(localStorage.getItem(key) || "{}"); } catch { return {}; } }
@@ -170,6 +174,10 @@ async function setSink(element: HTMLMediaElement) {
   if (audioOutputDeviceId && sink) await sink.call(element, audioOutputDeviceId).catch(() => {});
 }
 function bind(room: Room) {
+  room.on(RoomEvent.TrackPublished, (publication, participant) => {
+    if (publication.source !== Track.Source.ScreenShare) return;
+    if (wantedScreens.has(participant.identity)) void publication.setSubscribed(true);
+  });
   room.on(RoomEvent.TrackSubscribed, (track, publication, participant) => {
     const element = track.attach() as HTMLMediaElement;
     element.autoplay = true; element.style.display = "none"; document.body.appendChild(element);
@@ -267,6 +275,7 @@ export async function joinCall(id: string, isMuted: boolean, isDeafened: boolean
   const attempt = ++connectAttempt;
   const previous = active ?? connecting;
   active = null; connecting = null;
+  wantedScreens.clear();
   if (presentChannelId) { send("voice.presence.leave", { channel_id: presentChannelId }); presentChannelId = null; }
   previous?.disconnect();
   screen?.getTracks().forEach(track => track.stop()); screen = null;
@@ -316,6 +325,7 @@ export async function leaveCall() {
   if (presentChannelId) { send("voice.presence.leave", { channel_id: presentChannelId }); presentChannelId = null; }
   const room = active ?? connecting;
   active = null; connecting = null;
+  wantedScreens.clear();
   stopLocalSpeechMonitor();
   await unpublishMicrophone(room);
   await microphone.dispose();
@@ -381,8 +391,16 @@ function screenPublication(sid: string, owner: string) {
   return participant.trackPublications.get(sid)
     ?? [...participant.trackPublications.values()].find(publication => publication.source === Track.Source.ScreenShare);
 }
-export function watchStream(_: string, sid: string, owner: string) { screenPublication(sid, owner)?.setSubscribed(true); }
-export function stopWatchingStream(_: string, sid: string, owner: string) { screenPublication(sid, owner)?.setSubscribed(false); }
+export function watchStream(_: string, sid: string, owner: string) {
+  wantedScreens.set(owner, sid);
+  const publication = screenPublication(sid, owner);
+  if (publication) void publication.setSubscribed(true);
+  return Boolean(publication);
+}
+export function stopWatchingStream(_: string, sid: string, owner: string) {
+  wantedScreens.delete(owner);
+  void screenPublication(sid, owner)?.setSubscribed(false);
+}
 export async function spectate(id: string, sid: string, owner: string) { if (!active) { const credential = await credentials(id, "spectator"); const room = new Room({ adaptiveStream: true, dynacast: true }); bind(room); await room.connect(credential.url, credential.token); active = room; } watchStream(id, sid, owner); }
 export function stopSpectate(_: string) {}
 export function onRemoteStream(listener: Remote) { remotes.add(listener); return () => { remotes.delete(listener); }; }

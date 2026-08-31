@@ -1,4 +1,7 @@
-# Instalador Windows
+# Instalador Windows legado
+
+> Este instalador Ã© usado exclusivamente pela release `v0.1.999` de ponte.
+> Releases novas usam Velopack; consulte `docs/desktop-updates.md`.
 
 O instalador da v1 usa Inno Setup e entrega o publish x64 do WPF junto dos
 assets React. Baixe o bootstrapper Evergreen do WebView2 como

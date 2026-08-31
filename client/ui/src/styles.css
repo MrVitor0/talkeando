@@ -12,44 +12,46 @@
   --font-weight-extra-bold: 800;
 
   /* surfaces — tracked to Discord's current (flat, darker) dark theme */
-  --bg-rail: #131416;
-  --bg-sidebar: #1a1b1e;
-  --bg-chat: #1e1f22;
-  --bg-members: #1a1b1e;
-  --bg-floating: #111214;
-  --bg-userbar: #1a1b1e;
-  --bg-input: #2b2d31;
-  --bg-input-2: #101115;
-  --bg-hover: rgba(78, 80, 88, 0.3);
-  --bg-active: rgba(78, 80, 88, 0.6);
-  --bg-message-hover: rgba(2, 2, 2, 0.06);
-  --bg-stage: #000000;
-  --bg-tile: #131416;
-  --bg-embed: #242529;
-  --border-subtle: rgba(255, 255, 255, 0.06);
+  --bg-rail: #101015;
+  --bg-sidebar: #18171e;
+  --bg-chat: #1d1c23;
+  --bg-members: #18171e;
+  --bg-floating: #121217;
+  --bg-userbar: #19181e;
+  --bg-input: #2a292f;
+  --bg-input-2: #101015;
+  --bg-hover: rgba(25, 126, 99, 0.13);
+  --bg-active: rgba(25, 126, 99, 0.22);
+  --bg-message-hover: rgba(25, 126, 99, 0.06);
+  --bg-stage: #0c0c10;
+  --bg-tile: #18171e;
+  --bg-embed: #222027;
+  --border-subtle: rgba(121, 105, 202, 0.17);
 
   /* text */
-  --text-normal: #dbdee1;
-  --text-muted: #949ba4;
-  --text-faint: #80848e;
-  --header-primary: #f2f3f5;
-  --header-secondary: #b5bac1;
-  --interactive-normal: #b5bac1;
-  --interactive-hover: #dbdee1;
+  --text-normal: #eee3d4;
+  --text-muted: #b9b0a7;
+  --text-faint: #89817d;
+  --header-primary: #fff5e7;
+  --header-secondary: #d8cec4;
+  --interactive-normal: #c9c0b8;
+  --interactive-hover: #f8eee2;
   --interactive-active: #ffffff;
-  --interactive-muted: #4e5058;
-  --channel-icon: #80848e;
+  --interactive-muted: #66625e;
+  --channel-icon: #aaa49c;
 
   /* accents */
-  --brand: #5865f2;
-  --brand-hover: #4752c4;
-  --green: #23a55a;
-  --green-hover: #1a6334;
-  --red: #f23f42;
-  --red-hover: #da373c;
-  --yellow: #f0b232;
-  --link: #00a8fc;
-  --mention: rgba(88, 101, 242, 0.3);
+  --brand: #197e63;
+  --brand-hover: #239b78;
+  --brand-deep: #0d5546;
+  --brand-soft: #78c8b0;
+  --green: #58bd82;
+  --green-hover: #368d61;
+  --red: #ed6b56;
+  --red-hover: #c84c3d;
+  --yellow: #f4ac24;
+  --link: #75c8b0;
+  --mention: rgba(25, 126, 99, 0.25);
 
   color-scheme: dark;
 }
@@ -219,6 +221,26 @@ a:hover {
 }
 .guilds__pill .tk-icon {
   color: currentColor;
+}
+.guilds__pill--tupi {
+  background: #101114;
+}
+.guilds__pill--tupi:hover,
+.guilds__pill--tupi.is-active {
+  background: #1b1d20;
+}
+.guilds__pill--tupi.is-plain:hover {
+  background: #1b1d20;
+}
+.guilds__tupi-mark {
+  width: 38px;
+  height: 38px;
+  object-fit: contain;
+  filter: drop-shadow(0 2px 5px rgba(0, 0, 0, 0.34));
+  transition: transform 0.15s ease;
+}
+.guilds__pill--tupi:hover .guilds__tupi-mark {
+  transform: scale(1.06);
 }
 
 .guilds__sep {
@@ -445,7 +467,7 @@ a:hover {
 }
 .voice-members--bots { padding-top: 5px; }
 .voice-members__label { padding: 2px 8px; color: var(--muted); font-size: 10px; font-weight: 700; letter-spacing: .06em; }
-.voice-member--bot .voice-member__av { background: linear-gradient(135deg, #5865f2, #a36bff) !important; }
+.voice-member--bot .voice-member__av { background: linear-gradient(135deg, var(--brand), var(--brand-deep)) !important; }
 .voice-member {
   position: relative;
   display: flex;
@@ -499,6 +521,15 @@ a:hover {
   font-weight: 700;
   letter-spacing: 0.03em;
   text-transform: uppercase;
+}
+.voice-member__live-badge--watch {
+  border: 0;
+  cursor: pointer;
+}
+.voice-member__live-badge--watch:hover,
+.voice-member__live-badge--watch:focus-visible {
+  background: var(--red-hover);
+  outline: 1px solid color-mix(in srgb, var(--red) 65%, white);
 }
 .voice-member__watch {
   flex: none;
@@ -1692,9 +1723,9 @@ a:hover {
   text-align: center;
   padding: 36px 48px;
   border-radius: 20px;
-  background: radial-gradient(circle at center, rgba(88, 101, 242, 0.15), rgba(30, 31, 34, 0.85));
-  border: 2px dashed #5865f2;
-  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.6), 0 0 30px rgba(88, 101, 242, 0.25);
+  background: radial-gradient(circle at center, rgba(218, 117, 48, 0.16), rgba(19, 20, 23, 0.92));
+  border: 2px dashed var(--brand);
+  box-shadow: 0 16px 40px rgba(0, 0, 0, 0.6), 0 0 30px rgba(255, 162, 30, 0.22);
   animation: drop-pop-in 0.25s cubic-bezier(0.175, 0.885, 0.32, 1.275);
   max-width: 90%;
 }
@@ -1703,13 +1734,13 @@ a:hover {
   width: 72px;
   height: 72px;
   border-radius: 50%;
-  background: linear-gradient(135deg, #5865f2, #7983f5);
+  background: linear-gradient(135deg, var(--brand), var(--brand-deep));
   display: flex;
   align-items: center;
   justify-content: center;
   color: #fff;
   margin-bottom: 16px;
-  box-shadow: 0 8px 24px rgba(88, 101, 242, 0.45);
+  box-shadow: 0 8px 24px rgba(255, 170, 27, 0.42);
   animation: drop-pulse 1.6s ease-in-out infinite alternate;
 }
 
@@ -1728,8 +1759,8 @@ a:hover {
 }
 
 .composer.is-drag-over {
-  border-color: #5865f2 !important;
-  box-shadow: 0 0 16px rgba(88, 101, 242, 0.35);
+  border-color: var(--brand) !important;
+  box-shadow: 0 0 16px rgba(255, 170, 27, 0.32);
   transform: scale(1.005);
 }
 
@@ -1744,8 +1775,8 @@ a:hover {
 }
 
 @keyframes drop-pulse {
-  from { transform: scale(1); box-shadow: 0 8px 20px rgba(88, 101, 242, 0.4); }
-  to { transform: scale(1.08); box-shadow: 0 12px 30px rgba(88, 101, 242, 0.7); }
+  from { transform: scale(1); box-shadow: 0 8px 20px rgba(255, 170, 27, 0.35); }
+  to { transform: scale(1.08); box-shadow: 0 12px 30px rgba(255, 170, 27, 0.62); }
 }
 
 /* ---- Autocomplete Menus (Mentions & Slash Commands) ---- */
@@ -2289,8 +2320,8 @@ a:hover {
   padding: 16px;
   text-align: center;
   background:
-    radial-gradient(120% 90% at 50% 40%, rgba(88, 101, 242, 0.14), transparent 60%),
-    linear-gradient(160deg, #17181c 0%, #101114 55%, #0c0d10 100%);
+    radial-gradient(120% 90% at 50% 40%, rgba(218, 117, 48, 0.15), transparent 60%),
+    linear-gradient(160deg, #1a150d 0%, #100c06 55%, #090704 100%);
   animation: stream-loading-in 0.25s ease both;
 }
 @keyframes stream-loading-in {
@@ -2302,7 +2333,7 @@ a:hover {
   width: 190px;
   height: 190px;
   border-radius: 50%;
-  background: radial-gradient(circle, rgba(88, 101, 242, 0.4), transparent 70%);
+  background: radial-gradient(circle, rgba(255, 180, 32, 0.42), transparent 70%);
   filter: blur(24px);
   animation: stream-loading-pulse 2.2s ease-in-out infinite;
 }
@@ -2320,7 +2351,7 @@ a:hover {
   border-radius: 50%;
   background: rgba(255, 255, 255, 0.06);
   box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.08);
-  color: #c9cdff;
+  color: var(--brand-soft);
   animation: stream-loading-bob 2.2s ease-in-out infinite;
 }
 @keyframes stream-loading-bob {
@@ -2348,7 +2379,7 @@ a:hover {
   inset: 0 auto 0 0;
   width: 40%;
   border-radius: inherit;
-  background: linear-gradient(90deg, rgba(88, 101, 242, 0.2), var(--brand), #b6bcff, var(--brand), rgba(88, 101, 242, 0.2));
+  background: linear-gradient(90deg, rgba(226, 138, 66, 0.14), var(--brand), var(--brand-soft), var(--brand), rgba(226, 138, 66, 0.14));
   animation: stream-loading-scan 1.35s cubic-bezier(0.65, 0, 0.35, 1) infinite;
 }
 @keyframes stream-loading-scan {
@@ -2796,22 +2827,22 @@ a:hover {
   transition: border-color 0.15s ease, box-shadow 0.15s ease;
 }
 .auth__field input:focus {
-  border-color: #5865f2;
-  box-shadow: 0 0 0 1px #5865f2;
+  border-color: var(--brand);
+  box-shadow: 0 0 0 1px var(--brand);
 }
 .auth__submit {
   width: 100%;
   height: 44px;
   margin-top: 3px;
   border-radius: 4px;
-  background: #5865f2;
+  background: var(--brand);
   color: #fff;
   font-size: 14px;
   font-weight: 600;
   transition: background-color 0.15s ease, transform 0.15s ease;
 }
 .auth__submit:hover {
-  background: #4752c4;
+  background: var(--brand-hover);
   transform: translateY(-1px);
 }
 .auth__link {
@@ -3025,7 +3056,7 @@ a:hover {
   left: 0;
   top: 0;
   bottom: 0;
-  background: linear-gradient(90deg, var(--brand), #7983f5);
+  background: linear-gradient(90deg, var(--brand-deep), #4a4197);
   transition: width 0.2s ease;
 }
 .update-banner__progress-text {
@@ -4244,7 +4275,7 @@ a:hover {
   left: 0;
   top: 0;
   bottom: 0;
-  background: linear-gradient(90deg, var(--brand), #7983f5);
+  background: linear-gradient(90deg, var(--brand-deep), #4a4197);
   transition: width 0.2s ease;
 }
 .update-modal-progress-text {

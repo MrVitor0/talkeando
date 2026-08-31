@@ -34,3 +34,5 @@ infra/cookies/
 
 # Local working notes / in-progress investigations — not project docs
 docs/investigations/
+.private/
+private/

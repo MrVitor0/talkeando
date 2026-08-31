@@ -34,6 +34,19 @@ de fonte. Para cada faixa, o bot tenta a cadeia configurada em
 `cache` e `library` são reservados para implementação futura. Uma falha no
 SoundCloud afeta somente a faixa atual: o bot tenta Audius em seguida.
 
+Enquanto uma faixa toca, o bot resolve em paralelo uma pequena janela das
+próximas faixas e pré-aquece somente a primeira que tenha fonte utilizável.
+Assim, uma faixa indisponível não transforma `/skip` em várias buscas seriais,
+e a troca aproveita um buffer PCM já decodificado. Os limites padrão são janela
+de 4 faixas, 2 buscas simultâneas e 2,5 s de PCM preparado. Se necessário, o
+deploy pode ajustá-los sem alterar código:
+
+```env
+MUSIC_PREFETCH_RESOLVE_WINDOW=4
+MUSIC_PREFETCH_RESOLVE_CONCURRENCY=2
+MUSIC_PREPARE_BUFFER_MS=2500
+```
+
 **YouTube é só descoberta.** Um link ou playlist do YouTube vira título +
 artista pela Data API (`YOUTUBE_API_KEY`) e o áudio sai de SoundCloud/Audius —
 não há cookies, nem sidecar de Proof-of-Origin, nem checagem de IP de

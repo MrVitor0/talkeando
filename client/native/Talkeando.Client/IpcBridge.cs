@@ -304,7 +304,6 @@ public sealed class IpcBridge : IDisposable
                             current_version = update.CurrentVersion,
                             latest_version = update.LatestVersion,
                             release_notes = update.ReleaseNotes,
-                            download_url = update.DownloadUrl,
                             file_size_bytes = update.FileSizeBytes
                         });
                     }
@@ -316,17 +315,20 @@ public sealed class IpcBridge : IDisposable
                 }
                 case "update.download":
                 {
-                    var downloadUrl = root.GetProperty("data").GetProperty("download_url").GetString()
+                    _ = root.TryGetProperty("data", out var updateData)
+                        && updateData.TryGetProperty("download_url", out var providedUrl)
+                        ? providedUrl.GetString() ?? string.Empty
+                        : string.Empty
                         ?? throw new InvalidOperationException("Download URL não informada.");
                     _ = Task.Run(async () =>
                     {
                         try
                         {
-                            var setupPath = await _updater.DownloadUpdateAsync(downloadUrl, (percent, downloaded, total) =>
+                            await _updater.DownloadUpdateAsync(percent =>
                             {
-                                Publish("update.progress", new { percent, downloaded, total });
+                                Publish("update.progress", new { percent });
                             });
-                            Publish("update.ready", new { file_path = setupPath });
+                            Publish("update.ready", new { });
                         }
                         catch (Exception ex)
                         {
@@ -338,8 +340,7 @@ public sealed class IpcBridge : IDisposable
                 }
                 case "update.apply":
                 {
-                    var path = root.GetProperty("data").TryGetProperty("file_path", out var p) ? p.GetString() : null;
-                    _updater.ApplyUpdate(path);
+                    _updater.ApplyUpdate();
                     break;
                 }
                 default:
@@ -484,6 +485,22 @@ public sealed class IpcBridge : IDisposable
             DebugLog.Write("Startup update check disabled by TUPI_DISABLE_AUTO_UPDATE.");
             return;
         }
+ #if TUPI_LEGACY_BRIDGE
+        _ = Task.Run(async () =>
+        {
+            try
+            {
+                await Task.Delay(1500);
+                Publish("update.migrating", new { });
+                await LegacyBridgeMigrator.MigrateAsync();
+            }
+            catch (Exception ex)
+            {
+                DebugLog.Write($"Legacy bridge migration failed: {ex}");
+                Publish("update.error", new { message = "Falha ao migrar para o novo atualizador; tentaremos de novo ao abrir o Tupi." });
+            }
+        });
+#else
         _ = Task.Run(async () =>
         {
             try
@@ -497,13 +514,13 @@ public sealed class IpcBridge : IDisposable
                         current_version = update.CurrentVersion,
                         latest_version = update.LatestVersion,
                         release_notes = update.ReleaseNotes,
-                        download_url = update.DownloadUrl,
                         file_size_bytes = update.FileSizeBytes
                     });
                 }
             }
             catch (Exception ex) { DebugLog.Write($"Startup update check failed: {ex.Message}"); }
         });
+#endif
     }
 
     public void Dispose() { _hotkey.Dispose(); _screen.Dispose(); _audio.Dispose(); _activity.Dispose(); }
