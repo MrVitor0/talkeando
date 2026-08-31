@@ -1,6 +1,7 @@
 # Opens Talkeando client windows (one per profile) pointed at whatever
 # client\native\Talkeando.Client\tupi.settings.json says - the hosted/prod
-# API by default. No local server, no Postgres, no env overrides.
+# API by default. No local server or Postgres. Auto-update is disabled so a
+# locally built client is never compared against the published installer.
 # Use scripts\dev.ps1 instead for the full LOCAL stack.
 #
 #   -Profiles alice,bob   which profiles to open (default: alice, bob)
@@ -33,6 +34,7 @@ if (Test-Path $Settings) {
     Info 'no tupi.settings.json - client uses its built-in default'
 }
 Info 'TUPI_API_BASE_URL / TUPI_WS_URL are NOT set by this script'
+Info 'TUPI_DISABLE_AUTO_UPDATE=1 (local builds never show release updates)'
 
 if (-not $SkipBuild) {
     if (-not (Get-Command npm -ErrorAction SilentlyContinue)) {
@@ -57,7 +59,7 @@ if (-not $SkipBuild) {
 
 Step ('Launching ' + $Profiles.Count + ' client window(s)')
 foreach ($name in $Profiles) {
-    $cmd = "`$host.UI.RawUI.WindowTitle='tupi-client:$name'; Set-Location '$ClientDir'; `$env:TUPI_PROFILE='$name'; dotnet run --no-build --no-restore"
+    $cmd = "`$host.UI.RawUI.WindowTitle='tupi-client:$name'; Set-Location '$ClientDir'; `$env:TUPI_PROFILE='$name'; `$env:TUPI_DISABLE_AUTO_UPDATE='1'; dotnet run --no-build --no-restore"
     Start-Process powershell -ArgumentList @('-NoExit', '-NoProfile', '-Command', $cmd) | Out-Null
     Info "window 'tupi-client:$name'"
     Start-Sleep -Seconds 2

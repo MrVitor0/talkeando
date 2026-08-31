@@ -452,12 +452,11 @@ export function SettingsModal({
                 <div className="settings-field" style={{ marginTop: "20px" }}>
                   <label className="settings-label">Redução de ruído</label>
                   <select className="settings-select" value={noiseMode} onChange={event => handleNoiseModeChange(event.target.value as NoiseSuppressionMode)}>
-                    <option value="browser">Padrão do dispositivo (AEC + supressão + ganho)</option>
-                    <option value="rnnoise">Avançada (RNNoise local)</option>
-                    <option value="off">Desativada (mantém cancelamento de eco)</option>
+                    <option value="rnnoise">Ativada (RNNoise local)</option>
+                    <option value="off">Desativada</option>
                   </select>
                   <div className="settings-radio-desc" aria-live="polite">
-                    {noiseStatus.state === "loading" ? "Carregando processamento avançado…" : noiseStatus.state === "fallback" ? "Processamento avançado indisponível; usando modo padrão." : noiseStatus.state === "failed" ? "Falha ao alterar o processamento de áudio." : noiseStatus.effectiveMode === "rnnoise" ? "RNNoise ativo na track publicada." : noiseStatus.effectiveMode === "off" ? "Sem supressão de ruído nativa ou avançada." : "Usando o processamento nativo do dispositivo."}
+                    {noiseStatus.state === "loading" ? "Carregando RNNoise…" : noiseStatus.state === "failed" ? "Falha ao ativar o RNNoise." : noiseStatus.effectiveMode === "rnnoise" ? "RNNoise ativo na track publicada." : "Sem processamento de áudio adicional."}
                   </div>
                 </div>
 

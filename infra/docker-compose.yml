@@ -42,5 +42,25 @@ services:
     volumes:
       - ./livekit/livekit.dev.yaml:/etc/livekit.yaml:ro
 
+  music-bot:
+    build:
+      context: ../music-bot
+    restart: unless-stopped
+    depends_on:
+      - livekit
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      # The backend stays on the Windows host in dev; the bot joins the same
+      # local SFU over the compose network.
+      TUPI_WS_URL: ws://host.docker.internal:8090/ws
+      TUPI_API_URL: http://host.docker.internal:8090
+      LIVEKIT_URL: ws://livekit:7880
+      MUSIC_BOT_TOKEN: local-dev-music-bot-token
+      PROVIDER_CHAIN: cache,library,soundcloud,audius
+    volumes:
+      - talkeando_ytdlp_cache:/home/node/.cache/yt-dlp
+
 volumes:
   talkeando_pg_data:
+  talkeando_ytdlp_cache:

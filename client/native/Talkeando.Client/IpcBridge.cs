@@ -43,6 +43,8 @@ public sealed class IpcBridge : IDisposable
     private readonly AudioCapture _audio = new();
     private readonly ActivityMonitor _activity;
     private readonly UpdateChecker _updater = new();
+    private static readonly bool AutoUpdateDisabled =
+        Environment.GetEnvironmentVariable("TUPI_DISABLE_AUTO_UPDATE") is "1" or "true" or "TRUE";
     private readonly GlobalHotkeyHook _hotkey = new();
     private int _frameSeq;
     private int _audioSeq;
@@ -289,6 +291,9 @@ public sealed class IpcBridge : IDisposable
                         root.GetProperty("data").TryGetProperty("text", out var titleText)
                             ? titleText.GetString() ?? "" : "");
                     break;
+                case "voice.rooms.request":
+                    await _network.SendWebSocketAsync("voice.rooms.request", JsonSerializer.SerializeToElement(new { }));
+                    break;
                 case "update.check":
                 {
                     var update = await _updater.CheckAsync();
@@ -474,6 +479,11 @@ public sealed class IpcBridge : IDisposable
 
     public void CheckUpdatesOnStartup()
     {
+        if (AutoUpdateDisabled)
+        {
+            DebugLog.Write("Startup update check disabled by TUPI_DISABLE_AUTO_UPDATE.");
+            return;
+        }
         _ = Task.Run(async () =>
         {
             try

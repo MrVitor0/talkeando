@@ -26,6 +26,7 @@ let inputVolume = storedNumber("tk.inputVolume", 1);
 let outputVolume = storedNumber("tk.outputVolume", 1);
 const remotes = new Set<Remote>();
 const cameras = new Set<(stream: MediaStream | null) => void>();
+const callEnded = new Set<() => void>();
 const speakers = new Set<(ids: Set<string>) => void>();
 // LiveKit's active-speaker event is authoritative for remote people, but it
 // reaches us only after the SFU has received and classified a few audio
@@ -46,10 +47,21 @@ let noiseSuppressionMode: NoiseSuppressionMode = storedNoiseSuppressionMode();
 let localMuted = false;
 const volumes = new Map<string, number>(Object.entries(stored("tk.peerVolumes")));
 const screenVolumes = new Map<string, number>(Object.entries(stored("tk.screenVolumes")));
-const muted = new Map<string, boolean>(), screenMuted = new Map<string, boolean>();
+const muted = new Map<string, boolean>(Object.entries(storedBooleans("tk.peerMuted")));
+const screenMuted = new Map<string, boolean>(Object.entries(storedBooleans("tk.screenMuted")));
 const audio = new Map<string, HTMLAudioElement[]>(), screenAudio = new Map<string, HTMLAudioElement[]>();
+let locallyDeafened = false;
 
 function stored(key: string): Record<string, number> { try { return JSON.parse(localStorage.getItem(key) || "{}"); } catch { return {}; } }
+function storedBooleans(key: string): Record<string, boolean> {
+  try {
+    const value = JSON.parse(localStorage.getItem(key) || "{}");
+    if (!value || typeof value !== "object") return {};
+    const entries: Array<[string, boolean]> = [];
+    for (const [id, muted] of Object.entries(value)) if (typeof muted === "boolean") entries.push([id, muted]);
+    return Object.fromEntries(entries);
+  } catch { return {}; }
+}
 function storedString(key: string): string | undefined { try { return localStorage.getItem(key) || undefined; } catch { return undefined; } }
 function storedNumber(key: string, fallback: number): number {
   try {
@@ -62,12 +74,12 @@ function storedNumber(key: string, fallback: number): number {
 function storedNoiseSuppressionMode(): NoiseSuppressionMode {
   try {
     const value = localStorage.getItem("tk.noiseSuppressionMode");
-    if (value === "browser" || value === "rnnoise" || value === "off") return value;
-    // Preserve the only legacy choice: old "off" meant no suppression.
-    return localStorage.getItem("tk.noiseSuppression") === "off" ? "off" : "browser";
-  } catch { return "browser"; }
+    if (value === "rnnoise" || value === "off") return value;
+    return "off";
+  } catch { return "off"; }
 }
 function persist(key: string, values: Map<string, number>) { try { localStorage.setItem(key, JSON.stringify(Object.fromEntries(values))); } catch {} }
+function persistBooleans(key: string, values: Map<string, boolean>) { try { localStorage.setItem(key, JSON.stringify(Object.fromEntries(values))); } catch {} }
 function persistValue(key: string, value: string | number) { try { localStorage.setItem(key, String(value)); } catch {} }
 
 microphone.onStatus(status => audioPipelineStatusListeners.forEach(listener => listener(status)));
@@ -149,7 +161,7 @@ async function credentials(channel_id: string, mode = "participant") {
 function apply(id: string, isScreen = false) {
   for (const element of (isScreen ? screenAudio : audio).get(id) || []) {
     element.volume = ((isScreen ? screenVolumes : volumes).get(id) ?? 1) * outputVolume;
-    element.muted = (isScreen ? screenMuted : muted).get(id) === true;
+    element.muted = locallyDeafened || (isScreen ? screenMuted : muted).get(id) === true;
     void setSink(element);
   }
 }
@@ -168,7 +180,13 @@ function bind(room: Room) {
     if (track.kind === Track.Kind.Video) remotes.forEach(listener => listener(participant.identity, new MediaStream([track.mediaStreamTrack]), publication.trackSid));
   });
   room.on(RoomEvent.TrackUnsubscribed, (track, publication, participant) => {
-    track.detach().forEach(element => element.remove());
+    const detached = track.detach() as HTMLMediaElement[];
+    detached.forEach(element => element.remove());
+    const isScreen = publication.source === Track.Source.ScreenShareAudio;
+    const sinks = isScreen ? screenAudio : audio;
+    const remaining = (sinks.get(participant.identity) || []).filter(element => !detached.includes(element));
+    if (remaining.length) sinks.set(participant.identity, remaining);
+    else sinks.delete(participant.identity);
     if (track.kind === Track.Kind.Video) remotes.forEach(listener => listener(participant.identity, null, publication.trackSid));
   });
   room.on(RoomEvent.ActiveSpeakersChanged, list => {
@@ -192,6 +210,11 @@ function bind(room: Room) {
     stopLocalSpeechMonitor();
     void microphone.dispose();
     if (presentChannelId) { send("voice.presence.leave", { channel_id: presentChannelId }); presentChannelId = null; }
+    // The UI owns the visible call state. Without this notification a failed
+    // LiveKit room left the stage rendered as connected even though capture
+    // had already been disposed, making every later music command look like
+    // it broke the call.
+    callEnded.forEach(listener => listener());
   });
   room.on(RoomEvent.Reconnecting, () => logAudio("audio.livekit.reconnect.started"));
   room.on(RoomEvent.Reconnected, () => logAudio("audio.livekit.reconnect.completed"));
@@ -239,7 +262,8 @@ export function init(_: string) {
     }
   });
 }
-export async function joinCall(id: string, isMuted: boolean, _: boolean) {
+export async function joinCall(id: string, isMuted: boolean, isDeafened: boolean) {
+  locallyDeafened = isDeafened;
   const attempt = ++connectAttempt;
   const previous = active ?? connecting;
   active = null; connecting = null;
@@ -297,9 +321,13 @@ export async function leaveCall() {
   await microphone.dispose();
   room?.disconnect();
   screen?.getTracks().forEach(track => track.stop()); screen = null;
+  locallyDeafened = false;
 }
-export async function setLocalAudioState(isMuted: boolean, _: boolean) {
+export async function setLocalAudioState(isMuted: boolean, isDeafened: boolean) {
   localMuted = isMuted;
+  locallyDeafened = isDeafened;
+  audio.forEach((_, id) => apply(id));
+  screenAudio.forEach((_, id) => apply(id, true));
   const publication = active && [...active.localParticipant.audioTrackPublications.values()]
     .find(item => item.source === Track.Source.Microphone);
   if (publication?.track) {
@@ -345,20 +373,30 @@ export async function unpublishScreen(_: string, __: string) {
 export function reconfigureScreen(height: number, fps: number) { reconfigureNativeScreen(screenSource, height, fps, screenAudioEnabled); }
 export function switchScreenSource(source: string) { screenSource = source; }
 export function getLocalScreenStream() { return screen; }
-export function watchStream(_: string, sid: string, __: string) { active?.remoteParticipants.forEach(participant => participant.trackPublications.get(sid)?.setSubscribed(true)); }
-export function stopWatchingStream(_: string, sid: string, __: string) { active?.remoteParticipants.forEach(participant => participant.trackPublications.get(sid)?.setSubscribed(false)); }
+function screenPublication(sid: string, owner: string) {
+  const participant = active?.remoteParticipants.get(owner);
+  if (!participant) return undefined;
+  // The control plane's stream id is separate from LiveKit's track SID.
+  // Falling back to this owner's screen track keeps subscription reliable.
+  return participant.trackPublications.get(sid)
+    ?? [...participant.trackPublications.values()].find(publication => publication.source === Track.Source.ScreenShare);
+}
+export function watchStream(_: string, sid: string, owner: string) { screenPublication(sid, owner)?.setSubscribed(true); }
+export function stopWatchingStream(_: string, sid: string, owner: string) { screenPublication(sid, owner)?.setSubscribed(false); }
 export async function spectate(id: string, sid: string, owner: string) { if (!active) { const credential = await credentials(id, "spectator"); const room = new Room({ adaptiveStream: true, dynacast: true }); bind(room); await room.connect(credential.url, credential.token); active = room; } watchStream(id, sid, owner); }
 export function stopSpectate(_: string) {}
 export function onRemoteStream(listener: Remote) { remotes.add(listener); return () => { remotes.delete(listener); }; }
+export function onCallDisconnected(listener: () => void) { callEnded.add(listener); return () => { callEnded.delete(listener); }; }
 export function onSpeaking(listener: (ids: Set<string>) => void) { speakers.add(listener); return () => { speakers.delete(listener); }; }
 export function onConnectionQuality(listener: (quality: ConnQuality) => void) { qualities.add(listener); return () => { qualities.delete(listener); }; }
 export function onMediaError(listener: (message: string) => void) { mediaErrors.add(listener); return () => { mediaErrors.delete(listener); }; }
 export function setPeerVolume(id: string, value: number) { volumes.set(id, value); persist("tk.peerVolumes", volumes); apply(id); }
 export function getPeerVolumes() { return Object.fromEntries(volumes); }
-export function setPeerAudioMuted(id: string, value: boolean) { muted.set(id, value); apply(id); }
+export function setPeerAudioMuted(id: string, value: boolean) { muted.set(id, value); persistBooleans("tk.peerMuted", muted); apply(id); }
+export function getPeerAudioMuted() { return Object.fromEntries(muted); }
 export function setScreenAudioVolume(id: string, value: number) { screenVolumes.set(id, value); persist("tk.screenVolumes", screenVolumes); apply(id, true); }
 export function getScreenAudioVolumes() { return Object.fromEntries(screenVolumes); }
-export function setScreenAudioMuted(id: string, value: boolean) { screenMuted.set(id, value); apply(id, true); }
+export function setScreenAudioMuted(id: string, value: boolean) { screenMuted.set(id, value); persistBooleans("tk.screenMuted", screenMuted); apply(id, true); }
 export async function listCameras(): Promise<MediaDeviceInfo[]> { return (await navigator.mediaDevices.enumerateDevices()).filter(device => device.kind === "videoinput"); }
 export async function listAllMediaDevices(): Promise<DeviceLists> { const devices = await navigator.mediaDevices.enumerateDevices(); return { audioInputs: devices.filter(device => device.kind === "audioinput"), audioOutputs: devices.filter(device => device.kind === "audiooutput"), videoInputs: devices.filter(device => device.kind === "videoinput") }; }
 export function getAudioInputDeviceId() { return audioInputDeviceId; }

@@ -45,24 +45,23 @@ describe("AudioPipelineManager", () => {
   });
 
   it("uses the exact native processing constraints for each mode", () => {
-    expect(constraintsForMode("browser", "mic-a")).toMatchObject({ deviceId: { exact: "mic-a" }, echoCancellation: true, noiseSuppression: true, autoGainControl: true, channelCount: 1, sampleRate: 48_000 });
-    expect(constraintsForMode("rnnoise")).toMatchObject({ echoCancellation: true, noiseSuppression: false, autoGainControl: true, channelCount: 1, sampleRate: 48_000 });
-    expect(constraintsForMode("off")).toMatchObject({ echoCancellation: true, noiseSuppression: false, autoGainControl: false, channelCount: 1, sampleRate: 48_000 });
+    expect(constraintsForMode("rnnoise")).toMatchObject({ echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 1, sampleRate: 48_000 });
+    expect(constraintsForMode("off", "mic-a")).toMatchObject({ deviceId: { exact: "mic-a" }, echoCancellation: false, noiseSuppression: false, autoGainControl: false, channelCount: 1, sampleRate: 48_000 });
   });
 
-  it("publishes the raw track only in browser/off modes and cleans it up", async () => {
+  it("publishes the raw track with processing disabled and cleans it up", async () => {
     const manager = new AudioPipelineManager();
     let installed: MediaStreamTrack | undefined;
-    const pipeline = await manager.start({ mode: "browser" }, async output => { installed = output; });
+    const pipeline = await manager.start({ mode: "off" }, async output => { installed = output; });
     expect(pipeline.isProcessed).toBe(false);
     expect(pipeline.outputTrack).toBe(pipeline.rawTrack);
     expect(installed).toBe(pipeline.rawTrack);
-    expect(captures[0]).toMatchObject({ noiseSuppression: true });
+    expect(captures[0]).toMatchObject({ echoCancellation: false, noiseSuppression: false, autoGainControl: false });
     await manager.dispose();
     expect((pipeline.rawTrack as FakeTrack).stopped).toBe(true);
   });
 
-  it("falls back by reacquiring browser-processed audio when RNNoise cannot load", async () => {
+  it("does not publish unprocessed audio when RNNoise cannot load", async () => {
     rnnoiseMock.loadRnnoise.mockRejectedValueOnce(new Error("wasm unavailable"));
     class FailingAudioContext {
       sampleRate = 48_000; state: AudioContextState = "running";
@@ -75,13 +74,10 @@ describe("AudioPipelineManager", () => {
     const manager = new AudioPipelineManager();
     const states: string[] = [];
     manager.onStatus(status => states.push(status.state));
-    const pipeline = await manager.start({ mode: "rnnoise" }, async () => {});
-    expect(pipeline.origin).toBe("fallback");
-    expect(pipeline.mode).toBe("browser");
-    expect(captures).toHaveLength(2);
+    await expect(manager.start({ mode: "rnnoise" }, async () => {})).rejects.toThrow("wasm unavailable");
+    expect(captures).toHaveLength(1);
     expect(captures[0]).toMatchObject({ noiseSuppression: false });
-    expect(captures[1]).toMatchObject({ noiseSuppression: true });
-    expect(states).toContain("fallback");
+    expect(states).toContain("failed");
   });
 
   it("uses a distinct RNNoise output track when the worklet is ready", async () => {
@@ -107,7 +103,7 @@ describe("AudioPipelineManager", () => {
 
   it("serializes replacements so the old track is disposed only after install succeeds", async () => {
     const manager = new AudioPipelineManager();
-    const first = await manager.start({ mode: "browser" }, async () => {});
+    const first = await manager.start({ mode: "off" }, async () => {});
     let release!: () => void;
     const gate = new Promise<void>(resolve => { release = resolve; });
     const change = manager.switchMode("off", async () => { await gate; });

@@ -3,10 +3,10 @@ import rnnoiseWorkletUrl from "@sapphi-red/web-noise-suppressor/rnnoiseWorklet.j
 import rnnoiseWasmUrl from "@sapphi-red/web-noise-suppressor/rnnoise.wasm?url";
 import rnnoiseSimdWasmUrl from "@sapphi-red/web-noise-suppressor/rnnoise_simd.wasm?url";
 
-export type NoiseSuppressionMode = "browser" | "rnnoise" | "off";
-export type AudioPipelineOrigin = "browser" | "rnnoise" | "off" | "fallback";
+export type NoiseSuppressionMode = "rnnoise" | "off";
+export type AudioPipelineOrigin = "rnnoise" | "off";
 export type AudioPipelineStatus = {
-  state: "idle" | "loading" | "ready" | "fallback" | "failed";
+  state: "idle" | "loading" | "ready" | "failed";
   requestedMode: NoiseSuppressionMode;
   effectiveMode: NoiseSuppressionMode;
   origin?: AudioPipelineOrigin;
@@ -45,15 +45,7 @@ export function constraintsForMode(mode: NoiseSuppressionMode, deviceId?: string
   const device = deviceId ? { exact: deviceId } : undefined;
   if (mode === "rnnoise") return {
     deviceId: device,
-    echoCancellation: true,
-    noiseSuppression: false,
-    autoGainControl: true,
-    channelCount: 1,
-    sampleRate: 48_000,
-  };
-  if (mode === "off") return {
-    deviceId: device,
-    echoCancellation: true,
+    echoCancellation: false,
     noiseSuppression: false,
     autoGainControl: false,
     channelCount: 1,
@@ -61,9 +53,9 @@ export function constraintsForMode(mode: NoiseSuppressionMode, deviceId?: string
   };
   return {
     deviceId: device,
-    echoCancellation: true,
-    noiseSuppression: true,
-    autoGainControl: true,
+    echoCancellation: false,
+    noiseSuppression: false,
+    autoGainControl: false,
     channelCount: 1,
     sampleRate: 48_000,
   };
@@ -82,13 +74,13 @@ async function capture(mode: NoiseSuppressionMode, deviceId?: string): Promise<M
   return stream;
 }
 
-function rawPipeline(stream: MediaStream, mode: "browser" | "off", origin: AudioPipelineOrigin = mode): AudioCapturePipeline {
+function rawPipeline(stream: MediaStream, mode: "off"): AudioCapturePipeline {
   const track = stream.getAudioTracks()[0];
   const settings = track.getSettings();
   let disposed = false;
   return {
     mode,
-    origin,
+    origin: mode,
     rawStream: stream,
     rawTrack: track,
     outputStream: stream,
@@ -100,7 +92,7 @@ function rawPipeline(stream: MediaStream, mode: "browser" | "off", origin: Audio
       if (disposed) return;
       disposed = true;
       stream.getTracks().forEach(item => item.stop());
-      log("audio.pipeline.disposed", { origin });
+      log("audio.pipeline.disposed", { origin: mode });
     },
   };
 }
@@ -168,7 +160,7 @@ export class AudioPipelineManager {
   private active: AudioCapturePipeline | null = null;
   private serial = Promise.resolve();
   private generation = 0;
-  private desiredMode: NoiseSuppressionMode = "browser";
+  private desiredMode: NoiseSuppressionMode = "off";
   private listeners = new Set<StatusListener>();
 
   onStatus(listener: StatusListener) { this.listeners.add(listener); return () => { this.listeners.delete(listener); }; }
@@ -205,7 +197,6 @@ export class AudioPipelineManager {
     this.desiredMode = input.mode;
     this.status({ state: "loading", requestedMode: input.mode, effectiveMode: input.mode });
     let next: AudioCapturePipeline | null = null;
-    let fallbackReason: string | undefined;
     try {
       const stream = await capture(input.mode, input.deviceId);
       next = input.mode === "rnnoise" ? await rnnoisePipeline(stream) : rawPipeline(stream, input.mode);
@@ -216,17 +207,8 @@ export class AudioPipelineManager {
         this.status({ state: "failed", requestedMode: input.mode, effectiveMode: input.mode, reason });
         throw error;
       }
-      // RNNoise must never silently transmit the raw capture made with native
-      // suppression disabled. Reacquire the safe browser-mode source instead.
-      fallbackReason = reason;
-      try {
-        const fallback = await capture("browser", input.deviceId);
-        next = rawPipeline(fallback, "browser", "fallback");
-      } catch (fallbackError) {
-        const fallbackFailure = safeError(fallbackError);
-        this.status({ state: "failed", requestedMode: "rnnoise", effectiveMode: this.active?.mode ?? "browser", reason: fallbackFailure });
-        throw fallbackError;
-      }
+      this.status({ state: "failed", requestedMode: "rnnoise", effectiveMode: this.active?.mode ?? "off", reason });
+      throw error;
     }
     try {
       await install(next.outputTrack, next);
@@ -234,14 +216,13 @@ export class AudioPipelineManager {
       await next.dispose();
       const reason = safeError(error);
       log("audio.track.replacing.failed", { generation, reason });
-      this.status({ state: "failed", requestedMode: input.mode, effectiveMode: this.active?.mode ?? "browser", reason });
+      this.status({ state: "failed", requestedMode: input.mode, effectiveMode: this.active?.mode ?? "off", reason });
       throw error;
     }
     const previous = this.active;
     this.active = next;
     await previous?.dispose();
-    if (next.origin === "fallback") this.status({ state: "fallback", requestedMode: "rnnoise", effectiveMode: "browser", origin: "fallback", reason: fallbackReason });
-    else this.status({ state: "ready", requestedMode: input.mode, effectiveMode: next.mode, origin: next.origin });
+    this.status({ state: "ready", requestedMode: input.mode, effectiveMode: next.mode, origin: next.origin });
     log("audio.pipeline.ready", { generation, requestedMode: input.mode, effectiveMode: next.mode, origin: next.origin, processed: next.isProcessed, sampleRate: next.sampleRate, channels: next.channels });
     return next;
   }

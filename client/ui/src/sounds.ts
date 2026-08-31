@@ -12,6 +12,8 @@ const files = {
   stopCamera: "stop_camera.mp3",
   micMuted: "mic-muted.MP3",
   micUnmuted: "mic-unmuted.MP3",
+  noiseSuppressionEnabled: "mic-unmuted.MP3",
+  noiseSuppressionDisabled: "mic-muted.MP3",
   headphoneMuted: "headphone-muted.MP3",
   headphoneUnmuted: "headphone-umuted.MP3",
 } as const;

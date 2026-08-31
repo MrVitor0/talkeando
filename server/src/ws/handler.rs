@@ -180,7 +180,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 last_seen = Instant::now();
                 match msg {
                     Message::Text(text) => {
-                        dispatch(&state, user_id, &text, &mut joined_calls).await;
+                        dispatch(&state, user_id, connection_id, &text, &mut joined_calls).await;
                     }
                     Message::Ping(payload) => {
                         let _ = state
@@ -449,6 +449,7 @@ async fn teardown_spectator_subscriptions(state: &AppState, user_id: Uuid) {
 async fn dispatch(
     state: &AppState,
     user_id: Uuid,
+    connection_id: Uuid,
     text: &str,
     joined_calls: &mut HashSet<Uuid>,
 ) {
@@ -589,6 +590,13 @@ async fn dispatch(
             // make roster cleanup conditional on that per-connection cache.
             joined_calls.remove(&data.channel_id);
             evict_voice_participant(state, data.channel_id, user_id).await;
+        }
+        // The native host can finish the WebView bootstrap after this
+        // connection's first snapshot was delivered. Let the UI explicitly
+        // re-request the authoritative voice-room snapshot after mounting or
+        // reconnecting, rather than waiting for someone to join/leave.
+        "voice.rooms.request" => {
+            send_voice_rooms_snapshot(state, user_id, connection_id).await;
         }
         "voice.track.published" => {
             let data: VoiceTrack = parse_or_reject!(VoiceTrack);

@@ -481,6 +481,9 @@ a:hover {
   flex: none;
   color: var(--red);
 }
+.voice-member__flag--local-muted {
+  color: rgba(185, 190, 200, 0.55);
+}
 /* Camera-on is a positive/neutral state, not an alert — use a soft green
    instead of the muted-red the audio flags use. */
 .voice-member__flag--cam {
@@ -579,12 +582,6 @@ a:hover {
   gap: 8px;
   padding: 2px 2px;
 }
-.voice-panel__signal {
-  width: 18px;
-  height: 18px;
-  flex: none;
-  color: var(--green, #23a55a);
-}
 .voice-panel__info {
   flex: 1;
   min-width: 0;
@@ -621,13 +618,6 @@ a:hover {
 }
 .voice-panel__grid.cols-3 {
   grid-template-columns: repeat(3, 1fr);
-}
-.voice-panel__noise-state {
-  grid-column: 1 / -1;
-  color: var(--text-muted);
-  font-size: 10px;
-  text-align: center;
-  min-height: 12px;
 }
 .vp-btn {
   height: 32px;
@@ -3628,6 +3618,31 @@ a:hover {
 .ctx-menu__item.is-danger:hover {
   background: var(--red);
   color: #fff;
+}
+.ctx-menu__checkbox {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 8px 10px;
+  color: var(--interactive-normal);
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+}
+.ctx-menu__checkbox:hover { background: var(--bg-hover); }
+.ctx-menu__checkbox > span { flex: 1; }
+.ctx-menu__checkbox input { position: absolute; opacity: 0; pointer-events: none; }
+.ctx-menu__checkbox i {
+  width: 18px;
+  height: 18px;
+  border: 2px solid rgba(185, 190, 200, 0.55);
+  border-radius: 4px;
+  box-sizing: border-box;
+}
+.ctx-menu__checkbox input:checked + i {
+  background: rgba(185, 190, 200, 0.55);
+  border-color: rgba(185, 190, 200, 0.55);
+  box-shadow: inset 0 0 0 3px var(--bg-floating);
 }
 .ctx-menu__slider {
   padding: 8px 10px 10px;

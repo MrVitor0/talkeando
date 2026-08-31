@@ -785,6 +785,7 @@ type MenuAction = { label: string; onClick: () => void; danger?: boolean };
 // stays open while it's dragged.
 type MenuSlider = {
   kind: "slider";
+  id: string;
   label: string;
   value: number;
   min: number;
@@ -794,6 +795,13 @@ type MenuSlider = {
   format?: (value: number) => string;
   onChange: (value: number) => void;
 };
+type MenuCheckbox = {
+  kind: "checkbox";
+  id: string;
+  label: string;
+  checked: boolean;
+  onChange: (checked: boolean) => void;
+};
 // A native colour picker embedded in the menu; `value` null = default colour.
 type MenuColor = {
   kind: "color";
@@ -801,7 +809,7 @@ type MenuColor = {
   value: string | null;
   onChange: (hex: string | null) => void;
 };
-type MenuItem = MenuAction | MenuSlider | MenuColor;
+type MenuItem = MenuAction | MenuSlider | MenuCheckbox | MenuColor;
 type MenuState = { x: number; y: number; items: MenuItem[] };
 
 function ContextMenu({ x, y, items, onClose }: MenuState & { onClose: () => void }) {
@@ -844,8 +852,10 @@ function ContextMenu({ x, y, items, onClose }: MenuState & { onClose: () => void
       {items.map((item, index) =>
         "kind" in item
           ? (item.kind === "slider"
-            ? <MenuSliderRow key={index} item={item} />
-            : <MenuColorRow key={index} item={item} />)
+            ? <MenuSliderRow key={item.id} item={item} />
+            : item.kind === "checkbox"
+              ? <MenuCheckboxRow key={item.id} item={item} />
+              : <MenuColorRow key={index} item={item} />)
           : (
             <button
               key={index}
@@ -864,6 +874,10 @@ function MenuSliderRow({ item }: { item: MenuSlider }) {
   // Own the value locally so dragging stays smooth even though the parent
   // menu holds a one-shot snapshot of `items`.
   const [value, setValue] = useState(item.value);
+  // A context menu is reused by React when it is reopened for another row.
+  // Reset from its stable peer id so one user's slider can never inherit the
+  // value that was being dragged for someone else.
+  useEffect(() => { setValue(item.value); }, [item.id, item.value]);
   const apply = (next: number) => { setValue(next); item.onChange(next); };
   return (
     <div className="ctx-menu__slider">
@@ -881,6 +895,18 @@ function MenuSliderRow({ item }: { item: MenuSlider }) {
         onDoubleClick={() => { if (item.resetTo !== undefined) apply(item.resetTo); }}
       />
     </div>
+  );
+}
+
+function MenuCheckboxRow({ item }: { item: MenuCheckbox }) {
+  const [checked, setChecked] = useState(item.checked);
+  useEffect(() => { setChecked(item.checked); }, [item.id, item.checked]);
+  return (
+    <label className="ctx-menu__checkbox">
+      <span>{item.label}</span>
+      <input type="checkbox" checked={checked} onChange={event => { setChecked(event.target.checked); item.onChange(event.target.checked); }} />
+      <i aria-hidden="true" />
+    </label>
   );
 }
 
@@ -909,58 +935,6 @@ function MenuColorRow({ item }: { item: MenuColor }) {
 }
 
 /* ------------------------------------------------------------------ */
-/* realtime call-connection quality — cellular-style signal bars       */
-/* ------------------------------------------------------------------ */
-
-function SignalBars({ quality }: { quality: rtc.ConnQuality }) {
-  const level = quality === "good" ? 3 : quality === "medium" ? 2 : 1;
-  const color =
-    quality === "good" ? "var(--green)" : quality === "medium" ? "var(--yellow)" : "var(--red)";
-  const label =
-    quality === "good" ? "Conexão boa" : quality === "medium" ? "Conexão lenta" : "Conexão muito lenta";
-  const bars = [
-    { x: 1, y: 9, height: 4 },
-    { x: 6, y: 5.5, height: 7.5 },
-    { x: 11, y: 2, height: 11 },
-  ];
-  return (
-    <svg
-      className={`voice-panel__signal is-${quality}`}
-      width={18}
-      height={18}
-      viewBox="0 0 16 16"
-      role="img"
-      aria-label={label}
-    >
-      <title>{label}</title>
-      {bars.map((bar, index) => (
-        <rect
-          key={index}
-          x={bar.x}
-          y={bar.y}
-          width={3}
-          height={bar.height}
-          rx={1}
-          fill={index < level ? color : "currentColor"}
-          opacity={index < level ? 1 : 0.25}
-        />
-      ))}
-    </svg>
-  );
-}
-
-function AudioWaveform({ color = "var(--yellow)" }: { color?: string }) {
-  return (
-    <svg className="voice-panel__waveform" width={18} height={18} viewBox="0 0 18 18" fill="none">
-      <rect x="2" y="5" width="2.5" height="8" rx="1.25" fill={color} className="wave-bar wave-bar--1" />
-      <rect x="6" y="2" width="2.5" height="14" rx="1.25" fill={color} className="wave-bar wave-bar--2" />
-      <rect x="10" y="4" width="2.5" height="10" rx="1.25" fill={color} className="wave-bar wave-bar--3" />
-      <rect x="14" y="6" width="2.5" height="6" rx="1.25" fill={color} className="wave-bar wave-bar--4" />
-    </svg>
-  );
-}
-
-/* ------------------------------------------------------------------ */
 /* animated boot splash — shown until the session-restore answer lands */
 /* ------------------------------------------------------------------ */
 
@@ -968,7 +942,6 @@ const SPLASH_TIPS = [
   "Clique com o botão direito num canal para renomeá-lo.",
   "Fique como Ocupado pelo menu do seu perfil para silenciar as notificações.",
   "Passe o mouse sobre quem está compartilhando a tela para espiar sem entrar na call.",
-  "As barrinhas ao lado de “Voz conectada” mostram a qualidade da conexão em tempo real.",
   "Clique no nome de uma categoria para recolher os canais dela.",
   "A supressão de ruído (RNNoise) fica no painel de voz, no botão “crisp”.",
 ];
@@ -1071,7 +1044,6 @@ export function App() {
   const [call, setCall] = useState<{ channelId: string; participants: Participant[] } | null>(null);
   const [voiceConnState, setVoiceConnState] = useState<"waiting_server" | "authenticating" | "connecting" | "connected" | "disconnected">("disconnected");
   const voiceConnTimers = useRef<number[]>([]);
-  const [connQuality, setConnQuality] = useState<rtc.ConnQuality>("good");
   // User ids currently making sound — drives the green speaking ring in the
   // voice roster and on the stage tiles.
   const [speakingUsers, setSpeakingUsers] = useState<Set<string>>(() => new Set());
@@ -1134,7 +1106,7 @@ export function App() {
   const [cameraMenuOpen, setCameraMenuOpen] = useState(false);
   const [focusedUser, setFocusedUser] = useState<string | null>(null);
   const [theater, setTheater] = useState(false);
-  const [mutedPeers, setMutedPeers] = useState<Record<string, boolean>>({});
+  const [mutedPeers, setMutedPeers] = useState<Record<string, boolean>>(() => rtc.getPeerAudioMuted());
   // Local-only per-user playback volume (0..1, 1 = default). Not sent anywhere.
   const [peerVolumes, setPeerVolumes] = useState<Record<string, number>>(() => rtc.getPeerVolumes());
   // Local-only, per screen-share: mute / volume for the SHARE's audio only —
@@ -1286,6 +1258,10 @@ export function App() {
         selfIdRef.current = selfId;
         if (event.data.currentUser) setCurrentUser(event.data.currentUser);
         if (selfId) rtc.init(selfId);
+        // The server's first `voice.rooms` snapshot can arrive while this
+        // WebView is still mounting its IPC listeners. Ask for a fresh one
+        // after bootstrap so an already-active call is never rendered empty.
+        send("voice.rooms.request");
       }
       if (event.op === "presence.snapshot") setPresence(Object.fromEntries((event.data.users ?? []).map((user: { user_id: string; status: "online" | "busy" | "offline" }) => [user.user_id, user.status])));
       if (event.op === "presence.update") setPresence(current => ({ ...current, [event.data.user_id]: event.data.status }));
@@ -1385,6 +1361,13 @@ export function App() {
       if (event.op === "voice.roster") {
         const { channel_id, participants, streams: roomStreams } = event.data as { channel_id: string; participants: VoiceRosterEntry[]; streams?: StreamInfo[] };
         setVoiceRooms(current => {
+          const botWasHere = (current[channel_id] ?? []).some(entry => entry.user_id === MUSIC_BOT_ID);
+          const botIsHere = (participants ?? []).some(entry => entry.user_id === MUSIC_BOT_ID);
+          // The bot's entrance is a real call event. Play it only for people
+          // already in this channel, never while receiving the initial rooms
+          // snapshot after opening the app.
+          if (channel_id === callChannelIdRef.current && !botWasHere && botIsHere) playSound("joinCall");
+          if (channel_id === callChannelIdRef.current && botWasHere && !botIsHere) playSound("leaveCall");
           const next = { ...current };
           if (!participants || participants.length === 0) delete next[channel_id];
           else next[channel_id] = participants;
@@ -1493,7 +1476,10 @@ export function App() {
       if (event.op === "chat.message.edited") setMessages(current => current.map(message => message.id === event.data.message_id ? { ...message, content: event.data.content } : message));
       if (event.op === "chat.message.preview_updated") setMessages(current => current.map(message => message.id === event.data.message_id ? { ...message, link_preview: event.data.link_preview } : message));
       if (event.op === "chat.message.deleted") setMessages(current => current.filter(message => message.id !== event.data.message_id));
-      if (event.op === "connection.state") setConnectionState(event.data.state);
+      if (event.op === "connection.state") {
+        setConnectionState(event.data.state);
+        if (event.data.state === "connected") send("voice.rooms.request");
+      }
       if (event.op === "screen.sources") { setSources(event.data.sources ?? []); setSourcesLoading(false); }
       if (event.op === "attachment.uploaded") {
         const att = event.data;
@@ -1793,8 +1779,21 @@ export function App() {
   // List cameras up front (labels stay blank until permission is granted once).
   useEffect(() => { void rtc.listCameras().then(setCameras); }, []);
 
-  useEffect(() => rtc.onConnectionQuality(setConnQuality), []);
   useEffect(() => rtc.onSpeaking(setSpeakingUsers), []);
+  useEffect(() => rtc.onCallDisconnected(() => {
+    callChannelIdRef.current = null;
+    musicStreamRef.current = null;
+    setVoiceConnState("disconnected");
+    setCall(null);
+    setStreams([]);
+    setMySharingStreamId(null);
+    setMyMusicStreamId(null);
+    setMyCameraStreamId(null);
+    setSelfCameraStream(null);
+    setWatching({});
+    setRemoteVideos({});
+    setError("A conexão de voz foi encerrada. Entre novamente no canal.");
+  }), []);
   useEffect(() => rtc.onMediaError(message => setError(message)), []);
 
   useEffect(() => { setSoundsMuted(deafened); }, [deafened]);
@@ -2182,6 +2181,10 @@ export function App() {
   }
   function leaveCall() {
     if (call) { playSound("leaveCall"); void rtc.leaveCall(); }
+    // A roster update can reach us before React commits setCall(null).
+    // Clear the imperative guard immediately so it cannot rebuild a stale
+    // stage for one frame while the departure is being processed.
+    callChannelIdRef.current = null;
     shortcutPressedRef.current = false;
     voiceConnTimers.current.forEach(id => window.clearTimeout(id));
     voiceConnTimers.current = [];
@@ -2545,6 +2548,7 @@ export function App() {
     if (callmate) {
       items.push({
         kind: "slider",
+        id: `peer-volume:${userId}`,
         label: callmate.is_bot ? "Volume da música" : "Volume do usuário",
         value: Math.round((peerVolumes[userId] ?? 1) * 100),
         min: 0,
@@ -2553,6 +2557,13 @@ export function App() {
         resetTo: 100,
         format: percent => `${percent}%`,
         onChange: percent => changePeerVolume(userId, percent / 100),
+      });
+      items.push({
+        kind: "checkbox",
+        id: `peer-muted:${userId}`,
+        label: "Silenciar só para mim",
+        checked: !!mutedPeers[userId],
+        onChange: checked => setPeerMuted(userId, checked),
       });
     }
     if (member) items.push({ label: "Renomear usuário", onClick: () => renameOtherMember(member) });
@@ -2592,11 +2603,11 @@ export function App() {
   })();
 
   function togglePeerMute(userId: string) {
-    setMutedPeers(current => {
-      const next = !current[userId];
-      rtc.setPeerAudioMuted(userId, next);
-      return { ...current, [userId]: next };
-    });
+    setPeerMuted(userId, !mutedPeers[userId]);
+  }
+  function setPeerMuted(userId: string, isMuted: boolean) {
+    rtc.setPeerAudioMuted(userId, isMuted);
+    setMutedPeers(current => ({ ...current, [userId]: isMuted }));
   }
   function changePeerVolume(userId: string, volume: number) {
     const clamped = Math.max(0, Math.min(1, volume));
@@ -2604,7 +2615,11 @@ export function App() {
     setPeerVolumes(current => ({ ...current, [userId]: clamped }));
   }
   function toggleNoiseSuppression() {
-    setNoiseSuppressionMode(current => current === "browser" ? "rnnoise" : current === "rnnoise" ? "off" : "browser");
+    setNoiseSuppressionMode(current => {
+      const next = current === "rnnoise" ? "off" : "rnnoise";
+      playSound(next === "rnnoise" ? "noiseSuppressionEnabled" : "noiseSuppressionDisabled");
+      return next;
+    });
   }
   function toggleFocus(userId: string) {
     setFocusedUser(current => (current === userId ? null : userId));
@@ -3144,6 +3159,7 @@ export function App() {
                           >{name}</span>
                           {micMuted && <Icon name="mic-muted" size={15} className="voice-member__flag" />}
                           {audioOff && <Icon name="headphone-muted" size={15} className="voice-member__flag" />}
+                          {mutedPeers[entry.user_id] && <Icon name="headphone-muted" size={15} className="voice-member__flag voice-member__flag--local-muted" title="Silenciado só para você" />}
                           {hasCamera && <Icon name="camera" size={15} className="voice-member__flag voice-member__flag--cam" title="Câmera ligada" />}
                           {isLive && <span className="voice-member__live-badge">AO VIVO</span>}
                           {botPlaying && (
@@ -3190,11 +3206,6 @@ export function App() {
         {call && (
           <div className="voice-panel">
             <div className="voice-panel__row">
-              {voiceConnState === "connected" ? (
-                <SignalBars quality={connQuality} />
-              ) : (
-                <AudioWaveform color="var(--yellow)" />
-              )}
               <div className="voice-panel__info">
                 <div className={`voice-panel__state ${voiceConnState === "connected" ? "is-connected" : "is-connecting"}`}>
                   {voiceConnState === "waiting_server"
@@ -3236,19 +3247,14 @@ export function App() {
                 onClick={toggleNoiseSuppression}
                 title={noisePipelineStatus.state === "loading"
                   ? "Carregando processamento avançado…"
-                  : noisePipelineStatus.state === "fallback"
-                    ? "Processamento avançado indisponível; usando modo padrão"
+                  : noisePipelineStatus.state === "failed"
+                    ? "Não foi possível ativar o RNNoise"
                     : noiseSuppressionMode === "rnnoise"
                       ? "Redução de ruído: Avançada (RNNoise)"
-                      : noiseSuppressionMode === "off"
-                        ? "Redução de ruído: Desativada"
-                        : "Redução de ruído: Padrão do dispositivo"}
+                      : "Redução de ruído: Desativada"}
               >
                 <Icon name={noiseSuppressionMode === "rnnoise" ? "crisp-nois-cenaceling-on" : "crisp-off"} size={18} />
               </button>
-              <span className="voice-panel__noise-state" aria-live="polite">
-                {noisePipelineStatus.state === "loading" ? "Processando…" : noisePipelineStatus.state === "fallback" ? "Padrão (fallback)" : noiseSuppressionMode === "rnnoise" ? "RNNoise" : noiseSuppressionMode === "off" ? "Sem supressão" : "Padrão"}
-              </span>
               <button className="vp-btn" title="Efeitos sonoros"><Icon name="sound-effects" size={18} /></button>
             </div>
           </div>

@@ -454,6 +454,10 @@ function finishTrack(track) {
   track.done = true;
   const seconds = ((Date.now() - track.startedAt) / 1000).toFixed(1);
   log(`finished "${track.title}" (${(track.bytes / 1e6).toFixed(1)} MB PCM in ${seconds}s, ${track.underruns} underruns)`);
+  // A following source can take seconds to resolve. During that interval the
+  // old song is over, so remove its presence badge and post its completion.
+  unpublishCurrent();
+  statusReporter.report(track.meta.entry.channelId, "finished", statusDetails(track.meta));
   void playNext();
 }
 
@@ -464,6 +468,7 @@ async function playNext() {
   try {
     const previous = current;
     stopCurrent();
+    if (previous) unpublishCurrent();
     while (queue.length) {
       const entry = queue.shift();
       const resolution = await resolveEntry(entry);
@@ -474,9 +479,6 @@ async function playNext() {
     }
     unpublishCurrent();
     idleSince = Date.now();
-    if (previous?.done && previous.bytes > 0) {
-      statusReporter.report(previous.meta.entry.channelId, "finished", statusDetails(previous.meta));
-    }
     log("queue drained — idle");
   } catch (error) {
     log(`playNext failed: ${error && error.message ? error.message : error}`);
@@ -493,6 +495,9 @@ async function playNext() {
  *  empty sources fail over to the next provider. */
 function beginStream(meta, attempt = 0) {
   stopCurrent();
+  // Never expose a playing indicator before the decoder has actually
+  // produced audio. This also clears a stale indicator during failover.
+  unpublishCurrent();
   const clients = CLIENT_SETS[Math.min(attempt, CLIENT_SETS.length - 1)];
   const clientDetails = meta.provider === "youtube" ? ` clients=${clients}${attempt ? ` attempt=${attempt + 1}` : ""}` : "";
   log(`playing "${meta.title}" (${meta.url}) provider=${meta.provider}${clientDetails}`);
@@ -555,6 +560,7 @@ function beginStream(meta, attempt = 0) {
       if (!track.announced) {
         track.announced = true;
         lastStatusChannelId = meta.entry.channelId || lastStatusChannelId;
+        publishTrack(meta.title);
         statusReporter.report(meta.entry.channelId, "playing", statusDetails(meta));
       }
     }
@@ -584,7 +590,6 @@ function beginStream(meta, attempt = 0) {
     void failoverSource(track);
   });
 
-  publishTrack(meta.title);
   return true;
 }
 

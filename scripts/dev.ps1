@@ -1,38 +1,39 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-  One command to bring up the whole Talkeando local dev stack and open two
-  client windows (alice + bob) for P2P / two-account testing on one machine.
+  One command to run the Talkeando backend and desktop clients locally. It
+  uses the configured database while running the backend, desktop clients, and
+  LiveKit SFU locally before deployment.
 
 .DESCRIPTION
   Does, in order, everything the README's "manual" steps 1-5 describe:
-    1. Start the compose Postgres (infra/docker-compose.yml), wait for healthy.
-    2. Create server/.env from the example if it does not exist yet.
-    3. Build the Rust server, run bootstrap-owner once (idempotent - fine if
-       the community already exists), then start the server in its own window
-       unless something is already listening on port 8080.
-    4. Make sure the second account (bob) exists: mints an invite as the
-       owner and registers bob if a login check for him fails.
-    5. Build the React UI (client/ui) unless -SkipUiBuild - the native client
+    1. Starts the local LiveKit SFU in Docker, plus Postgres only when
+       DATABASE_URL explicitly points to it.
+    2. Starts the Rust server locally on 127.0.0.1:8090, without rewriting
+       server/.env.
+    3. When using a local database only, seeds alice/bob for two-account tests.
+       A remote database is never seeded, reset, or otherwise mutated by this
+       launcher.
+    4. Builds the React UI (client/ui) unless -SkipUiBuild - the native client
        only ever loads the built dist/, never live source.
-    6. Build the native client once, then launch two instances with
+    5. Builds the native client once, then launches two instances with
        TUPI_PROFILE=alice and =bob, each in its own titled window.
 
-  Everything talks to the same local backend, so a call / screen share
-  between the two windows is a real P2P connection over loopback.
+  Everything talks to the same local backend and local LiveKit SFU. The
+  database may remain remote; the launcher never creates or resets remote
+  data.
 
 .PARAMETER Reset
-  Tear the Postgres volume down first (docker compose down -v) and wipe the
-  local per-profile session + WebView2 folders, so you start from a clean DB
-  with no stale bearer tokens. bootstrap-owner then runs fresh.
+  Wipe the local per-profile session + WebView2 folders. The Postgres volume
+  is also removed only when DATABASE_URL selects the local Docker database.
+  Remote data is never reset.
 
 .PARAMETER SkipUiBuild
   Skip `npm install` / `npm run build` for client/ui. Use when you have not
   touched client/ui/src since the last run.
 
 .PARAMETER NoClients
-  Bring the backend up (and ensure both accounts) but do not open the two
-  client windows.
+  Bring the backend up but do not open the two client windows.
 
 .EXAMPLE
   .\dev.cmd
@@ -55,7 +56,7 @@ param(
 # $LASTEXITCODE / output checks and `throw` below instead.
 $ErrorActionPreference = 'Continue'
 
-# --- accounts wired up for local two-window testing -------------------------
+# --- accounts wired up for local-database two-window testing ----------------
 # Throwaway local-only credentials (same ones the README uses). alice is the
 # community owner created by bootstrap-owner; bob joins via an invite alice
 # mints. Change the display names if you like; keep passwords >= 8 chars.
@@ -69,8 +70,8 @@ $ClientDir = Join-Path $RepoRoot 'client\native\Talkeando.Client'
 $Compose   = Join-Path $RepoRoot 'infra\docker-compose.yml'
 # Port 8080 collides with other Node/dev servers people commonly leave
 # running (it did on the machine this was written on). Talkeando's local
-# stack uses 8090 instead; server/.env's BIND_ADDR is rewritten to match
-# below, and both client windows are pointed here explicitly.
+# stack uses 8090 instead; the local server process gets that bind address and
+# both client windows are pointed here explicitly.
 $BindPort  = 8090
 $ApiBase   = "http://127.0.0.1:$BindPort/api"
 $WsUrl     = "ws://127.0.0.1:$BindPort/ws"
@@ -108,7 +109,6 @@ function Start-InWindow($title, $workDir, $command) {
         "`$host.UI.RawUI.WindowTitle = '$title'; Set-Location '$workDir'; $command"
     ) | Out-Null
 }
-
 # ---------------------------------------------------------------------------
 Step 'Checking prerequisites'
 Need cargo; Need dotnet; Need npm
@@ -120,18 +120,16 @@ if (-not (Test-Path $envFile)) {
     Step 'Creating server/.env from .env.example'
     Copy-Item (Join-Path $ServerDir '.env.example') $envFile
 }
-# DATABASE_URL decides whether we manage a local Docker Postgres or just
-# point at a remote one (the checked-in default is a managed/prod DB). Only
-# the *shape* of the line is inspected here, never its value.
+# DATABASE_URL decides whether we also manage a local Docker Postgres or use
+# the remote database. Only the *shape* of the line is inspected here, never
+# its value.
 $dbLine = (Select-String -Path $envFile -Pattern '^DATABASE_URL=' -SimpleMatch:$false | Select-Object -First 1)
 $LocalDb = $dbLine -and ($dbLine.Line -match '@(localhost|127\.0\.0\.1):5434')
 
-if ($LocalDb) {
-    Need docker
-    & docker info 2>&1 | Out-Null
-    if ($LASTEXITCODE -ne 0) { throw 'DATABASE_URL points at the local Docker Postgres but the Docker daemon is not responding. Start Docker Desktop, or point DATABASE_URL at the remote DB.' }
-    Info 'docker daemon is up'
-}
+Need docker
+& docker info 2>&1 | Out-Null
+if ($LASTEXITCODE -ne 0) { throw 'Docker Desktop is required for the local LiveKit SFU but is not responding. Start Docker Desktop and retry.' }
+Info 'docker daemon is up'
 
 if ($Reset) {
     Step 'Reset: wiping local per-profile session state'
@@ -144,7 +142,15 @@ if ($Reset) {
     Info 'clean slate'
 }
 
-# --- 1. Postgres (only when using the local one) ---------------------
+# --- 1. local LiveKit SFU + optional Postgres ------------------------
+Step 'Starting local LiveKit SFU (compose)'
+& docker compose -f $Compose up -d livekit 2>&1 | ForEach-Object { Info $_ }
+if ($LASTEXITCODE -ne 0) { throw 'docker compose up livekit failed.' }
+$liveKitDeadline = (Get-Date).AddSeconds(60)
+while (-not (Test-Port 7880) -and (Get-Date) -lt $liveKitDeadline) { Start-Sleep -Milliseconds 800 }
+if (-not (Test-Port 7880)) { throw 'Local LiveKit did not start on :7880.' }
+Info 'local LiveKit ready on ws://127.0.0.1:7880'
+
 if ($LocalDb) {
     Step 'Starting Postgres (compose)'
     & docker compose -f $Compose up -d postgres 2>&1 | ForEach-Object { Info $_ }
@@ -161,19 +167,15 @@ if ($LocalDb) {
     if ($health -ne 'healthy') { throw "Postgres did not become healthy in time (last status: '$health')." }
     Info 'postgres healthy'
 } else {
-    Step 'Using the DATABASE_URL from server/.env (remote database)'
+    Step 'Using remote database from server/.env'
+    Info 'remote data is read/written only through the local backend; no seed or reset runs'
 }
 
-# --- 2. server/.env BIND_ADDR --------------------------------------
-# Keep BIND_ADDR in sync with $BindPort without echoing the file's contents.
-$envLines = Get-Content $envFile
-if ($envLines -match '^BIND_ADDR=') {
-    $patched = $envLines -replace '^BIND_ADDR=.*', "BIND_ADDR=127.0.0.1:$BindPort"
-} else {
-    $patched = $envLines + "BIND_ADDR=127.0.0.1:$BindPort"
-}
-Set-Content -Path $envFile -Value $patched
-Info "server/.env BIND_ADDR -> 127.0.0.1:$BindPort"
+# --- 2. local server bind ------------------------------------------
+# The local process overrides the bind address. Keep server/.env untouched so
+# it can retain the remote-service settings used by deployments.
+$ServerRuntimeEnv = "`$env:BIND_ADDR='127.0.0.1:$BindPort'; `$env:LIVEKIT_URL='ws://127.0.0.1:7880'; `$env:LIVEKIT_API_KEY='devkey'; `$env:LIVEKIT_API_SECRET='devsecret_at_least_32_chars_long'; `$env:MUSIC_BOT_TOKEN='local-dev-music-bot-token'; "
+Info "local server bind -> 127.0.0.1:$BindPort"
 
 # --- 3. server -------------------------------------------------------
 Step 'Building server (cargo build)'
@@ -182,7 +184,8 @@ try {
     cargo build --bin tupi-server
     if ($LASTEXITCODE -ne 0) { throw 'cargo build failed.' }
 
-    Step 'Running bootstrap-owner (idempotent - fine if the community already exists)'
+    if ($LocalDb) {
+    Step 'Running bootstrap-owner for the local database'
     # Redirect every stream to a file so a stderr line can never be turned
     # into a terminating error under $ErrorActionPreference = 'Stop'.
     $bootstrapLog = New-TemporaryFile
@@ -194,6 +197,7 @@ try {
     ($bootstrap -split "`r?`n") | Where-Object { $_ } | ForEach-Object { Info $_ }
     if ($bootstrapExit -ne 0 -and ($bootstrap -notmatch 'already exists')) {
         throw 'bootstrap-owner failed unexpectedly (see output above).'
+    }
     }
 }
 finally { Pop-Location }
@@ -210,12 +214,26 @@ if (Test-Port $BindPort) {
     }
 }
 if ($portOwner -eq 'tupi') {
-    Info "A tupi-server is already running on :$BindPort - reusing it."
+    # A dev launch must use the freshly built server and its local LiveKit /
+    # music-bot environment. Reusing a process from an earlier run silently
+    # keeps stale tokens and makes the local bot fail authentication.
+    $listener = Get-NetTCPConnection -LocalPort $BindPort -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
+    $existing = if ($listener) { Get-Process -Id $listener.OwningProcess -ErrorAction SilentlyContinue } else { $null }
+    if ($existing -and $existing.ProcessName -eq 'tupi-server') {
+        Step 'Restarting the existing local tupi-server'
+        Stop-Process -Id $existing.Id -Force
+        $closeDeadline = (Get-Date).AddSeconds(10)
+        while ((Test-Port $BindPort) -and (Get-Date) -lt $closeDeadline) { Start-Sleep -Milliseconds 200 }
+        if (Test-Port $BindPort) { throw "The previous tupi-server did not release :$BindPort." }
+        Start-InWindow 'tupi-server' $ServerDir "${ServerRuntimeEnv}cargo run --bin tupi-server"
+    } else {
+        throw "Port $BindPort is held by a Tupi endpoint, but its process could not be identified as the local tupi-server. Stop it and retry."
+    }
 } elseif ($portOwner -eq 'foreign') {
     throw "Port $BindPort is held by another process that is not tupi-server. Stop it (or change `$BindPort in scripts\dev.ps1) and retry."
 } else {
     Step 'Starting the server in its own window'
-    Start-InWindow 'tupi-server' $ServerDir 'cargo run --bin tupi-server'
+    Start-InWindow 'tupi-server' $ServerDir "${ServerRuntimeEnv}cargo run --bin tupi-server"
 }
 
 Step 'Waiting for the server to answer'
@@ -234,8 +252,14 @@ while ((Get-Date) -lt $deadline) {
 if (-not $up) { throw "Server never answered on :$BindPort." }
 Info 'server responding'
 
-# --- 4. ensure the second account ------------------------------------
-Step "Ensuring second account '$($Member.Username)' exists"
+Step 'Starting local music bot (compose)'
+& docker compose -f $Compose up -d --build music-bot 2>&1 | ForEach-Object { Info $_ }
+if ($LASTEXITCODE -ne 0) { throw 'docker compose up music-bot failed.' }
+Info 'local music bot starting (use docker compose logs -f music-bot to follow it)'
+
+# --- 4. ensure the second account (local DB only) -------------------
+if ($LocalDb) {
+Step "Ensuring second account '$($Member.Username)' exists in the local database"
 $memberExists = $false
 try {
     Invoke-Api POST 'auth/login' @{ username = $Member.Username; password = $Member.Password } $null | Out-Null
@@ -255,6 +279,10 @@ if ($memberExists) {
         display_name = $Member.Display
     } $null | Out-Null
     Info "registered $($Member.Username)"
+}
+} else {
+    Step 'Using existing remote accounts'
+    Info 'No accounts or invitations are created against the remote database.'
 }
 
 # --- 5. React UI ---------------------------------------------------
@@ -278,20 +306,28 @@ if ($LASTEXITCODE -ne 0) { throw 'dotnet build failed.' }
 
 if ($NoClients) {
     Step 'Backend ready. Skipping the client windows (-NoClients).'
-    Write-Host "`nAccounts:" -ForegroundColor Green
-    Write-Host "  $($Owner.Username) / $($Owner.Password)   (community owner)"
-    Write-Host "  $($Member.Username) / $($Member.Password)"
+    if ($LocalDb) {
+        Write-Host "`nAccounts:" -ForegroundColor Green
+        Write-Host "  $($Owner.Username) / $($Owner.Password)   (community owner)"
+        Write-Host "  $($Member.Username) / $($Member.Password)"
+    } else {
+        Write-Host "`nUse existing accounts from the configured remote database." -ForegroundColor Green
+    }
     return
 }
 
 Step 'Launching two client windows'
-$clientEnv = "`$env:TUPI_API_BASE_URL='$ApiBase'; `$env:TUPI_WS_URL='$WsUrl'; "
+$clientEnv = "`$env:TUPI_API_BASE_URL='$ApiBase'; `$env:TUPI_WS_URL='$WsUrl'; `$env:TUPI_DISABLE_AUTO_UPDATE='1'; "
 Start-InWindow "tupi-client:$($Owner.Username)"  $ClientDir "$clientEnv`$env:TUPI_PROFILE='$($Owner.Username)'; dotnet run --no-build --no-restore"
 Start-Sleep -Seconds 2
 Start-InWindow "tupi-client:$($Member.Username)" $ClientDir "$clientEnv`$env:TUPI_PROFILE='$($Member.Username)'; dotnet run --no-build --no-restore"
 
 Write-Host "`nAll set." -ForegroundColor Green
-Write-Host "  window 'tupi-client:$($Owner.Username)'  -> log in as $($Owner.Username) / $($Owner.Password)  (community owner)"
-Write-Host "  window 'tupi-client:$($Member.Username)'    -> log in as $($Member.Username) / $($Member.Password)"
+if ($LocalDb) {
+    Write-Host "  window 'tupi-client:$($Owner.Username)'  -> log in as $($Owner.Username) / $($Owner.Password)  (community owner)"
+    Write-Host "  window 'tupi-client:$($Member.Username)'    -> log in as $($Member.Username) / $($Member.Password)"
+} else {
+    Write-Host "  Log in with existing accounts from the configured remote database."
+}
 Write-Host "`nServer runs in the 'tupi-server' window (Ctrl+C there to stop it)."
-Write-Host "Postgres stays up in Docker: 'docker compose -f infra/docker-compose.yml stop' to stop it."
+if ($LocalDb) { Write-Host "Postgres stays up in Docker: 'docker compose -f infra/docker-compose.yml stop' to stop it." }
