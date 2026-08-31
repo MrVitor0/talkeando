@@ -128,7 +128,12 @@ jobs:
           $tag = 'v${{ steps.release.outputs.version }}'
           $notes = "Tupi $tag (${{ steps.release.outputs.channel }}).`n`nThis release is delivered automatically to Velopack clients. The legacy v0.1.999 bridge intentionally remains the GitHub latest release for old clients."
           $pre = if ('${{ steps.release.outputs.channel }}' -eq 'beta') { '--prerelease' } else { '' }
-          gh release create $tag release/velopack/$env:PACK_ID-Setup.exe release/velopack/SHA256SUMS.txt --title "Tupi $tag" --notes $notes --latest=false $pre
+          # vpk includes the channel/RID in the setup filename (for example
+          # `Tupi.Client-win-x64-beta-Setup.exe`), so never assume a bare
+          # `<packId>-Setup.exe` name here.
+          $setup = Get-ChildItem release/velopack -Filter '*-Setup.exe' -File | Select-Object -First 1
+          if (-not $setup) { throw 'Velopack did not produce a Setup.exe artifact.' }
+          gh release create $tag $setup.FullName release/velopack/SHA256SUMS.txt --title "Tupi $tag" --notes $notes --latest=false $pre
 
       - uses: actions/upload-artifact@v4
         with:
