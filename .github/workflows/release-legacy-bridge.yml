@@ -29,11 +29,20 @@ jobs:
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '6.0.x'
+      - name: Test native client
+        run: dotnet test client/native/Talkeando.Client.Tests/Talkeando.Client.Tests.csproj --configuration Release
       - name: Publish the Inno-compatible bridge payload
         run: dotnet publish client/native/Talkeando.Client/Talkeando.Client.csproj --configuration Release --runtime win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:TupiLegacyBridge=true -p:Version=0.1.999 -p:AssemblyVersion=0.1.999.0 -p:FileVersion=0.1.999.0 --output release/Tupi-legacy-bridge
       - name: Download WebView2 bootstrapper
         shell: pwsh
         run: Invoke-WebRequest -Uri 'https://go.microsoft.com/fwlink/p/?LinkId=2124703' -OutFile client/native/installer/MicrosoftEdgeWebview2Setup.exe
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          choco install innosetup --yes --no-progress
+          $iscc = Get-ChildItem 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe', 'C:\Program Files\Inno Setup 6\ISCC.exe' -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $iscc) { throw 'Inno Setup was installed but ISCC.exe was not found.' }
+          $iscc.DirectoryName | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
       - name: Build final Inno installer
         shell: pwsh
         run: iscc /DAppVersion="0.1.999" /DPublishDir="${{ github.workspace }}\release\Tupi-legacy-bridge" client/native/installer/Tupi.iss
@@ -42,8 +51,20 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release download tupi-update-feed --pattern 'Tupi.Client-Setup.exe' --dir release/feed 2>$null
+          # The bridge has a fixed URL for this alias. Verify it exists before
+          # publishing an installer that depends on it.
+          New-Item -ItemType Directory -Force release/feed | Out-Null
+          gh release download tupi-update-feed --pattern 'Tupi.Client-Setup.exe' --dir release/feed --clobber 2>$null
           if ($LASTEXITCODE -ne 0) { throw 'Publish the first Velopack stable package to tupi-update-feed before releasing the bridge.' }
           $setup = 'client/native/installer/output/Tupi-Setup-0.1.999-x64.exe'
           Get-FileHash $setup -Algorithm SHA256 | ForEach-Object { "{0}  {1}" -f $_.Hash.ToLowerInvariant(), (Split-Path $_.Path -Leaf) } | Set-Content SHA256SUMS.txt
-          gh release create v0.1.999 $setup SHA256SUMS.txt --title 'Tupi v0.1.999 — Legacy Bridge' --notes 'Final Inno release. It silently migrates this installation to the new automatic updater.' --latest=true
+          gh release view v0.1.999 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            # Keep the intentionally one-time bridge safely rerunnable after
+            # a failed job by replacing its generated assets.
+            gh release upload v0.1.999 $setup SHA256SUMS.txt --clobber
+            if ($LASTEXITCODE -ne 0) { throw 'Could not refresh the legacy bridge assets.' }
+          } else {
+            gh release create v0.1.999 $setup SHA256SUMS.txt --title 'Tupi v0.1.999 — Legacy Bridge' --notes 'Final Inno release. It silently migrates this installation to the new automatic updater.' --latest=true
+            if ($LASTEXITCODE -ne 0) { throw 'Could not create the legacy bridge release.' }
+          }

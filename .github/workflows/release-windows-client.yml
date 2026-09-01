@@ -104,10 +104,29 @@ jobs:
           "@ | Set-Content release/release-notes.md
           vpk pack --packId $env:PACK_ID --packVersion "${{ steps.release.outputs.version }}" --packDir release/Tupi-win-x64 --mainExe Tupi.exe --outputDir release/velopack --channel "${{ steps.release.outputs.velopack_channel }}" --packTitle Tupi --icon client/native/Talkeando.Client/assets/tupi.ico --framework webview2 --releaseNotes release/release-notes.md
 
+          # Velopack scopes Setup.exe by channel/RID. Keep one stable alias as
+          # well: the final legacy bridge uses this URL to migrate an old Inno
+          # installation to Velopack.
+          $channelSetup = Join-Path release/velopack "$env:PACK_ID-${{ steps.release.outputs.velopack_channel }}-Setup.exe"
+          if (-not (Test-Path -LiteralPath $channelSetup)) { throw "Velopack did not produce the expected installer: $channelSetup" }
+          Copy-Item -LiteralPath $channelSetup -Destination (Join-Path release/velopack "$env:PACK_ID-Setup.exe") -Force
+
       - name: Write checksums for release artifacts
         shell: pwsh
         run: |
-          Get-ChildItem release/velopack -File | Get-FileHash -Algorithm SHA256 | ForEach-Object { "{0}  {1}" -f $_.Hash.ToLowerInvariant(), $_.Path.Substring((Resolve-Path release/velopack).Path.Length + 1) } | Set-Content release/velopack/SHA256SUMS.txt
+          # The previous feed is restored before packaging to generate delta
+          # packages, so SHA256SUMS.txt can already exist. Do not hash that
+          # file while overwriting it: Windows then raises a sharing violation.
+          $directory = (Resolve-Path release/velopack).Path
+          $checksums = Join-Path $directory 'SHA256SUMS.txt'
+          $temporary = Join-Path $directory 'SHA256SUMS.txt.tmp'
+          Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
+          Get-ChildItem $directory -File |
+            Where-Object { $_.Name -notin @('SHA256SUMS.txt', 'SHA256SUMS.txt.tmp') } |
+            Get-FileHash -Algorithm SHA256 |
+            ForEach-Object { "{0}  {1}" -f $_.Hash.ToLowerInvariant(), $_.Path.Substring($directory.Length + 1) } |
+            Set-Content -LiteralPath $temporary -NoNewline
+          Move-Item -LiteralPath $temporary -Destination $checksums -Force
 
       - name: Publish immutable update feed
         shell: pwsh
@@ -131,9 +150,21 @@ jobs:
           # vpk includes the channel/RID in the setup filename (for example
           # `Tupi.Client-win-x64-beta-Setup.exe`), so never assume a bare
           # `<packId>-Setup.exe` name here.
-          $setup = Get-ChildItem release/velopack -Filter '*-Setup.exe' -File | Select-Object -First 1
-          if (-not $setup) { throw 'Velopack did not produce a Setup.exe artifact.' }
-          gh release create $tag $setup.FullName release/velopack/SHA256SUMS.txt --title "Tupi $tag" --notes $notes --latest=false $pre
+          $setup = Join-Path release/velopack "$env:PACK_ID-${{ steps.release.outputs.velopack_channel }}-Setup.exe"
+          if (-not (Test-Path -LiteralPath $setup)) { throw "Velopack did not produce the expected installer: $setup" }
+          gh release view $tag 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            # A rerun can happen after the release was created but before the
+            # job completed. Replace its generated assets rather than failing
+            # solely because the tag already exists.
+            gh release upload $tag $setup release/velopack/SHA256SUMS.txt --clobber
+            if ($LASTEXITCODE -ne 0) { throw "Could not refresh assets for $tag." }
+            gh release edit $tag --title "Tupi $tag" --notes $notes --latest=false $pre
+            if ($LASTEXITCODE -ne 0) { throw "Could not refresh metadata for $tag." }
+          } else {
+            gh release create $tag $setup release/velopack/SHA256SUMS.txt --title "Tupi $tag" --notes $notes --latest=false $pre
+            if ($LASTEXITCODE -ne 0) { throw "Could not create $tag." }
+          }
 
       - uses: actions/upload-artifact@v4
         with:
