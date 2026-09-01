@@ -25,12 +25,24 @@ public sealed record UpdateInfo(
 
 public sealed class UpdateChecker
 {
-    private readonly UpdateManager _manager;
+    // An Inno-installed legacy bridge and local/dev executables are not
+    // Velopack packages, so VelopackLocator.Current is unavailable there.
+    // Constructing UpdateManager used to throw before the bridge could run
+    // its migration, leaving the user with an application that immediately
+    // crashed. Keep the updater unavailable in those contexts instead.
+    private readonly UpdateManager? _manager;
     private Velopack.UpdateInfo? _available;
 
     public UpdateChecker()
     {
-        _manager = new UpdateManager(ReleaseConfiguration.UpdateFeedUrl);
+        try
+        {
+            _manager = new UpdateManager(ReleaseConfiguration.UpdateFeedUrl);
+        }
+        catch (Exception ex)
+        {
+            DebugLog.Write($"Velopack updater is unavailable in this installation: {ex.Message}");
+        }
     }
 
     public static string GetCurrentVersion()
@@ -41,6 +53,9 @@ public sealed class UpdateChecker
 
     public async Task<UpdateInfo?> CheckAsync()
     {
+        if (_manager is null)
+            return null;
+
         try
         {
             _available = await _manager.CheckForUpdatesAsync();
@@ -66,6 +81,8 @@ public sealed class UpdateChecker
 
     public async Task DownloadUpdateAsync(Action<int> onProgress, CancellationToken ct = default)
     {
+        if (_manager is null)
+            throw new InvalidOperationException("AtualizaÃ§Ã£o automÃ¡tica indisponÃ­vel nesta instalaÃ§Ã£o.");
         if (_available == null)
             throw new InvalidOperationException("Nenhuma atualizaÃ§Ã£o pendente para baixar.");
 
@@ -74,6 +91,8 @@ public sealed class UpdateChecker
 
     public void ApplyUpdate()
     {
+        if (_manager is null)
+            throw new InvalidOperationException("AtualizaÃ§Ã£o automÃ¡tica indisponÃ­vel nesta instalaÃ§Ã£o.");
         if (_available == null)
             throw new InvalidOperationException("Nenhuma atualizaÃ§Ã£o baixada para aplicar.");
 
