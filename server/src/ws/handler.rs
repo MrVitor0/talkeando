@@ -29,6 +29,7 @@ use crate::{
     state::AppState,
     ws::{
         call_registry::CallOpError,
+        hub::ConnMeta,
         protocol::*,
     },
 };
@@ -53,29 +54,47 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
 
     // WS-FR-001: client must send auth.hello within 10s of connecting.
     let hello = tokio::time::timeout(Duration::from_secs(10), receiver.next()).await;
-    let user = match hello {
+    let authenticated = match hello {
         Ok(Some(Ok(Message::Text(text)))) => match serde_json::from_str::<InboundEnvelope>(&text) {
-            Ok(env) if env.op == "auth.hello" => {
-                match serde_json::from_value::<AuthHello>(env.data) {
-                    Ok(AuthHello { token }) if token == state.config.music_bot_token => Some((music_bot_user(), Uuid::nil())),
-                    Ok(AuthHello { token }) => match authenticate_token(&state.pool, &token).await {
-                        Ok((u, s)) => Some((u, s)),
-                        Err(error) => {
-                            if !matches!(error, crate::error::AppError::Unauthorized) {
-                                tracing::error!(%error, "database error during ws handshake");
+            Ok(env) if env.op == "auth.hello" => match serde_json::from_value::<AuthHello>(env.data) {
+                Ok(hello) => {
+                    // `client_version` / `client_platform` are client-controlled
+                    // and flow into logs and the debug endpoint — truncate
+                    // before storing (SPEC-001 §5, §6.4).
+                    let meta = ConnMeta {
+                        protocol_version: hello.protocol_version.min(MAX_SERVER_PROTOCOL),
+                        client_version: truncate_chars(
+                            hello.client_version.as_deref().unwrap_or("unknown"),
+                            64,
+                        ),
+                        client_platform: truncate_chars(
+                            hello.client_platform.as_deref().unwrap_or("unknown"),
+                            32,
+                        ),
+                        connected_at: chrono::Utc::now(),
+                    };
+                    if hello.token == state.config.music_bot_token {
+                        Some((music_bot_user(), Uuid::nil(), meta))
+                    } else {
+                        match authenticate_token(&state.pool, &hello.token).await {
+                            Ok((u, s)) => Some((u, s, meta)),
+                            Err(error) => {
+                                if !matches!(error, crate::error::AppError::Unauthorized) {
+                                    tracing::error!(%error, "database error during ws handshake");
+                                }
+                                None
                             }
-                            None
                         }
-                    },
-                    Err(_) => None,
+                    }
                 }
-            }
+                Err(_) => None,
+            },
             _ => None,
         },
         _ => None,
     };
 
-    let Some((user, _session_id)) = user else {
+    let Some((user, _session_id, conn_meta)) = authenticated else {
         let _ = tx.send(Message::Text(
             serde_json::to_string(&OutboundEnvelope::new(
                 "auth.rejected",
@@ -90,10 +109,16 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     };
 
     let user_id = user.id;
-    tracing::info!(%user_id, "ws connected");
+    tracing::info!(
+        %user_id,
+        protocol_version = conn_meta.protocol_version,
+        client_version = %conn_meta.client_version,
+        client_platform = %conn_meta.client_platform,
+        "ws connected"
+    );
 
     let was_online = state.hub.is_online(user_id).await;
-    let connection_id = state.hub.register(user_id, tx.clone()).await;
+    let connection_id = state.hub.register(user_id, tx.clone(), conn_meta.clone()).await;
     state.advance_presence_epoch(user_id).await;
     let cancelled_offline_grace = state.cancel_offline_grace(user_id).await;
 
@@ -109,6 +134,9 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                     username: user.username.clone(),
                     display_name: user.display_name.clone(),
                     livekit_url: state.config.livekit_url.clone(),
+                    protocol_version: conn_meta.protocol_version,
+                    server_version: crate::SERVER_VERSION.to_string(),
+                    features: crate::ws::server_features(&state.config),
                 },
             ),
         )
@@ -250,6 +278,16 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     });
     tracing::info!(%user_id, "ws disconnected; grace period started");
     let _ = forward_task.await;
+}
+
+/// Keeps at most `max` Unicode scalar values of `s`, on a char boundary.
+/// Applied to the client-controlled `client_version` / `client_platform`
+/// before they reach logs or the debug endpoint (SPEC-001 §5).
+fn truncate_chars(s: &str, max: usize) -> String {
+    match s.char_indices().nth(max) {
+        Some((idx, _)) => s[..idx].to_string(),
+        None => s.to_string(),
+    }
 }
 
 fn music_bot_user() -> db::User {
@@ -1750,3 +1788,28 @@ async fn handle_stream_unsubscribe(state: &AppState, user_id: Uuid, data: Stream
     }
 }
 */
+
+#[cfg(test)]
+mod tests {
+    use super::truncate_chars;
+
+    #[test]
+    fn truncate_chars_keeps_short_strings_intact() {
+        assert_eq!(truncate_chars("1.4.0", 64), "1.4.0");
+        assert_eq!(truncate_chars("", 64), "");
+    }
+
+    #[test]
+    fn truncate_chars_caps_long_strings_at_the_limit() {
+        let s = "v".repeat(10_000);
+        assert_eq!(truncate_chars(&s, 64).chars().count(), 64);
+    }
+
+    #[test]
+    fn truncate_chars_never_splits_a_multibyte_char() {
+        let s = "é".repeat(50); // 2 bytes per char
+        let out = truncate_chars(&s, 10);
+        assert_eq!(out.chars().count(), 10);
+        assert_eq!(out, "é".repeat(10));
+    }
+}

@@ -21,6 +21,12 @@ public sealed record TurnCredentials(string Username, string Credential, IReadOn
 public sealed class NetworkClient
 {
     private const int ProfileImageMaxPixels = 256;
+    /// Signaling-protocol version this build understands. Bump only alongside a
+    /// change in tupi-v2-refactor/05-protocol-spec.md. The UI learns the
+    /// version actually negotiated from `auth.ok`. Stays at 1 until SPEC-008,
+    /// which is when the client actually speaks the v2 ops — announcing 2
+    /// earlier would make the server send ops this build would ignore.
+    private const int ClientProtocolVersion = 1;
     private static readonly TimeSpan WebSocketSendTimeout = TimeSpan.FromSeconds(6);
     private readonly SessionStore _sessions;
     private readonly HttpClient _http;
@@ -354,7 +360,13 @@ public sealed class NetworkClient
                 ?? "ws://localhost:8080/ws";
             await socket.ConnectAsync(new Uri(wsUrl), CancellationToken.None);
             var token = _sessions.Load() ?? throw new InvalidOperationException("Sessão não encontrada.");
-            await SendWebSocketAsync("auth.hello", JsonSerializer.SerializeToElement(new { token }));
+            await SendWebSocketAsync("auth.hello", JsonSerializer.SerializeToElement(new
+            {
+                token,
+                protocol_version = ClientProtocolVersion,
+                client_version = UpdateChecker.GetCurrentVersion(),
+                client_platform = "windows",
+            }));
             _reconnectAttempt = 0;
             Interlocked.Exchange(ref _reconnecting, 0);
             _onWebSocketEvent?.Invoke("connection.state", JsonSerializer.SerializeToElement(new { state = "connected" }));

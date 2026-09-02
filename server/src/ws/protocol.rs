@@ -52,9 +52,29 @@ pub struct ErrorData {
 
 // ---- auth.* ----
 
+/// Highest protocol dialect this server speaks. Bump only alongside a
+/// documented dialect change in tupi-v2-refactor/05-protocol-spec.md.
+///
+/// This is `2` from SPEC-001 on, even though SPEC-001 implements nothing of
+/// v2: SPEC-005 is what starts emitting the new ops, and the `features` list
+/// in `auth.ok` is what actually declares availability. A client that
+/// negotiates `protocol_version: 2` but sees an empty `features` MUST operate
+/// in the v1 dialect (see 05-protocol-spec.md §1.2).
+pub const MAX_SERVER_PROTOCOL: u8 = 2;
+
 #[derive(Debug, Deserialize)]
 pub struct AuthHello {
     pub token: String,
+    #[serde(default = "default_protocol_version")]
+    pub protocol_version: u8,
+    #[serde(default)]
+    pub client_version: Option<String>,
+    #[serde(default)]
+    pub client_platform: Option<String>,
+}
+
+fn default_protocol_version() -> u8 {
+    1
 }
 
 #[derive(Debug, Serialize)]
@@ -64,6 +84,13 @@ pub struct AuthOk {
     pub display_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub livekit_url: Option<String>,
+    /// Protocol version actually negotiated for this connection:
+    /// `min(client, MAX_SERVER_PROTOCOL)`.
+    pub protocol_version: u8,
+    /// The server's `CARGO_PKG_VERSION`.
+    pub server_version: String,
+    /// Optional capabilities; the client ignores names it does not know.
+    pub features: Vec<String>,
 }
 
 // ---- presence.* ----

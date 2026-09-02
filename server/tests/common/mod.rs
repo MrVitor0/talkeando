@@ -237,15 +237,37 @@ fn replace_database_name(admin_url: &str, db_name: &str) -> String {
 /// assert on the actual JSON, not a heavily-abstracted wrapper.
 pub struct WsClient {
     socket: tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    /// The `data` of the `auth.ok` this client received during the handshake.
+    /// `Null` only if a caller built the client without authenticating.
+    pub auth_ok: serde_json::Value,
 }
 
 impl WsClient {
     pub async fn connect_and_authenticate(ws_url: &str, token: &str) -> Self {
+        Self::connect_and_authenticate_with(ws_url, token, serde_json::json!({})).await
+    }
+
+    /// Like `connect_and_authenticate`, but merges `hello_extra`'s fields into
+    /// the `auth.hello` payload — e.g. `json!({ "protocol_version": 2 })`.
+    /// The resulting `auth.ok` data is stored on `self.auth_ok`.
+    pub async fn connect_and_authenticate_with(
+        ws_url: &str,
+        token: &str,
+        hello_extra: serde_json::Value,
+    ) -> Self {
         let (socket, _) = tokio_tungstenite::connect_async(ws_url).await.expect("connect websocket");
-        let mut client = WsClient { socket };
-        client.send("auth.hello", serde_json::json!({ "token": token })).await;
+        let mut client = WsClient { socket, auth_ok: serde_json::Value::Null };
+        let mut hello = serde_json::json!({ "token": token });
+        if let Some(extra) = hello_extra.as_object() {
+            let obj = hello.as_object_mut().expect("hello is an object");
+            for (key, value) in extra {
+                obj.insert(key.clone(), value.clone());
+            }
+        }
+        client.send("auth.hello", hello).await;
         let ok = client.recv_op("auth.ok").await;
         assert!(ok.is_some(), "expected auth.ok after auth.hello");
+        client.auth_ok = ok.unwrap();
         client
     }
 

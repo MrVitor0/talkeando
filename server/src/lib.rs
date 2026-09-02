@@ -15,6 +15,10 @@ use tower_http::{cors::CorsLayer, trace::TraceLayer};
 
 use crate::state::AppState;
 
+/// This build's version, reported to clients in `auth.ok.server_version`
+/// (SPEC-001). Tracks the crate version in `server/Cargo.toml`.
+pub const SERVER_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 /// Builds the full HTTP+WS router (routes, CORS, body limits, tracing).
 /// Shared by the real binary (`main.rs`) and the integration test harness
 /// (`tests/common`) so tests exercise the exact same middleware stack as
