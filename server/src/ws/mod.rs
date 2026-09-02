@@ -2,6 +2,7 @@ pub mod activity;
 pub mod call_registry;
 pub mod handler;
 pub mod hub;
+pub mod projection;
 pub mod protocol;
 pub mod voice_metrics;
 pub mod voice_registry;

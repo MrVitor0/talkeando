@@ -184,13 +184,39 @@ fn spawn_voice_reconcile(state: AppState) {
         return;
     }
     tokio::spawn(async move {
+        use std::time::{Duration, Instant};
         // Let the process settle and accept a few reconnects first.
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(15));
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let mut ticker = tokio::time::interval(Duration::from_secs(1));
+        let mut last_full = Instant::now();
         loop {
             ticker.tick().await;
-            if state.should_reconcile_voice(std::time::Duration::ZERO).await {
+
+            // 1. Directed reconciles that came due (leave, kick, move, room_finished).
+            for channel_id in state.take_due_reconciles().await {
+                tupi_server::ws::handler::reconcile_one_room(&state, channel_id).await;
+            }
+
+            // 2. Full sweep every 15 s, as before.
+            if last_full.elapsed() >= Duration::from_secs(15)
+                && state.should_reconcile_voice(Duration::ZERO).await
+            {
+                last_full = Instant::now();
                 tupi_server::ws::handler::reconcile_voice_rooms(&state).await;
+            }
+
+            // 3. Expire provisionals (INV-A2).
+            let expired = state.hub.voice.write().await.expire_provisionals();
+            for change in expired {
+                tupi_server::ws::voice_metrics::VoiceMetrics::bump(
+                    &state.voice_metrics.provisional_expired,
+                );
+                tracing::warn!(
+                    event = "voice.registry.participant_expired",
+                    channel_id = %change.channel_id,
+                    source = "expiry"
+                );
+                tupi_server::ws::handler::publish_room_change(&state, change).await;
             }
         }
     });

@@ -1279,9 +1279,11 @@ pub(crate) async fn broadcast_voice_roster(state: &AppState, channel_id: Uuid) {
             return;
         }
     };
+    // Read from the v2 registry (SPEC-004) and project to the v1 shape. The
+    // legacy `CallRegistry` is no longer the source of the community roster.
     let (participants, streams) = {
-        let calls = state.hub.calls.read().await;
-        (calls.roster(channel_id), calls.roster_streams(channel_id))
+        let voice = state.hub.voice.read().await;
+        crate::ws::projection::v1_roster(&voice, channel_id)
     };
     broadcast_to_community(
         state,
@@ -1292,6 +1294,78 @@ pub(crate) async fn broadcast_voice_roster(state: &AppState, channel_id: Uuid) {
         ),
     )
     .await;
+}
+
+/// Provisional emitter for this spec: SPEC-005 replaces it with the full
+/// v1+v2 dispatcher. Here it just re-broadcasts the affected channel's v1
+/// roster (the pre-v2 behaviour) so SPEC-004 is mergeable on its own.
+pub async fn publish_room_change(
+    state: &AppState,
+    change: crate::ws::voice_registry::RoomChange,
+) {
+    if change.is_empty() {
+        return;
+    }
+    broadcast_voice_roster(state, change.channel_id).await;
+}
+
+/// Maps LiveKit's `RoomParticipant` list into the registry's reconcile input.
+/// Non-UUID identities and unprojectable track sources are dropped.
+fn map_to_reconciled(
+    participants: Vec<crate::livekit::RoomParticipant>,
+) -> Vec<crate::ws::voice_registry::ReconciledParticipant> {
+    participants
+        .into_iter()
+        .filter_map(|p| {
+            Some(crate::ws::voice_registry::ReconciledParticipant {
+                user_id: Uuid::parse_str(&p.identity).ok()?,
+                sid: p.sid,
+                tracks: p
+                    .tracks
+                    .into_iter()
+                    .filter_map(|(track_sid, source, muted)| {
+                        Some((
+                            track_sid,
+                            crate::ws::voice_registry::TrackSource::parse(&source)?,
+                            muted,
+                        ))
+                    })
+                    .collect(),
+            })
+        })
+        .collect()
+}
+
+/// Confirms ONE channel against LiveKit — used when there is a specific reason
+/// to distrust that channel (leave, kick, move, `room_finished`) instead of
+/// sweeping every room.
+pub async fn reconcile_one_room(state: &AppState, channel_id: Uuid) {
+    if state.config.livekit_url.is_none() {
+        return;
+    }
+    VoiceMetrics::bump(&state.voice_metrics.reconciles_run);
+    let participants =
+        match crate::livekit::room_participants(&state.config, &channel_id.to_string()).await {
+            Ok(list) => list,
+            Err(error) => {
+                VoiceMetrics::bump(&state.voice_metrics.reconciles_failed);
+                tracing::warn!(event = "voice.reconcile.failed", %channel_id, %error);
+                return;
+            }
+        };
+    let mapped = map_to_reconciled(participants);
+    let change = state.hub.voice.write().await.reconcile_room(channel_id, mapped);
+    if !change.is_empty() {
+        VoiceMetrics::bump(&state.voice_metrics.reconciles_with_drift);
+        tracing::warn!(
+            event = "voice.reconcile.drift_detected",
+            %channel_id,
+            scope = "single_room",
+            added = change.participants_added.len(),
+            removed = change.participants_removed.len(),
+        );
+    }
+    publish_room_change(state, change).await;
 }
 
 /// Removes `user_id` from a voice channel's roster and re-broadcasts it. The
@@ -1382,32 +1456,37 @@ pub async fn reconcile_voice_rooms(state: &AppState) {
         }
     };
     let rooms_queried = snapshot.len();
-    let mapped: Vec<(Uuid, Vec<crate::ws::call_registry::ReconcileParticipant>)> = snapshot
+    let mapped: Vec<(Uuid, Vec<crate::livekit::RoomParticipant>)> = snapshot
         .into_iter()
         .filter_map(|(room, participants)| {
             let channel_id = Uuid::parse_str(&room).ok()?;
-            let participants = participants
-                .into_iter()
-                .filter_map(|participant| {
-                    Some(crate::ws::call_registry::ReconcileParticipant {
-                        user_id: Uuid::parse_str(&participant.identity).ok()?,
-                        camera_sid: participant.camera_sid,
-                        screen_sid: participant.screen_sid,
-                        has_screen_audio: participant.has_screen_audio,
-                    })
-                })
-                .collect();
             Some((channel_id, participants))
         })
         .collect();
-    let changed = state.hub.calls.write().await.reconcile(mapped);
+
+    let live_channels: std::collections::HashSet<Uuid> =
+        mapped.iter().map(|(channel_id, _)| *channel_id).collect();
+
+    let mut changes: Vec<crate::ws::voice_registry::RoomChange> = Vec::new();
+    {
+        let mut voice = state.hub.voice.write().await;
+        for (channel_id, participants) in mapped {
+            let change = voice.reconcile_room(channel_id, map_to_reconciled(participants));
+            if !change.is_empty() {
+                changes.push(change);
+            }
+        }
+        // Channels LiveKit no longer reports at all.
+        changes.extend(voice.reconcile_prune(&live_channels).into_iter().filter(|c| !c.is_empty()));
+    }
+
     let duration_ms = started.elapsed().as_millis() as u64;
     VoiceMetrics::set(&state.voice_metrics.last_reconcile_duration_ms, duration_ms);
     VoiceMetrics::set(
         &state.voice_metrics.last_reconcile_at_unix,
         chrono::Utc::now().timestamp().max(0) as u64,
     );
-    if changed.is_empty() {
+    if changes.is_empty() {
         tracing::debug!(
             event = "voice.reconcile.completed",
             rooms_queried,
@@ -1416,17 +1495,18 @@ pub async fn reconcile_voice_rooms(state: &AppState) {
         );
     } else {
         VoiceMetrics::bump(&state.voice_metrics.reconciles_with_drift);
+        let channels: Vec<Uuid> = changes.iter().map(|c| c.channel_id).collect();
         tracing::warn!(
             event = "voice.reconcile.drift_detected",
             rooms_queried,
-            rooms_changed = changed.len(),
-            channels = ?changed,
+            rooms_changed = changes.len(),
+            channels = ?channels,
             duration_ms,
             "reconcile found divergence; a webhook was lost or there was a race"
         );
     }
-    for channel_id in changed {
-        broadcast_voice_roster(state, channel_id).await;
+    for change in changes {
+        publish_room_change(state, change).await;
     }
 }
 
@@ -1439,19 +1519,19 @@ async fn send_voice_rooms_snapshot(state: &AppState, user_id: Uuid, connection_i
     if state.should_reconcile_voice(std::time::Duration::from_secs(5)).await {
         reconcile_voice_rooms(state).await;
     }
-    let active = state.hub.calls.read().await.active_channel_ids();
+    let active = state.hub.voice.read().await.active_channel_ids();
     let rooms = if active.is_empty() {
         vec![]
     } else {
         match db::visible_channel_ids(&state.pool, user_id, &active).await {
             Ok(visible) => {
-                let calls = state.hub.calls.read().await;
+                let voice = state.hub.voice.read().await;
                 visible
                     .into_iter()
-                    .map(|channel_id| VoiceRoster {
-                        channel_id,
-                        participants: calls.roster(channel_id),
-                        streams: calls.roster_streams(channel_id),
+                    .map(|channel_id| {
+                        let (participants, streams) =
+                            crate::ws::projection::v1_roster(&voice, channel_id);
+                        VoiceRoster { channel_id, participants, streams }
                     })
                     .filter(|roster| !roster.participants.is_empty())
                     .collect()

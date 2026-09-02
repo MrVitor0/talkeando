@@ -33,6 +33,9 @@ pub struct AppState {
     /// can be throttled to one sweep per 10 s (same pattern as
     /// `should_reconcile_voice`).
     pub last_debug_live: Arc<Mutex<Option<Instant>>>,
+    /// Channels that need confirming against LiveKit, with the instant they
+    /// become due. Drained by the 1 s tick in `main.rs` (SPEC-004).
+    pub pending_reconcile: Arc<Mutex<HashMap<Uuid, Instant>>>,
 }
 
 impl AppState {
@@ -48,7 +51,38 @@ impl AppState {
             voice_metrics: Arc::new(crate::ws::voice_metrics::VoiceMetrics::default()),
             started_at: Instant::now(),
             last_debug_live: Arc::new(Mutex::new(None)),
+            pending_reconcile: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Schedules confirmation of ONE channel against LiveKit. If a sooner run
+    /// is already queued for it, the sooner one wins.
+    pub async fn schedule_reconcile(&self, channel_id: Uuid, delay: Duration) {
+        let due = Instant::now() + delay;
+        let mut pending = self.pending_reconcile.lock().await;
+        pending
+            .entry(channel_id)
+            .and_modify(|existing| {
+                if due < *existing {
+                    *existing = due;
+                }
+            })
+            .or_insert(due);
+    }
+
+    /// Channels whose scheduled time has passed, removing them from the queue.
+    pub async fn take_due_reconciles(&self) -> Vec<Uuid> {
+        let now = Instant::now();
+        let mut pending = self.pending_reconcile.lock().await;
+        let due: Vec<Uuid> = pending
+            .iter()
+            .filter(|(_, at)| **at <= now)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in &due {
+            pending.remove(id);
+        }
+        due
     }
 
     /// Returns true (and stamps "now") when `GET /api/debug/voice?live=1` has

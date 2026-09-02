@@ -27,6 +27,18 @@ pub struct TestApp {
 
 impl TestApp {
     pub async fn spawn() -> Self {
+        Self::spawn_inner(None).await
+    }
+
+    /// Spawns the app with `config.livekit_url` pointed at a local fake that
+    /// answers `ListRooms` / `ListParticipants` from state the test controls.
+    pub async fn spawn_with_fake_livekit() -> (Self, FakeLiveKit) {
+        let fake = FakeLiveKit::start().await;
+        let app = Self::spawn_inner(Some(fake.base_url())).await;
+        (app, fake)
+    }
+
+    async fn spawn_inner(livekit_url_override: Option<String>) -> Self {
         let admin_url = std::env::var("TEST_DATABASE_ADMIN_URL")
             .unwrap_or_else(|_| "postgres://talkeando:talkeando@localhost:5434/postgres".to_string());
         let admin_pool = PgPoolOptions::new()
@@ -68,7 +80,9 @@ impl TestApp {
             allowed_origins: vec!["http://localhost:5173".to_string()],
             unattached_attachment_ttl_hours: 24,
             music_bot_token: "test-music-bot-token".to_string(),
-            livekit_url: Some("ws://localhost:7880".to_string()),
+            livekit_url: Some(
+                livekit_url_override.unwrap_or_else(|| "ws://localhost:7880".to_string()),
+            ),
             livekit_api_key: Some("APItestkey".to_string()),
             livekit_api_secret: Some("test-livekit-secret".to_string()),
             livekit_token_ttl_seconds: 21_600,
@@ -99,6 +113,28 @@ impl TestApp {
             db_name,
             attachment_dir,
         }
+    }
+
+    /// Builds and signs a LiveKit webhook exactly as LiveKit does (a JWT whose
+    /// `sha256` claim is the base64 of the body's SHA-256, see
+    /// `server/src/livekit.rs::verify_webhook`) and POSTs it. Returns the HTTP
+    /// status. `event` is the raw webhook JSON object.
+    pub async fn send_webhook(&self, event: serde_json::Value) -> reqwest::StatusCode {
+        use base64::Engine;
+        use sha2::Digest;
+        let body = serde_json::to_string(&event).unwrap();
+        let hash = base64::engine::general_purpose::STANDARD.encode(sha2::Sha256::digest(body.as_bytes()));
+        let claims = serde_json::json!({ "iss": "APItestkey", "sha256": hash });
+        let token = sign_hs256(&claims, "test-livekit-secret");
+        reqwest::Client::new()
+            .post(format!("{}/livekit/webhook", self.http_url))
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(body)
+            .send()
+            .await
+            .unwrap()
+            .status()
     }
 
     /// Best-effort cleanup. Call at the end of a test; a panic before this
@@ -316,6 +352,16 @@ impl WsClient {
         .map(|envelope| envelope["data"].clone())
     }
 
+    /// Public escape hatch: read envelopes until `predicate` matches the whole
+    /// envelope, or `timeout` elapses.
+    pub async fn recv_matching_pub(
+        &mut self,
+        timeout: std::time::Duration,
+        predicate: impl Fn(&serde_json::Value) -> bool,
+    ) -> Option<serde_json::Value> {
+        self.recv_matching(timeout, predicate).await
+    }
+
     /// Reads envelopes (discarding non-matching ones, e.g. an unrelated
     /// presence.snapshot) until `predicate` matches the full envelope, or
     /// `timeout` elapses. Returns the whole envelope (not just `data`) so
@@ -349,5 +395,123 @@ impl WsClient {
     /// also what a `presence.md` "8 second grace period" test needs.
     pub async fn close(mut self) {
         let _ = self.socket.close(None).await;
+    }
+}
+
+/// Signs a compact HS256 JWT the same way `server/src/livekit.rs` does
+/// (URL-safe base64, no padding). Used to forge LiveKit webhook auth.
+fn sign_hs256(claims: &serde_json::Value, secret: &str) -> String {
+    use base64::Engine;
+    use hmac::Mac;
+    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let header = b64.encode(r#"{"alg":"HS256","typ":"JWT"}"#);
+    let payload = b64.encode(serde_json::to_vec(claims).unwrap());
+    let signing_input = format!("{header}.{payload}");
+    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes()).unwrap();
+    mac.update(signing_input.as_bytes());
+    let signature = b64.encode(mac.finalize().into_bytes());
+    format!("{signing_input}.{signature}")
+}
+
+/// One participant as the fake LiveKit should report them.
+#[derive(Clone)]
+pub struct FakeParticipant {
+    pub identity: String,
+    pub sid: String,
+    pub hidden: bool,
+    /// `(track_sid, LiveKit source, muted)` — source e.g. `"SCREEN_SHARE"`.
+    pub tracks: Vec<(String, String, bool)>,
+}
+
+impl FakeParticipant {
+    pub fn new(identity: uuid::Uuid, sid: &str) -> Self {
+        Self { identity: identity.to_string(), sid: sid.to_string(), hidden: false, tracks: Vec::new() }
+    }
+    pub fn hidden(mut self) -> Self {
+        self.hidden = true;
+        self
+    }
+    pub fn with_track(mut self, track_sid: &str, source: &str) -> Self {
+        self.tracks.push((track_sid.to_string(), source.to_string(), false));
+        self
+    }
+}
+
+type FakeRooms = std::collections::HashMap<String, Vec<FakeParticipant>>;
+
+/// A local HTTP server that answers the two LiveKit RoomService endpoints the
+/// reconcile path calls, from state the test mutates via `set_room`.
+pub struct FakeLiveKit {
+    base_url: String,
+    rooms: std::sync::Arc<tokio::sync::Mutex<FakeRooms>>,
+}
+
+impl FakeLiveKit {
+    async fn start() -> Self {
+        use axum::{routing::post, Json, Router};
+        let rooms: std::sync::Arc<tokio::sync::Mutex<FakeRooms>> = Default::default();
+
+        let list_rooms_rooms = rooms.clone();
+        let list_participants_rooms = rooms.clone();
+        let router = Router::new()
+            .route(
+                "/twirp/livekit.RoomService/ListRooms",
+                post(move || {
+                    let rooms = list_rooms_rooms.clone();
+                    async move {
+                        let guard = rooms.lock().await;
+                        let names: Vec<_> = guard
+                            .iter()
+                            .filter(|(_, p)| !p.is_empty())
+                            .map(|(name, _)| serde_json::json!({ "name": name }))
+                            .collect();
+                        Json(serde_json::json!({ "rooms": names }))
+                    }
+                }),
+            )
+            .route(
+                "/twirp/livekit.RoomService/ListParticipants",
+                post(move |Json(body): Json<serde_json::Value>| {
+                    let rooms = list_participants_rooms.clone();
+                    async move {
+                        let room = body["room"].as_str().unwrap_or_default().to_string();
+                        let guard = rooms.lock().await;
+                        let participants: Vec<_> = guard
+                            .get(&room)
+                            .into_iter()
+                            .flatten()
+                            .map(|p| {
+                                serde_json::json!({
+                                    "identity": p.identity,
+                                    "sid": p.sid,
+                                    "state": "ACTIVE",
+                                    "permission": { "hidden": p.hidden, "canPublish": true },
+                                    "tracks": p.tracks.iter().map(|(sid, source, muted)| serde_json::json!({
+                                        "sid": sid, "source": source, "muted": muted,
+                                    })).collect::<Vec<_>>(),
+                                })
+                            })
+                            .collect();
+                        Json(serde_json::json!({ "participants": participants }))
+                    }
+                }),
+            );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        Self { base_url: format!("http://{addr}"), rooms }
+    }
+
+    fn base_url(&self) -> String {
+        self.base_url.clone()
+    }
+
+    /// Sets the exact participant list the fake reports for `room` (a channel
+    /// UUID string). An empty list makes the room disappear from `ListRooms`.
+    pub async fn set_room(&self, room: impl Into<String>, participants: Vec<FakeParticipant>) {
+        self.rooms.lock().await.insert(room.into(), participants);
     }
 }

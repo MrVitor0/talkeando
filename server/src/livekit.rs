@@ -37,13 +37,47 @@ pub fn access_token(cfg: &Config, identity: &str, name: &str, room: &str, mode: 
 }
 
 #[derive(Debug, Deserialize)]
-pub struct WebhookEvent { pub event: String, pub room: Option<Room>, pub participant: Option<Participant>, pub track: Option<Track> }
+pub struct WebhookEvent {
+    pub event: String,
+    #[serde(default)]
+    pub id: Option<String>,
+    #[serde(default, rename = "createdAt")]
+    pub created_at: Option<i64>,
+    pub room: Option<Room>,
+    pub participant: Option<Participant>,
+    pub track: Option<Track>,
+}
 #[derive(Debug, Deserialize)]
-pub struct Room { pub name: String }
+pub struct Room {
+    pub name: String,
+    #[serde(default)]
+    pub sid: Option<String>,
+}
 #[derive(Debug, Deserialize)]
-pub struct Participant { pub identity: String }
+pub struct Participant {
+    pub identity: String,
+    #[serde(default)]
+    pub sid: Option<String>,
+    #[serde(default)]
+    pub state: Option<String>,
+    #[serde(default)]
+    pub permission: Option<ParticipantPermission>,
+}
+#[derive(Debug, Deserialize, Clone, Copy, Default)]
+pub struct ParticipantPermission {
+    #[serde(default)]
+    pub hidden: bool,
+    #[serde(default, rename = "canPublish")]
+    pub can_publish: bool,
+}
 #[derive(Debug, Deserialize)]
-pub struct Track { pub source: String, #[serde(default)] pub sid: Option<String> }
+pub struct Track {
+    pub source: String,
+    #[serde(default)]
+    pub sid: Option<String>,
+    #[serde(default)]
+    pub muted: bool,
+}
 
 #[derive(Deserialize)]
 struct WebhookClaims { iss: String, sha256: String }
@@ -106,15 +140,15 @@ pub async fn remove_participant(cfg: &Config, room: &str, identity: &str) -> Res
     Ok(())
 }
 
-/// One participant as LiveKit currently sees them, reduced to the fields the
-/// call registry mirrors: identity plus the publication sids for their camera
-/// and screen tracks (screen audio is a boolean that rides on the screen row).
+/// One participant as LiveKit currently sees them, carrying their tracks as-is
+/// (track_sid + source + muted) rather than flattening into camera/screen sids
+/// — the v2 `VoiceRegistry` keys tracks by their real SID.
 #[derive(Debug, Clone)]
 pub struct RoomParticipant {
     pub identity: String,
-    pub camera_sid: Option<String>,
-    pub screen_sid: Option<String>,
-    pub has_screen_audio: bool,
+    pub sid: String,
+    /// `(track_sid, lowercase LiveKit source, muted)`
+    pub tracks: Vec<(String, String, bool)>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -135,7 +169,11 @@ struct ListParticipantsResponse {
 struct ParticipantInfo {
     identity: String,
     #[serde(default)]
+    sid: Option<String>,
+    #[serde(default)]
     state: Option<String>,
+    #[serde(default)]
+    permission: Option<ParticipantPermission>,
     #[serde(default)]
     tracks: Vec<TrackInfo>,
 }
@@ -144,6 +182,50 @@ struct TrackInfo {
     sid: String,
     #[serde(default)]
     source: Option<String>,
+    #[serde(default)]
+    muted: bool,
+}
+
+/// Shared filter+shape rule for `room_snapshot` and `room_participants`.
+/// Drops disconnected and hidden (spectator, INV-B3) participants, and any
+/// without a sid (cannot be addressed).
+fn map_participants(participants: Vec<ParticipantInfo>) -> Vec<RoomParticipant> {
+    participants
+        .into_iter()
+        .filter(|p| p.state.as_deref() != Some("DISCONNECTED"))
+        .filter(|p| !p.permission.map(|perm| perm.hidden).unwrap_or(false))
+        .filter_map(|p| {
+            let sid = p.sid?;
+            Some(RoomParticipant {
+                identity: p.identity,
+                sid,
+                tracks: p
+                    .tracks
+                    .into_iter()
+                    .map(|t| (t.sid, t.source.unwrap_or_default().to_ascii_lowercase(), t.muted))
+                    .collect(),
+            })
+        })
+        .collect()
+}
+
+/// Participants of ONE room. Used by the directed reconcile (leave, kick,
+/// move, room_finished), which does not need to sweep the whole server. A room
+/// that does not exist is treated as empty, never as an error (§4.1).
+pub async fn room_participants(cfg: &Config, room: &str) -> Result<Vec<RoomParticipant>> {
+    let base = http_base(cfg)?;
+    let token = admin_token(cfg, serde_json::json!({ "roomAdmin": true, "room": room }))?;
+    let response = reqwest::Client::new()
+        .post(format!("{base}/twirp/livekit.RoomService/ListParticipants"))
+        .bearer_auth(token)
+        .json(&serde_json::json!({ "room": room }))
+        .send()
+        .await?;
+    if !response.status().is_success() {
+        return Ok(vec![]);
+    }
+    let parsed: ListParticipantsResponse = response.json().await?;
+    Ok(map_participants(parsed.participants))
 }
 
 /// Authoritative snapshot of every live room and its non-disconnected
@@ -178,29 +260,7 @@ pub async fn room_snapshot(cfg: &Config) -> Result<Vec<(String, Vec<RoomParticip
             .error_for_status()?
             .json()
             .await?;
-        let participants = response
-            .participants
-            .into_iter()
-            .filter(|p| p.state.as_deref() != Some("DISCONNECTED"))
-            .map(|p| {
-                let mut mapped = RoomParticipant {
-                    identity: p.identity,
-                    camera_sid: None,
-                    screen_sid: None,
-                    has_screen_audio: false,
-                };
-                for track in p.tracks {
-                    match track.source.as_deref().map(str::to_ascii_uppercase).as_deref() {
-                        Some("CAMERA") => mapped.camera_sid = Some(track.sid),
-                        Some("SCREEN_SHARE") => mapped.screen_sid = Some(track.sid),
-                        Some("SCREEN_SHARE_AUDIO") => mapped.has_screen_audio = true,
-                        _ => {}
-                    }
-                }
-                mapped
-            })
-            .collect();
-        out.push((room.name, participants));
+        out.push((room.name, map_participants(response.participants)));
     }
     Ok(out)
 }

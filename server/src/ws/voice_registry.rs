@@ -281,6 +281,13 @@ impl VoiceRegistry {
             .collect()
     }
 
+    /// Every channel that has a room, including ones down to just a music row.
+    /// For the debug endpoint — a room with no participants is itself a bug
+    /// worth surfacing.
+    pub fn all_channel_ids(&self) -> Vec<ChannelId> {
+        self.rooms.keys().copied().collect()
+    }
+
     pub fn version(&self, channel_id: ChannelId) -> u64 {
         self.rooms.get(&channel_id).map_or(0, |room| room.version)
     }

@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use axum::{extract::{State, Json}, http::{header, HeaderMap}, Json as AxumJson};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -8,7 +10,7 @@ use crate::{
     error::{AppError, AppResult},
     livekit::{self, Mode},
     state::AppState,
-    ws::{handler::broadcast_voice_roster, voice_metrics::VoiceMetrics},
+    ws::{handler::publish_room_change, voice_metrics::VoiceMetrics, voice_registry::TrackSource},
 };
 
 const MUSIC_BOT_ID: Uuid = Uuid::from_u128(1);
@@ -41,6 +43,23 @@ pub async fn token(State(state): State<AppState>, headers: HeaderMap, Json(reque
     }
     if !is_bot && db::channel_if_member(&state.pool, request.channel_id, identity).await?.is_none() {
         return Err(refuse_token(&state, request.channel_id, identity, "not_member", AppError::Forbidden));
+    }
+    // INV-F2: refuse a `participant` token for a channel already at its human
+    // cap. Spectators are `hidden` and never counted, so they are never barred.
+    if !is_bot && request.mode == Mode::Participant {
+        let voice = state.hub.voice.read().await;
+        let already_in = voice.is_participant(request.channel_id, identity);
+        let full = voice.is_full(request.channel_id);
+        drop(voice);
+        if !already_in && full {
+            return Err(refuse_token(
+                &state,
+                request.channel_id,
+                identity,
+                "channel_full",
+                AppError::Conflict("este canal de voz já está cheio".into()),
+            ));
+        }
     }
     let url = state
         .config
@@ -95,52 +114,144 @@ pub async fn webhook(State(state): State<AppState>, headers: HeaderMap, body: St
         track_source = event.track.as_ref().map(|t| t.source.as_str()).unwrap_or("-"),
     );
 
-    let Some(room) = event.room.and_then(|room| Uuid::parse_str(&room.name).ok()) else {
-        tracing::info!(
-            event = "voice.webhook.ignored",
-            outcome = "unparsable_room",
-            livekit_event = %event.event,
-            room = room_name.as_deref().unwrap_or("-"),
-        );
+    // Dedupe: a LiveKit redelivery must not reapply anything (A10).
+    let dedupe_key = match &event.id {
+        Some(id) => format!("{}:{}", event.event, id),
+        None => format!(
+            "{}:{}:{}:{}:{}",
+            event.event,
+            room_name.as_deref().unwrap_or("-"),
+            event.participant.as_ref().and_then(|p| p.sid.as_deref()).unwrap_or("-"),
+            event.track.as_ref().and_then(|t| t.sid.as_deref()).unwrap_or("-"),
+            event.created_at.unwrap_or(0),
+        ),
+    };
+    if state.hub.voice.write().await.is_duplicate_event(&dedupe_key) {
+        VoiceMetrics::bump(&state.voice_metrics.webhooks_ignored_duplicate);
+        tracing::info!(event = "voice.webhook.ignored", outcome = "ignored_duplicate", key = %dedupe_key);
+        return Ok(());
+    }
+
+    // A very old event means the webhook stream is lagging: process it, but
+    // also force a reconcile of that channel rather than trusting it alone.
+    let is_late = event
+        .created_at
+        .map(|at| (chrono::Utc::now().timestamp() - at) > 60)
+        .unwrap_or(false);
+
+    let Some(channel_id) = event.room.as_ref().and_then(|r| Uuid::parse_str(&r.name).ok()) else {
+        tracing::info!(event = "voice.webhook.ignored", outcome = "unparsable_room", livekit_event = %event.event);
         return Ok(());
     };
-    let participant = event.participant.and_then(|p| Uuid::parse_str(&p.identity).ok());
 
-    match event.event.as_str() {
-        "participant_joined" => if let Some(user) = participant {
-            state.hub.calls.write().await.apply_participant(room, user, true);
-            VoiceMetrics::bump(&state.voice_metrics.participants_added_by_webhook);
-            tracing::info!(event = "voice.registry.participant_added", channel_id = %room, user_id = %user, source = "webhook", outcome = "applied");
-            broadcast_voice_roster(&state, room).await;
+    // Spectators never enter a roster (INV-B3).
+    if event
+        .participant
+        .as_ref()
+        .and_then(|p| p.permission)
+        .map(|perm| perm.hidden)
+        .unwrap_or(false)
+    {
+        VoiceMetrics::bump(&state.voice_metrics.webhooks_ignored_hidden);
+        tracing::debug!(event = "voice.webhook.ignored", outcome = "hidden_participant", %channel_id);
+        return Ok(());
+    }
+
+    let user_id = event.participant.as_ref().and_then(|p| Uuid::parse_str(&p.identity).ok());
+    let participant_sid = event.participant.as_ref().and_then(|p| p.sid.clone());
+
+    let change = match event.event.as_str() {
+        "participant_joined" => match (user_id, participant_sid.clone()) {
+            (Some(user), Some(sid)) => {
+                let c = state.hub.voice.write().await.webhook_participant_joined(channel_id, user, sid);
+                if !c.is_empty() {
+                    VoiceMetrics::bump(&state.voice_metrics.participants_added_by_webhook);
+                    tracing::info!(event = "voice.registry.participant_added", %channel_id, user_id = %user, source = "webhook", outcome = "applied");
+                }
+                Some(c)
+            }
+            _ => {
+                tracing::info!(event = "voice.webhook.ignored", outcome = "missing_sid", livekit_event = "participant_joined", %channel_id);
+                None
+            }
         },
-        "participant_left" => if let Some(user) = participant {
-            state.hub.calls.write().await.apply_participant(room, user, false);
-            VoiceMetrics::bump(&state.voice_metrics.participants_removed_by_webhook);
-            tracing::info!(event = "voice.registry.participant_removed", channel_id = %room, user_id = %user, source = "webhook", outcome = "applied");
-            broadcast_voice_roster(&state, room).await;
+        "participant_left" => match (user_id, participant_sid.clone()) {
+            (Some(user), Some(sid)) => {
+                let c = state.hub.voice.write().await.webhook_participant_left(channel_id, user, sid);
+                if c.is_empty() {
+                    VoiceMetrics::bump(&state.voice_metrics.webhooks_ignored_stale);
+                    tracing::info!(
+                        event = "voice.webhook.ignored",
+                        outcome = "ignored_stale",
+                        %channel_id,
+                        user_id = %user,
+                        sid = %participant_sid.as_deref().unwrap_or("-"),
+                    );
+                } else {
+                    VoiceMetrics::bump(&state.voice_metrics.participants_removed_by_webhook);
+                    tracing::info!(event = "voice.registry.participant_removed", %channel_id, user_id = %user, source = "webhook", outcome = "applied");
+                }
+                Some(c)
+            }
+            _ => {
+                tracing::info!(event = "voice.webhook.ignored", outcome = "missing_sid", livekit_event = "participant_left", %channel_id);
+                None
+            }
         },
-        "track_published" => if let (Some(user), Some(track)) = (participant, event.track) {
-            state.hub.calls.write().await.apply_track(room, user, &track.source, true, track.sid.clone());
-            tracing::info!(event = "voice.registry.track_added", channel_id = %room, user_id = %user, track_sid = track.sid.as_deref().unwrap_or("-"), track_source = %track.source, source = "webhook", outcome = "applied");
-            broadcast_voice_roster(&state, room).await;
+        "track_published" => match (user_id, event.track.as_ref()) {
+            (Some(user), Some(track)) => match (track.sid.clone(), TrackSource::parse(&track.source)) {
+                (Some(track_sid), Some(source)) => Some(
+                    state.hub.voice.write().await.webhook_track_published(
+                        channel_id,
+                        user,
+                        participant_sid.clone(),
+                        track_sid,
+                        source,
+                    ),
+                ),
+                _ => {
+                    tracing::debug!(event = "voice.webhook.ignored", outcome = "untrackable_publish", %channel_id, track_source = %track.source);
+                    None
+                }
+            },
+            _ => None,
         },
-        "track_unpublished" => if let (Some(user), Some(track)) = (participant, event.track) {
-            state.hub.calls.write().await.apply_track(room, user, &track.source, false, track.sid.clone());
-            tracing::info!(event = "voice.registry.track_removed", channel_id = %room, user_id = %user, track_sid = track.sid.as_deref().unwrap_or("-"), track_source = %track.source, source = "webhook", outcome = "applied");
-            broadcast_voice_roster(&state, room).await;
+        "track_unpublished" => match event.track.as_ref().and_then(|t| t.sid.clone()) {
+            Some(track_sid) => Some(state.hub.voice.write().await.webhook_track_unpublished(channel_id, &track_sid)),
+            None => None,
         },
-        // A media room can finish after a transient participant disconnects or
-        // after a user changes channels. Music playback is controlled only by
-        // an explicit /stop (or the bot's idle timeout), never by the
-        // lifecycle of an unrelated LiveKit room.
+        "track_muted" | "track_unmuted" => match event.track.as_ref().and_then(|t| t.sid.clone()) {
+            Some(track_sid) => Some(
+                state
+                    .hub
+                    .voice
+                    .write()
+                    .await
+                    .webhook_track_muted(channel_id, &track_sid, event.event == "track_muted"),
+            ),
+            None => None,
+        },
+        // NEVER clear the room here (RC-04). LiveKit can emit this after
+        // someone has already rejoined. Confirm against the truth instead.
         "room_finished" => {
-            state.hub.calls.write().await.clear_channel(room);
-            tracing::info!(event = "voice.webhook.applied", livekit_event = "room_finished", channel_id = %room, source = "webhook", outcome = "applied");
-            broadcast_voice_roster(&state, room).await;
-        },
-        other => {
-            tracing::info!(event = "voice.webhook.ignored", outcome = "unhandled_event", livekit_event = other, channel_id = %room);
+            tracing::info!(event = "voice.webhook.ignored", outcome = "room_finished_defers_to_reconcile", %channel_id);
+            state.schedule_reconcile(channel_id, Duration::from_millis(500)).await;
+            None
         }
+        "room_started" => None,
+        other => {
+            tracing::debug!(event = "voice.webhook.ignored", outcome = "unhandled_event", livekit_event = %other, %channel_id);
+            None
+        }
+    };
+
+    if is_late {
+        tracing::warn!(event = "voice.webhook.late", %channel_id, livekit_event = %event.event);
+        state.schedule_reconcile(channel_id, Duration::from_secs(1)).await;
+    }
+
+    if let Some(change) = change {
+        publish_room_change(&state, change).await;
     }
     Ok(())
 }
