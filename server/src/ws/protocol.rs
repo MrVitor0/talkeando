@@ -450,6 +450,82 @@ pub struct VoiceRoomsSnapshot {
     pub rooms: Vec<VoiceRoster>,
 }
 
+// ---- voice.room.* ---- (protocol v2; see tupi-v2-refactor/05-protocol-spec.md §2)
+// SPEC-003 only defines these DTOs. Nothing emits them yet — SPEC-005 does.
+
+#[derive(Debug, Serialize, Clone)]
+pub struct VoiceParticipantDto {
+    pub user_id: Uuid,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub participant_sid: Option<String>,
+    pub muted: bool,
+    pub deafened: bool,
+    pub is_bot: bool,
+    pub provisional: bool,
+    pub joined_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct VoiceTrackDto {
+    pub track_sid: String,
+    pub owner: Uuid,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_sid: Option<String>,
+    pub source: String,
+    pub muted: bool,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct VoiceRoomDto {
+    pub channel_id: Uuid,
+    pub version: u64,
+    pub participants: Vec<VoiceParticipantDto>,
+    pub tracks: Vec<VoiceTrackDto>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct VoiceRoomState {
+    pub full: bool,
+    pub rooms: Vec<VoiceRoomDto>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct VoiceRoomDelta {
+    pub channel_id: Uuid,
+    pub version: u64,
+    pub previous_version: u64,
+    pub participants_added: Vec<VoiceParticipantDto>,
+    pub participants_updated: Vec<VoiceParticipantDto>,
+    pub participants_removed: Vec<Uuid>,
+    pub tracks_added: Vec<VoiceTrackDto>,
+    pub tracks_removed: Vec<String>,
+    pub reason: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct VoiceRoomRequest {
+    #[serde(default)]
+    pub channel_ids: Vec<Uuid>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct VoicePresenceHint {
+    pub channel_id: Uuid,
+    /// `"joining"` | `"leaving"`
+    pub state: String,
+    #[serde(default)]
+    pub participant_sid: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct VoiceTrackHint {
+    pub channel_id: Uuid,
+    pub track_sid: String,
+    pub source: String,
+    /// `"published"` | `"unpublished"`
+    pub state: String,
+}
+
 // ---- rtc.* ---- (relayed verbatim between two participants of the same call)
 
 #[derive(Debug, Deserialize, Serialize, Clone)]

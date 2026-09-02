@@ -4,7 +4,10 @@ use axum::extract::ws::Message;
 use tokio::sync::{mpsc, RwLock};
 use uuid::Uuid;
 
-use super::{activity::ActivityRegistry, call_registry::CallRegistry, protocol::OutboundEnvelope};
+use super::{
+    activity::ActivityRegistry, call_registry::CallRegistry, protocol::OutboundEnvelope,
+    voice_registry::VoiceRegistry,
+};
 
 pub struct ConnHandle {
     pub tx: mpsc::UnboundedSender<Message>,
@@ -30,7 +33,11 @@ pub struct ConnMeta {
 /// delivery share one source of truth.
 pub struct Hub {
     conns: RwLock<HashMap<Uuid, HashMap<Uuid, ConnHandle>>>,
+    /// Legacy registry; removed in SPEC-018.
     pub calls: RwLock<CallRegistry>,
+    /// v2 registry (SPEC-003). Created here but written by nobody yet —
+    /// SPEC-004 migrates the webhook/reconcile writers onto it.
+    pub voice: RwLock<VoiceRegistry>,
     /// Ephemeral rich-presence: what each user is playing/listening to.
     /// See SDD/specs/activity.md.
     pub activities: RwLock<ActivityRegistry>,
@@ -46,6 +53,7 @@ impl Hub {
         Self {
             conns: RwLock::new(HashMap::new()),
             calls: RwLock::new(CallRegistry::default()),
+            voice: RwLock::new(VoiceRegistry::default()),
             activities: RwLock::new(ActivityRegistry::default()),
             statuses: RwLock::new(HashMap::new()),
         }

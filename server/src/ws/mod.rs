@@ -4,6 +4,7 @@ pub mod handler;
 pub mod hub;
 pub mod protocol;
 pub mod voice_metrics;
+pub mod voice_registry;
 
 pub use handler::ws_upgrade;
 
