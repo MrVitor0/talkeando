@@ -91,3 +91,128 @@ async fn client_version_is_truncated_to_64_chars() {
 
     assert_eq!(client.auth_ok["protocol_version"], 1);
 }
+
+// ---- SPEC-002: GET /api/debug/voice ----
+
+#[tokio::test]
+async fn debug_endpoint_requires_owner() {
+    let app = TestApp::spawn().await;
+    let bootstrap = app.bootstrap().await;
+    let (member_token, _member_id) = app.register_member(bootstrap.community_id, "member").await;
+
+    let http = reqwest::Client::new();
+    let owner = http
+        .get(format!("{}/debug/voice", app.http_url))
+        .bearer_auth(&bootstrap.owner_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(owner.status(), 200);
+
+    let member = http
+        .get(format!("{}/debug/voice", app.http_url))
+        .bearer_auth(&member_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(member.status(), 403);
+
+    app.teardown().await;
+}
+
+#[tokio::test]
+async fn debug_endpoint_lists_connection_versions() {
+    let app = TestApp::spawn().await;
+    let bootstrap = app.bootstrap().await;
+
+    let _v1 = WsClient::connect_and_authenticate(&app.ws_url, &bootstrap.owner_token).await;
+    let _v2 = WsClient::connect_and_authenticate_with(
+        &app.ws_url,
+        &bootstrap.owner_token,
+        serde_json::json!({ "protocol_version": 2 }),
+    )
+    .await;
+
+    let http = reqwest::Client::new();
+    let body: serde_json::Value = http
+        .get(format!("{}/debug/voice", app.http_url))
+        .bearer_auth(&bootstrap.owner_token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let versions: Vec<u64> = body["connections"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|c| c["user_id"] == serde_json::json!(bootstrap.owner_id))
+        .filter_map(|c| c["protocol_version"].as_u64())
+        .collect();
+    assert!(versions.contains(&1), "expected a v1 connection: {body:#}");
+    assert!(versions.contains(&2), "expected a v2 connection: {body:#}");
+
+    app.teardown().await;
+}
+
+#[tokio::test]
+async fn debug_endpoint_survives_livekit_being_down() {
+    // The test config points livekit_url at a port with nothing listening, so
+    // `live=1` must degrade to 200 with `livekit_diff: null` + `live_error`.
+    let app = TestApp::spawn().await;
+    let bootstrap = app.bootstrap().await;
+
+    let http = reqwest::Client::new();
+    let response = http
+        .get(format!("{}/debug/voice?live=1", app.http_url))
+        .bearer_auth(&bootstrap.owner_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+
+    let body: serde_json::Value = response.json().await.unwrap();
+    assert!(body["livekit_diff"].is_null(), "expected null diff: {body:#}");
+    assert!(body["live_error"].is_string(), "expected live_error: {body:#}");
+
+    app.teardown().await;
+}
+
+#[tokio::test]
+async fn debug_endpoint_reports_orphan_channel() {
+    let app = TestApp::spawn().await;
+    let bootstrap = app.bootstrap().await;
+
+    // A registry row for a channel with no `channels` table entry — exactly
+    // the kind of leak this endpoint exists to reveal.
+    let orphan_channel = uuid::Uuid::new_v4();
+    app.state
+        .hub
+        .calls
+        .write()
+        .await
+        .apply_participant(orphan_channel, bootstrap.owner_id, true);
+
+    let http = reqwest::Client::new();
+    let body: serde_json::Value = http
+        .get(format!("{}/debug/voice", app.http_url))
+        .bearer_auth(&bootstrap.owner_token)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+
+    let room = body["rooms"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["channel_id"] == serde_json::json!(orphan_channel))
+        .unwrap_or_else(|| panic!("orphan channel missing from rooms: {body:#}"));
+    assert!(room["channel_name"].is_null(), "orphan must have null name: {room:#}");
+
+    app.teardown().await;
+}

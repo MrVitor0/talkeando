@@ -3,6 +3,7 @@ pub mod call_registry;
 pub mod handler;
 pub mod hub;
 pub mod protocol;
+pub mod voice_metrics;
 
 pub use handler::ws_upgrade;
 

@@ -31,6 +31,7 @@ use crate::{
         call_registry::CallOpError,
         hub::ConnMeta,
         protocol::*,
+        voice_metrics::VoiceMetrics,
     },
 };
 
@@ -260,7 +261,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
         // voice roster they were still listed in. LiveKit's webhook would get
         // here too, eventually — this just makes it immediate and certain.
         for channel_id in left_calls {
-            evict_voice_participant(&delayed_state, channel_id, user_id).await;
+            evict_voice_participant(&delayed_state, channel_id, user_id, "ws_disconnect").await;
         }
         // ACT-FR-006: clear this user's activity in the same grace window,
         // and close any playtime rows left open (ACT-FR-031).
@@ -559,7 +560,7 @@ async fn dispatch(
             }
             let data: DmOpenData = parse_or_reject!(DmOpenData);
             if user_id != data.target_user_id {
-                if let Ok(Some((community_id,))) = sqlx::query_as::<_, (Uuid,)>("SELECT community_id FROM community_members WHERE user_id = $1 LIMIT 1").bind(user_id).fetch_optional(&state.pool).await {
+                if let Ok(Some(community_id)) = db::primary_community_for(&state.pool, user_id).await {
                     let topic = if user_id < data.target_user_id {
                         format!("dm:{}:{}", user_id, data.target_user_id)
                     } else {
@@ -596,6 +597,13 @@ async fn dispatch(
                 matches!(db::channel_if_member(&state.pool, data.channel_id, user_id).await, Ok(Some(channel)) if channel.kind == "voice")
             };
             if !allowed {
+                tracing::info!(
+                    event = "voice.presence.enter",
+                    channel_id = %data.channel_id,
+                    user_id = %user_id,
+                    source = "ws",
+                    outcome = "rejected"
+                );
                 state.hub.send_to(user_id, OutboundEnvelope::error("forbidden", "not allowed to join this voice channel", None)).await;
                 return;
             }
@@ -607,7 +615,7 @@ async fn dispatch(
                     continue;
                 }
                 joined_calls.remove(&previous);
-                evict_voice_participant(state, previous, user_id).await;
+                evict_voice_participant(state, previous, user_id, "ws_channel_switch").await;
             }
             if joined_calls.insert(data.channel_id) {
                 state
@@ -616,6 +624,13 @@ async fn dispatch(
                     .write()
                     .await
                     .apply_participant(data.channel_id, user_id, true);
+                tracing::info!(
+                    event = "voice.presence.enter",
+                    channel_id = %data.channel_id,
+                    user_id = %user_id,
+                    source = "ws",
+                    outcome = "applied"
+                );
                 broadcast_voice_roster(state, data.channel_id).await;
             }
         }
@@ -627,7 +642,14 @@ async fn dispatch(
             // leave is always safe to apply to the caller itself, so do not
             // make roster cleanup conditional on that per-connection cache.
             joined_calls.remove(&data.channel_id);
-            evict_voice_participant(state, data.channel_id, user_id).await;
+            tracing::info!(
+                event = "voice.presence.leave",
+                channel_id = %data.channel_id,
+                user_id = %user_id,
+                source = "ws",
+                outcome = "applied"
+            );
+            evict_voice_participant(state, data.channel_id, user_id, "ws_leave").await;
         }
         // The native host can finish the WebView bootstrap after this
         // connection's first snapshot was delivered. Let the UI explicitly
@@ -1275,7 +1297,19 @@ pub(crate) async fn broadcast_voice_roster(state: &AppState, channel_id: Uuid) {
 /// Removes `user_id` from a voice channel's roster and re-broadcasts it. The
 /// bot intentionally keeps playing when the last human leaves; it stops only
 /// through an explicit command or its own idle timeout.
-pub(crate) async fn evict_voice_participant(state: &AppState, channel_id: Uuid, user_id: Uuid) {
+pub(crate) async fn evict_voice_participant(
+    state: &AppState,
+    channel_id: Uuid,
+    user_id: Uuid,
+    source: &'static str,
+) {
+    tracing::info!(
+        event = "voice.registry.participant_removed",
+        %channel_id,
+        %user_id,
+        source,
+        outcome = "applied"
+    );
     {
         let mut calls = state.hub.calls.write().await;
         calls.apply_participant(channel_id, user_id, false);
@@ -1335,13 +1369,19 @@ pub async fn reconcile_voice_rooms(state: &AppState) {
     if state.config.livekit_url.is_none() {
         return;
     }
+    let started = Instant::now();
+    VoiceMetrics::bump(&state.voice_metrics.reconciles_run);
+    tracing::debug!(event = "voice.reconcile.started");
+
     let snapshot = match crate::livekit::room_snapshot(&state.config).await {
         Ok(rooms) => rooms,
         Err(error) => {
-            tracing::warn!(%error, "livekit voice reconcile skipped");
+            VoiceMetrics::bump(&state.voice_metrics.reconciles_failed);
+            tracing::warn!(event = "voice.reconcile.failed", %error);
             return;
         }
     };
+    let rooms_queried = snapshot.len();
     let mapped: Vec<(Uuid, Vec<crate::ws::call_registry::ReconcileParticipant>)> = snapshot
         .into_iter()
         .filter_map(|(room, participants)| {
@@ -1361,6 +1401,30 @@ pub async fn reconcile_voice_rooms(state: &AppState) {
         })
         .collect();
     let changed = state.hub.calls.write().await.reconcile(mapped);
+    let duration_ms = started.elapsed().as_millis() as u64;
+    VoiceMetrics::set(&state.voice_metrics.last_reconcile_duration_ms, duration_ms);
+    VoiceMetrics::set(
+        &state.voice_metrics.last_reconcile_at_unix,
+        chrono::Utc::now().timestamp().max(0) as u64,
+    );
+    if changed.is_empty() {
+        tracing::debug!(
+            event = "voice.reconcile.completed",
+            rooms_queried,
+            rooms_changed = 0,
+            duration_ms
+        );
+    } else {
+        VoiceMetrics::bump(&state.voice_metrics.reconciles_with_drift);
+        tracing::warn!(
+            event = "voice.reconcile.drift_detected",
+            rooms_queried,
+            rooms_changed = changed.len(),
+            channels = ?changed,
+            duration_ms,
+            "reconcile found divergence; a webhook was lost or there was a race"
+        );
+    }
     for channel_id in changed {
         broadcast_voice_roster(state, channel_id).await;
     }
@@ -1545,7 +1609,7 @@ async fn handle_voice_disconnect_member(state: &AppState, actor_id: Uuid, data: 
     }
     // Clear the roster row now — don't wait for LiveKit's webhook (or, for the
     // bot, its own disconnect) to catch up.
-    evict_voice_participant(state, data.channel_id, data.user_id).await;
+    evict_voice_participant(state, data.channel_id, data.user_id, "admin_disconnect").await;
     tracing::info!(%actor_id, target = %data.user_id, channel_id = %data.channel_id, bot = is_bot, "voice.disconnect_member");
 }
 

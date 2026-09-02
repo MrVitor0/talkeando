@@ -3,6 +3,7 @@ mod auth;
 mod attachments;
 mod channels;
 mod communities;
+mod debug;
 mod invites;
 pub mod messages;
 mod media;
@@ -59,4 +60,5 @@ pub fn router() -> Router<AppState> {
         .route("/api/invites/:id", delete(invites::revoke))
         .route("/api/livekit/token", post(livekit::token))
         .route("/api/livekit/webhook", post(livekit::webhook))
+        .route("/api/debug/voice", get(debug::voice))
 }

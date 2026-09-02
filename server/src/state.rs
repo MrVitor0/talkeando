@@ -24,6 +24,15 @@ pub struct AppState {
     /// the on-connect reconcile so a server restart (every client reconnects
     /// within a second) doesn't fan out into one LiveKit sweep per client.
     pub last_voice_reconcile: Arc<Mutex<Option<Instant>>>,
+    /// In-memory counters for the voice path (SPEC-002). Exposed by
+    /// `GET /api/debug/voice`.
+    pub voice_metrics: Arc<crate::ws::voice_metrics::VoiceMetrics>,
+    /// Boot instant, for the debug endpoint's `uptime_seconds`.
+    pub started_at: Instant,
+    /// Last time `GET /api/debug/voice?live=1` hit LiveKit, so the live diff
+    /// can be throttled to one sweep per 10 s (same pattern as
+    /// `should_reconcile_voice`).
+    pub last_debug_live: Arc<Mutex<Option<Instant>>>,
 }
 
 impl AppState {
@@ -36,6 +45,22 @@ impl AppState {
             presence_epochs: Arc::new(Mutex::new(HashMap::new())),
             pending_offline: Arc::new(Mutex::new(HashSet::new())),
             last_voice_reconcile: Arc::new(Mutex::new(None)),
+            voice_metrics: Arc::new(crate::ws::voice_metrics::VoiceMetrics::default()),
+            started_at: Instant::now(),
+            last_debug_live: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Returns true (and stamps "now") when `GET /api/debug/voice?live=1` has
+    /// not hit LiveKit within `min_gap`. Mirrors `should_reconcile_voice`.
+    pub async fn should_run_debug_live(&self, min_gap: Duration) -> bool {
+        let mut guard = self.last_debug_live.lock().await;
+        let now = Instant::now();
+        if guard.map_or(true, |last| now.duration_since(last) >= min_gap) {
+            *guard = Some(now);
+            true
+        } else {
+            false
         }
     }
 

@@ -17,6 +17,9 @@ pub struct TestApp {
     pub http_url: String,
     pub ws_url: String,
     pub pool: PgPool,
+    /// The live `AppState` the router runs on, so a test can inspect or seed
+    /// in-memory state (voice registry, metrics) that has no HTTP surface yet.
+    pub state: AppState,
     admin_pool: PgPool,
     db_name: String,
     attachment_dir: std::path::PathBuf,
@@ -72,7 +75,7 @@ impl TestApp {
         };
 
         let state = AppState::new(pool.clone(), config);
-        let app = build_app(state);
+        let app = build_app(state.clone());
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -91,6 +94,7 @@ impl TestApp {
             http_url: format!("http://{addr}/api"),
             ws_url: format!("ws://{addr}/ws"),
             pool,
+            state,
             admin_pool,
             db_name,
             attachment_dir,

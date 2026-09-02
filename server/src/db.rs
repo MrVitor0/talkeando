@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use sqlx::PgPool;
@@ -219,6 +221,58 @@ pub async fn is_community_owner(
     .fetch_optional(pool)
     .await?;
     Ok(found.is_some())
+}
+
+/// The first community a user belongs to. v1 puts every member in exactly one
+/// community, so "first" is "the" community; the debug endpoint (SPEC-002) and
+/// `dm.open` both need it. Extracted from the inline query that used to live in
+/// `ws/handler.rs`.
+pub async fn primary_community_for(
+    pool: &PgPool,
+    user_id: Uuid,
+) -> Result<Option<Uuid>, sqlx::Error> {
+    let row: Option<(Uuid,)> = sqlx::query_as(
+        "SELECT community_id FROM community_members WHERE user_id = $1 LIMIT 1",
+    )
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|(community_id,)| community_id))
+}
+
+/// `channel_id -> name` for the ids given. Missing ids are simply absent from
+/// the map — the debug endpoint (SPEC-002) treats that as `channel_name: null`
+/// so an orphaned registry row still shows up.
+pub async fn channel_names_for(
+    pool: &PgPool,
+    channel_ids: &[Uuid],
+) -> Result<HashMap<Uuid, String>, sqlx::Error> {
+    if channel_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let rows: Vec<(Uuid, String)> =
+        sqlx::query_as("SELECT id, name FROM channels WHERE id = ANY($1)")
+            .bind(channel_ids)
+            .fetch_all(pool)
+            .await?;
+    Ok(rows.into_iter().collect())
+}
+
+/// `user_id -> display_name` for the ids given. Missing ids are absent from the
+/// map. Used by the debug endpoint to label voice participants.
+pub async fn display_names_for(
+    pool: &PgPool,
+    user_ids: &[Uuid],
+) -> Result<HashMap<Uuid, String>, sqlx::Error> {
+    if user_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let rows: Vec<(Uuid, String)> =
+        sqlx::query_as("SELECT id, display_name FROM users WHERE id = ANY($1)")
+            .bind(user_ids)
+            .fetch_all(pool)
+            .await?;
+    Ok(rows.into_iter().collect())
 }
 
 // ---- game_sessions (SDD/specs/activity.md, ACT-FR-030..032) ----
