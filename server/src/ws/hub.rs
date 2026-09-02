@@ -106,6 +106,16 @@ impl Hub {
         connection_id
     }
 
+    /// Negotiated protocol version of one specific connection (SPEC-005).
+    pub async fn connection_protocol(&self, user_id: Uuid, connection_id: Uuid) -> Option<u8> {
+        self.conns
+            .read()
+            .await
+            .get(&user_id)
+            .and_then(|handles| handles.get(&connection_id))
+            .map(|handle| handle.meta.protocol_version)
+    }
+
     /// Metadata for every live connection. Used by `GET /api/debug/voice`
     /// (SPEC-002) to answer "who is on which version".
     pub async fn connection_meta(&self) -> Vec<(Uuid, ConnMeta)> {

@@ -38,7 +38,16 @@ impl TestApp {
         (app, fake)
     }
 
+    /// Spawns with the v2 voice dialect switched off (`TUPI_VOICE_PROTOCOL_V2=false`).
+    pub async fn spawn_v1_only() -> Self {
+        Self::spawn_with(None, false).await
+    }
+
     async fn spawn_inner(livekit_url_override: Option<String>) -> Self {
+        Self::spawn_with(livekit_url_override, true).await
+    }
+
+    async fn spawn_with(livekit_url_override: Option<String>, voice_protocol_v2: bool) -> Self {
         let admin_url = std::env::var("TEST_DATABASE_ADMIN_URL")
             .unwrap_or_else(|_| "postgres://talkeando:talkeando@localhost:5434/postgres".to_string());
         let admin_pool = PgPoolOptions::new()
@@ -86,6 +95,8 @@ impl TestApp {
             livekit_api_key: Some("APItestkey".to_string()),
             livekit_api_secret: Some("test-livekit-secret".to_string()),
             livekit_token_ttl_seconds: 21_600,
+            voice_protocol_v2,
+            ws_offline_grace_seconds: 1,
         };
 
         let state = AppState::new(pool.clone(), config);
@@ -395,6 +406,12 @@ impl WsClient {
     /// also what a `presence.md` "8 second grace period" test needs.
     pub async fn close(mut self) {
         let _ = self.socket.close(None).await;
+    }
+
+    /// Drops the socket with no close frame — an abrupt disconnect (killed
+    /// process, yanked cable). The server sees the TCP FIN but no WS Close.
+    pub fn terminate(self) {
+        drop(self);
     }
 }
 

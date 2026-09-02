@@ -36,7 +36,18 @@ pub struct AppState {
     /// Channels that need confirming against LiveKit, with the instant they
     /// become due. Drained by the 1 s tick in `main.rs` (SPEC-004).
     pub pending_reconcile: Arc<Mutex<HashMap<Uuid, Instant>>>,
+    /// `channel_id -> (community_id, fetched_at)`. Channels almost never move
+    /// communities; a 5 min TTL removes a Postgres query per roster event.
+    pub channel_community_cache: Arc<Mutex<HashMap<Uuid, (Uuid, Instant)>>>,
+    /// `community_id -> (member_ids, fetched_at)`. 60 s TTL plus explicit
+    /// invalidation on join.
+    pub community_members_cache: Arc<Mutex<HashMap<Uuid, (Vec<Uuid>, Instant)>>>,
+    /// Sliding-window limiter for `voice.room.request`, keyed by user.
+    pub room_request_limiter: Arc<Mutex<HashMap<Uuid, VecDeque<Instant>>>>,
 }
+
+const CHANNEL_COMMUNITY_TTL: Duration = Duration::from_secs(300);
+const COMMUNITY_MEMBERS_TTL: Duration = Duration::from_secs(60);
 
 impl AppState {
     pub fn new(pool: PgPool, config: Config) -> Self {
@@ -52,7 +63,75 @@ impl AppState {
             started_at: Instant::now(),
             last_debug_live: Arc::new(Mutex::new(None)),
             pending_reconcile: Arc::new(Mutex::new(HashMap::new())),
+            channel_community_cache: Arc::new(Mutex::new(HashMap::new())),
+            community_members_cache: Arc::new(Mutex::new(HashMap::new())),
+            room_request_limiter: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// `community_id` that owns `channel_id`, cached for `CHANNEL_COMMUNITY_TTL`
+    /// (SPEC-005 §4.6). `None` when the channel does not exist.
+    pub async fn community_of_channel(&self, channel_id: Uuid) -> Option<Uuid> {
+        {
+            let cache = self.channel_community_cache.lock().await;
+            if let Some((community_id, at)) = cache.get(&channel_id) {
+                if at.elapsed() < CHANNEL_COMMUNITY_TTL {
+                    return Some(*community_id);
+                }
+            }
+        }
+        let community_id = crate::db::channel_community(&self.pool, channel_id)
+            .await
+            .ok()
+            .flatten()?;
+        self.channel_community_cache
+            .lock()
+            .await
+            .insert(channel_id, (community_id, Instant::now()));
+        Some(community_id)
+    }
+
+    /// Member ids of `community_id`, cached for `COMMUNITY_MEMBERS_TTL`.
+    pub async fn community_members(&self, community_id: Uuid) -> Result<Vec<Uuid>, sqlx::Error> {
+        {
+            let cache = self.community_members_cache.lock().await;
+            if let Some((members, at)) = cache.get(&community_id) {
+                if at.elapsed() < COMMUNITY_MEMBERS_TTL {
+                    return Ok(members.clone());
+                }
+            }
+        }
+        let members = crate::db::community_member_ids(&self.pool, community_id).await?;
+        self.community_members_cache
+            .lock()
+            .await
+            .insert(community_id, (members.clone(), Instant::now()));
+        Ok(members)
+    }
+
+    pub async fn invalidate_channel_cache(&self, channel_id: Uuid) {
+        self.channel_community_cache.lock().await.remove(&channel_id);
+    }
+
+    pub async fn invalidate_members_cache(&self, community_id: Uuid) {
+        self.community_members_cache.lock().await.remove(&community_id);
+    }
+
+    /// `voice.room.request` limiter: at most 5 per user per rolling 10 s.
+    pub async fn allow_room_request(&self, user_id: Uuid) -> bool {
+        const WINDOW: Duration = Duration::from_secs(10);
+        const MAX: usize = 5;
+        let mut guard = self.room_request_limiter.lock().await;
+        let now = Instant::now();
+        let entry = guard.entry(user_id).or_default();
+        while entry.front().is_some_and(|front| now.duration_since(*front) > WINDOW) {
+            entry.pop_front();
+        }
+        if entry.len() >= MAX {
+            return false;
+        }
+        entry.push_back(now);
+        true
     }
 
     /// Schedules confirmation of ONE channel against LiveKit. If a sooner run

@@ -115,6 +115,9 @@ pub async fn register(
 
     tx.commit().await?;
 
+    // A new member changes who receives voice-roster broadcasts (SPEC-005 §4.6).
+    state.invalidate_members_cache(invite.community_id).await;
+
     // Broadcast the new member to the rest of the community
     let _ = crate::routes::profile::broadcast_member_updated(&state, &user).await;
 

@@ -7,9 +7,15 @@ use std::collections::BTreeMap;
 use uuid::Uuid;
 
 use crate::ws::{
-    protocol::{StreamDto, VoiceRosterEntry},
+    protocol::{StreamDto, VoiceRoomDto, VoiceRosterEntry},
     voice_registry::{TrackSource, VoiceRegistry, VoiceRoom},
 };
+
+/// v2 snapshot of one room, sorted deterministically. `None` if the channel
+/// has no room.
+pub fn v2_room(voice: &VoiceRegistry, channel_id: Uuid) -> Option<VoiceRoomDto> {
+    voice.room(channel_id).map(|room| room.to_dto(channel_id))
+}
 
 /// Fixed namespace for v1 `stream_id` UUID v5s. DO NOT CHANGE: changing it
 /// makes every v1 client treat existing shares as new ones.

@@ -285,8 +285,11 @@ pub async fn delete(
     .await?;
     let Some((_id, kind)) = deleted else { return Err(AppError::NotFound); };
     if kind == "voice" {
+        let change = state.hub.voice.write().await.close_channel(channel_id);
+        crate::ws::handler::publish_room_change(&state, change).await;
         state.hub.calls.write().await.clear_channel(channel_id);
     }
+    state.invalidate_channel_cache(channel_id).await;
     tracing::info!(actor_user_id = %auth.user.id, %channel_id, "channel deleted");
     Ok(StatusCode::NO_CONTENT)
 }

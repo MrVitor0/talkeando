@@ -566,3 +566,237 @@ async fn v1_stream_id_is_stable_across_two_broadcasts() {
 
     app.teardown().await;
 }
+
+// ---- SPEC-005: socket ops v2, disconnect no longer touches voice ----
+
+/// Sends `voice.presence.enter` for `channel` and waits for the resulting
+/// `voice.roster` echo so the caller knows the hint landed.
+async fn enter_voice(ws: &mut WsClient, channel: Uuid) {
+    ws.send("voice.presence.enter", serde_json::json!({ "channel_id": channel })).await;
+    let _ = next_roster(ws, channel).await;
+}
+
+/// I-02 — the WebSocket dropping (even abruptly) must never evict from voice.
+/// **The central test of this spec (INV-A3).**
+#[tokio::test]
+async fn ws_disconnect_keeps_voice_presence() {
+    let (app, fake) = TestApp::spawn_with_fake_livekit().await;
+    let bootstrap = app.bootstrap().await;
+    let channel = bootstrap.voice_channel_id;
+    let a = bootstrap.owner_id;
+    let (b_token, _b) = app.register_member(bootstrap.community_id, "bee").await;
+
+    let mut a_ws = WsClient::connect_and_authenticate(&app.ws_url, &bootstrap.owner_token).await;
+    let mut b_ws = WsClient::connect_and_authenticate(&app.ws_url, &b_token).await;
+
+    enter_voice(&mut a_ws, channel).await;
+    // LiveKit confirms A, and keeps reporting A for the rest of the test.
+    fake.set_room(channel.to_string(), vec![FakeParticipant::new(a, "PA_a")]).await;
+    app.send_webhook(wh("participant_joined", channel,
+        serde_json::json!({ "participant": { "identity": a.to_string(), "sid": "PA_a" } }))).await;
+    let _ = next_roster(&mut b_ws, channel).await;
+
+    // A vanishes with no close frame.
+    a_ws.terminate();
+
+    // Well past the 1 s grace and the 5 s scheduled reconcile.
+    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+    for due in app.state.take_due_reconciles().await {
+        tupi_server::ws::handler::reconcile_one_room(&app.state, due).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(4200)).await;
+    for due in app.state.take_due_reconciles().await {
+        tupi_server::ws::handler::reconcile_one_room(&app.state, due).await;
+    }
+
+    let room = room_in(&debug_voice(&app, &bootstrap.owner_token).await, channel).unwrap().clone();
+    let ids: Vec<&str> = room["participants"].as_array().unwrap().iter().map(|p| p["user_id"].as_str().unwrap()).collect();
+    assert_eq!(ids, vec![a.to_string()], "A was evicted by a WS drop: {room:#}");
+
+    app.teardown().await;
+}
+
+/// I-03 — a `leave` hint from a confirmed participant does not remove them;
+/// the directed reconcile confirms the real state (INV-A1).
+#[tokio::test]
+async fn leave_hint_does_not_evict_confirmed_participant() {
+    let (app, fake) = TestApp::spawn_with_fake_livekit().await;
+    let bootstrap = app.bootstrap().await;
+    let channel = bootstrap.voice_channel_id;
+    let a = bootstrap.owner_id;
+
+    let mut a_ws = WsClient::connect_and_authenticate(&app.ws_url, &bootstrap.owner_token).await;
+    enter_voice(&mut a_ws, channel).await;
+    fake.set_room(channel.to_string(), vec![FakeParticipant::new(a, "PA_a")]).await;
+    app.send_webhook(wh("participant_joined", channel,
+        serde_json::json!({ "participant": { "identity": a.to_string(), "sid": "PA_a" } }))).await;
+
+    a_ws.send("voice.presence.leave", serde_json::json!({ "channel_id": channel })).await;
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // Still present immediately after the hint.
+    assert_eq!(
+        room_in(&debug_voice(&app, &bootstrap.owner_token).await, channel).unwrap()["participants"].as_array().unwrap().len(),
+        1,
+        "leave hint evicted a confirmed participant"
+    );
+
+    // The reconcile it scheduled, run against a LiveKit that still has A: no change.
+    tokio::time::sleep(std::time::Duration::from_millis(2100)).await;
+    for due in app.state.take_due_reconciles().await {
+        tupi_server::ws::handler::reconcile_one_room(&app.state, due).await;
+    }
+    assert_eq!(
+        room_in(&debug_voice(&app, &bootstrap.owner_token).await, channel).unwrap()["participants"].as_array().unwrap().len(),
+        1
+    );
+
+    app.teardown().await;
+}
+
+/// I-13 — a v1 connection gets `voice.roster` and never `voice.room.delta`.
+#[tokio::test]
+async fn v1_client_receives_voice_rooms_and_roster() {
+    let app = TestApp::spawn().await;
+    let bootstrap = app.bootstrap().await;
+    let channel = bootstrap.voice_channel_id;
+    let mut ws = WsClient::connect_and_authenticate(&app.ws_url, &bootstrap.owner_token).await;
+    assert_eq!(ws.auth_ok["protocol_version"], 1);
+
+    app.send_webhook(wh("participant_joined", channel,
+        serde_json::json!({ "participant": { "identity": bootstrap.owner_id.to_string(), "sid": "PA_1" } }))).await;
+
+    let env = ws
+        .recv_matching_pub(std::time::Duration::from_secs(3), |e| {
+            e["op"] == "voice.roster" || e["op"] == "voice.room.delta"
+        })
+        .await
+        .expect("some voice op");
+    assert_eq!(env["op"], "voice.roster", "v1 must not get a delta");
+}
+
+/// I-14 — a v2 connection gets `voice.room.delta` and never `voice.roster`.
+#[tokio::test]
+async fn v2_client_receives_only_v2_room_ops() {
+    let app = TestApp::spawn().await;
+    let bootstrap = app.bootstrap().await;
+    let channel = bootstrap.voice_channel_id;
+    let mut ws = WsClient::connect_and_authenticate_with(
+        &app.ws_url,
+        &bootstrap.owner_token,
+        serde_json::json!({ "protocol_version": 2 }),
+    )
+    .await;
+    assert_eq!(ws.auth_ok["protocol_version"], 2);
+    assert_eq!(ws.auth_ok["features"], serde_json::json!(["voice.room.v2", "voice.hints"]));
+
+    app.send_webhook(wh("participant_joined", channel,
+        serde_json::json!({ "participant": { "identity": bootstrap.owner_id.to_string(), "sid": "PA_1" } }))).await;
+
+    let env = ws
+        .recv_matching_pub(std::time::Duration::from_secs(3), |e| {
+            e["op"] == "voice.roster" || e["op"] == "voice.room.delta"
+        })
+        .await
+        .expect("some voice op");
+    assert_eq!(env["op"], "voice.room.delta", "v2 must not get a v1 roster");
+    assert_eq!(env["data"]["reason"], "webhook.participant_joined");
+    assert_eq!(env["data"]["previous_version"], 0);
+    assert_eq!(env["data"]["version"], 1);
+}
+
+/// I-16 — `voice.track.hint unpublished` from a non-owner is rejected and the
+/// registry is untouched (INV-F1).
+#[tokio::test]
+async fn track_hint_from_non_owner_is_rejected() {
+    let app = TestApp::spawn().await;
+    let bootstrap = app.bootstrap().await;
+    let channel = bootstrap.voice_channel_id;
+    let a = bootstrap.owner_id;
+    let (b_token, b) = app.register_member(bootstrap.community_id, "bee").await;
+
+    let mut a_ws = WsClient::connect_and_authenticate(&app.ws_url, &bootstrap.owner_token).await;
+    let mut b_ws = WsClient::connect_and_authenticate(&app.ws_url, &b_token).await;
+    enter_voice(&mut a_ws, channel).await;
+    enter_voice(&mut b_ws, channel).await;
+    app.send_webhook(wh("participant_joined", channel, serde_json::json!({ "participant": { "identity": a.to_string(), "sid": "PA_a" } }))).await;
+    app.send_webhook(wh("participant_joined", channel, serde_json::json!({ "participant": { "identity": b.to_string(), "sid": "PA_b" } }))).await;
+
+    a_ws.send("voice.track.hint", serde_json::json!({
+        "channel_id": channel, "track_sid": "TR_a", "source": "screen_share", "state": "published",
+    })).await;
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+    b_ws.send("voice.track.hint", serde_json::json!({
+        "channel_id": channel, "track_sid": "TR_a", "source": "screen_share", "state": "unpublished",
+    })).await;
+    let err = b_ws.recv_op("error").await.expect("error for a non-owner unpublish");
+    assert_eq!(err["code"], "forbidden");
+
+    let body = debug_voice(&app, &bootstrap.owner_token).await;
+    let sids: Vec<&str> = room_in(&body, channel).unwrap()["tracks"].as_array().unwrap()
+        .iter().map(|t| t["track_sid"].as_str().unwrap()).collect();
+    assert_eq!(sids, vec!["TR_a"], "registry changed on a rejected hint");
+
+    app.teardown().await;
+}
+
+/// I-17 — a presence hint for a channel the user is not a member of is
+/// rejected (A2).
+#[tokio::test]
+async fn presence_hint_for_foreign_channel_is_rejected() {
+    let app = TestApp::spawn().await;
+    let bootstrap = app.bootstrap().await;
+    let mut ws = WsClient::connect_and_authenticate(&app.ws_url, &bootstrap.owner_token).await;
+
+    ws.send("voice.presence.hint", serde_json::json!({
+        "channel_id": Uuid::new_v4(), // not a channel of this (or any) community
+        "state": "joining",
+    })).await;
+
+    let err = ws.recv_op("error").await.expect("forbidden");
+    assert_eq!(err["code"], "forbidden");
+
+    app.teardown().await;
+}
+
+/// §7 — the 6th `voice.room.request` inside 10 s is rate-limited.
+#[tokio::test]
+async fn voice_room_request_is_rate_limited() {
+    let app = TestApp::spawn().await;
+    let bootstrap = app.bootstrap().await;
+    let mut ws = WsClient::connect_and_authenticate_with(
+        &app.ws_url,
+        &bootstrap.owner_token,
+        serde_json::json!({ "protocol_version": 2 }),
+    )
+    .await;
+
+    for _ in 0..5 {
+        ws.send("voice.room.request", serde_json::json!({ "channel_ids": [] })).await;
+        assert!(ws.recv_op("voice.room.state").await.is_some());
+    }
+    ws.send("voice.room.request", serde_json::json!({ "channel_ids": [] })).await;
+    let err = ws.recv_op("error").await.expect("rate_limited on the 6th");
+    assert_eq!(err["code"], "rate_limited");
+
+    app.teardown().await;
+}
+
+/// §7 — with `TUPI_VOICE_PROTOCOL_V2=false`, nobody negotiates 2 and features
+/// is empty.
+#[tokio::test]
+async fn protocol_v2_flag_off_forces_v1() {
+    let app = TestApp::spawn_v1_only().await;
+    let bootstrap = app.bootstrap().await;
+    let ws = WsClient::connect_and_authenticate_with(
+        &app.ws_url,
+        &bootstrap.owner_token,
+        serde_json::json!({ "protocol_version": 2 }),
+    )
+    .await;
+    assert_eq!(ws.auth_ok["protocol_version"], 1);
+    assert_eq!(ws.auth_ok["features"], serde_json::json!([]));
+
+    app.teardown().await;
+}
