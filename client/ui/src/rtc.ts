@@ -1,40 +1,31 @@
 /** SFU media adapter. WebSocket remains control-plane only; media connects directly to LiveKit. */
 import { Room, RoomEvent, Track } from "livekit-client";
-import { startNativeScreen, stopNativeScreen, reconfigureNativeScreen } from "./nativeScreen";
+import type { RemoteVideoTrack } from "livekit-client";
+import * as screenPublisher from "./screenPublisher";
 import { AudioPipelineManager, type AudioPipelineStatus, type NoiseSuppressionMode } from "./audioPipeline";
 import { send, subscribe } from "./ipc";
 import * as callSession from "./callSession";
 import { hasFeature } from "./serverInfo";
 import * as voiceStore from "./voiceStore";
+import * as remoteMedia from "./remoteMedia";
+export { subscribeRemoteVideos, getRemoteVideos, findRemoteVideo, watchRequestedAt } from "./remoteMedia";
+export type { RemoteVideo } from "./remoteMedia";
+import { logClient } from "./clientLog";
 
 export type ConnQuality = "good" | "medium" | "poor";
 export type { EndReason } from "./callSession";
 import type { EndReason } from "./callSession";
-type Remote = (id: string, stream: MediaStream | null, id2: string | null) => void;
 type DeviceLists = { audioInputs: MediaDeviceInfo[]; audioOutputs: MediaDeviceInfo[]; videoInputs: MediaDeviceInfo[] };
 
 // The call's lifecycle now lives in `callSession` (SPEC-007). `rtc.ts` reads
 // the active room through it and never mutates it directly.
 function room(): Room | null { return callSession.activeRoom(); }
 function channelId(): string | null { return callSession.snapshot().channelId; }
-// Spectating still creates its own Room here; SPEC-011 formalises it. Reads
-// that also serve the in-call "watch a peer's screen" path go through this.
-let spectatorRoom: Room | null = null;
-function viewRoom(): Room | null { return callSession.activeRoom() ?? spectatorRoom; }
-function teardownSpectator() {
-  const spectator = spectatorRoom;
-  spectatorRoom = null;
-  if (spectator) { spectator.removeAllListeners(); void spectator.disconnect(); }
-}
 let controlPlaneSubscription: (() => void) | null = null;
-let screen: MediaStream | null = null;
-let screenSource = "";
-let screenAudioEnabled = false;
 let audioInputDeviceId = storedString("tk.audioInputDeviceId");
 let audioOutputDeviceId = storedString("tk.audioOutputDeviceId");
 let inputVolume = storedNumber("tk.inputVolume", 1);
 let outputVolume = storedNumber("tk.outputVolume", 1);
-const remotes = new Set<Remote>();
 const cameras = new Set<(stream: MediaStream | null) => void>();
 const callEnded = new Set<(reason: EndReason) => void>();
 const speakers = new Set<(ids: Set<string>) => void>();
@@ -60,10 +51,14 @@ const screenVolumes = new Map<string, number>(Object.entries(stored("tk.screenVo
 const muted = new Map<string, boolean>(Object.entries(storedBooleans("tk.peerMuted")));
 const screenMuted = new Map<string, boolean>(Object.entries(storedBooleans("tk.screenMuted")));
 const audio = new Map<string, HTMLAudioElement[]>(), screenAudio = new Map<string, HTMLAudioElement[]>();
-// A sidebar action can arrive before LiveKit has announced the matching
-// remote publication. Keep the intent and apply it from TrackPublished so
-// "AO VIVO" never turns into a UI-only watch with no actual subscription.
-const wantedScreens = new Map<string, string>();
+/**
+ * Who we want to watch, and why. The hover preview and the "AO VIVO" button are
+ * two independent reasons for the SAME subscription; without the counter,
+ * leaving the hover cancelled the subscription the button had just created
+ * (RC-17). The intent also survives a republish (applied from `TrackPublished`).
+ */
+export type WatchReason = "hover" | "stage";
+const watchIntent = new Map<string, Set<WatchReason>>();
 let locallyDeafened = false;
 
 function stored(key: string): Record<string, number> { try { return JSON.parse(localStorage.getItem(key) || "{}"); } catch { return {}; } }
@@ -104,6 +99,9 @@ function emitSpeaking() {
   const ids = new Set(remoteSpeakers);
   if (localSpeaking && localSpeakerIdentity) ids.add(localSpeakerIdentity);
   speakers.forEach(listener => listener(ids));
+  // A slice in the store, so a speaking change can re-render one row instead
+  // of the whole tree (SPEC-013 §4.5).
+  voiceStore.setSpeaking(ids);
 }
 
 function stopLocalSpeechMonitor() {
@@ -158,6 +156,11 @@ function startLocalSpeechMonitor(activeRoom: Room, sessionId: number) {
   }
 }
 
+/** Requests a LiveKit token over IPC. Exported for `spectator.ts`, which mints
+ *  its own `mode: "spectator"` credential. */
+export async function mintCredentials(channel_id: string, mode = "participant") {
+  return credentials(channel_id, mode);
+}
 async function credentials(channel_id: string, mode = "participant") {
   const request_id = crypto.randomUUID();
   return new Promise<{ url: string; token: string }>((resolve, reject) => {
@@ -215,18 +218,36 @@ function bindMedia(room: Room, sessionId: number) {
 
   room.on(RoomEvent.TrackPublished, (publication, participant) => {
     if (publication.source !== Track.Source.ScreenShare) return;
-    if (wantedScreens.has(participant.identity)) void publication.setSubscribed(true);
+    if (watchIntent.has(participant.identity)) void publication.setSubscribed(true);
   });
   room.on(RoomEvent.TrackSubscribed, (track, publication, participant) => {
-    const element = track.attach() as HTMLMediaElement;
+    if (track.kind === Track.Kind.Video) {
+      // RC-12: do NOT attach here. The component that displays the video is the
+      // one that attaches, so the SDK observes the element the user sees and
+      // `adaptiveStream` reports visibility correctly.
+      remoteMedia.addRemoteVideo({
+        ownerId: participant.identity,
+        trackSid: publication.trackSid,
+        source: publication.source === Track.Source.Camera ? "camera" : "screen_share",
+        track: track as RemoteVideoTrack,
+        roomKey: "call",
+      });
+      logClient("watch.subscribed", { owner: participant.identity, track_sid: publication.trackSid });
+      return;
+    }
+    // Audio: hidden element on the body (adaptiveStream does not manage audio).
+    const element = track.attach() as HTMLAudioElement;
     element.autoplay = true; element.style.display = "none"; document.body.appendChild(element);
     const isScreen = publication.source === Track.Source.ScreenShareAudio;
     const sinks = isScreen ? screenAudio : audio;
-    sinks.set(participant.identity, [...(sinks.get(participant.identity) || []), element as HTMLAudioElement]);
+    sinks.set(participant.identity, [...(sinks.get(participant.identity) || []), element]);
     apply(participant.identity, isScreen);
-    if (track.kind === Track.Kind.Video) remotes.forEach(listener => listener(participant.identity, new MediaStream([track.mediaStreamTrack]), publication.trackSid));
   });
   room.on(RoomEvent.TrackUnsubscribed, (track, publication, participant) => {
+    if (track.kind === Track.Kind.Video) {
+      remoteMedia.removeRemoteVideo(publication.trackSid);
+      return;
+    }
     const detached = track.detach() as HTMLMediaElement[];
     detached.forEach(element => element.remove());
     const isScreen = publication.source === Track.Source.ScreenShareAudio;
@@ -234,7 +255,6 @@ function bindMedia(room: Room, sessionId: number) {
     const remaining = (sinks.get(participant.identity) || []).filter(element => !detached.includes(element));
     if (remaining.length) sinks.set(participant.identity, remaining);
     else sinks.delete(participant.identity);
-    if (track.kind === Track.Kind.Video) remotes.forEach(listener => listener(participant.identity, null, publication.trackSid));
   });
   room.on(RoomEvent.ActiveSpeakersChanged, list => {
     if (!callSession.isCurrent(sessionId)) return;
@@ -297,6 +317,9 @@ function restoreControlPlanePresence() {
   const channel = channelId();
   if (!activeRoom || !channel) return;
 
+  // The presence hint carries our participant_sid so the server marks us
+  // confirmed at once (SPEC-005 §4.3): we only know the sid because the LiveKit
+  // connection actually exists.
   sendPresenceHint(channel, "joining", callSession.snapshot().participantSid ?? undefined);
   for (const publication of activeRoom.localParticipant.trackPublications.values()) {
     if (!publication.track) continue;
@@ -304,6 +327,7 @@ function restoreControlPlanePresence() {
     if (publication.source === Track.Source.ScreenShare) reportTrack(true, "screen_share", publication.trackSid);
     if (publication.source === Track.Source.ScreenShareAudio) reportTrack(true, "screen_share_audio", publication.trackSid);
   }
+  logClient("call.presence.restored", { channel_id: channel });
 }
 
 export function init(_: string) {
@@ -315,15 +339,15 @@ export function init(_: string) {
   controlPlaneSubscription = subscribe(event => {
     if (event.op === "connection.state" && event.data?.state === "connected") {
       restoreControlPlanePresence();
+      // Local room state may have missed deltas while the socket was down.
+      voiceStore.requestFullSnapshot("ws_reconnected");
     }
   });
 }
 export async function joinCall(id: string, isMuted: boolean, isDeafened: boolean) {
   locallyDeafened = isDeafened;
   localMuted = isMuted;
-  wantedScreens.clear();
-  teardownSpectator();
-  screen?.getTracks().forEach(track => track.stop()); screen = null;
+  watchIntent.clear();
 
   await callSession.join(id, {
     credentials: channel => credentials(channel),
@@ -353,8 +377,9 @@ export async function joinCall(id: string, isMuted: boolean, isDeafened: boolean
       // reverse registration order — so register the mic first.
       callSession.registerResource(sessionId, () => microphone.dispose());
       callSession.registerResource(sessionId, () => {
+        remoteMedia.clearRemoteVideos();
         for (const elements of [...audio.values(), ...screenAudio.values()]) {
-          for (const element of elements) element.remove();
+          for (const element of elements) { element.pause(); element.srcObject = null; element.remove(); }
         }
         audio.clear();
         screenAudio.clear();
@@ -369,10 +394,8 @@ export async function joinCall(id: string, isMuted: boolean, isDeafened: boolean
 export async function leaveCall() {
   const channel = channelId();
   if (channel) sendPresenceHint(channel, "leaving", callSession.snapshot().participantSid ?? undefined);
-  wantedScreens.clear();
+  watchIntent.clear();
   locallyDeafened = false;
-  teardownSpectator();
-  screen?.getTracks().forEach(track => track.stop()); screen = null;
   await callSession.leave();
 }
 export async function setLocalAudioState(isMuted: boolean, isDeafened: boolean) {
@@ -408,59 +431,45 @@ export async function stopCamera(_: string, __: string) {
 }
 export async function switchCamera(deviceId: string) { await stopCamera("", ""); await startCamera("", "", deviceId); }
 export function onLocalCamera(listener: (stream: MediaStream | null) => void) { cameras.add(listener); return () => { cameras.delete(listener); }; }
-export async function publishScreen(_: string, __: string, source: string, height: number, fps: number, withAudio: boolean) {
-  const activeRoom = room();
-  if (!activeRoom) return;
-  screenSource = source; screenAudioEnabled = withAudio; screen = startNativeScreen(source, height, fps, withAudio);
-  for (const track of screen.getTracks()) {
-    const isAudio = track.kind === "audio";
-    const publication = await activeRoom.localParticipant.publishTrack(track, { source: isAudio ? Track.Source.ScreenShareAudio : Track.Source.ScreenShare, simulcast: !isAudio });
-    reportTrack(true, isAudio ? "screen_share_audio" : "screen_share", publication?.trackSid);
+// Screen sharing now lives entirely in `screenPublisher` (SPEC-010). These
+// thin re-exports keep the call sites that still import from `rtc`.
+export const publishScreen = screenPublisher.start;
+export const unpublishScreen = screenPublisher.stop;
+export const switchScreenSource = screenPublisher.switchSource;
+export const reconfigureScreen = screenPublisher.reconfigure;
+export function getLocalScreenStream(): MediaStream | null {
+  return screenPublisher.active()?.stream ?? null;
+}
+function applySubscription(ownerId: string, subscribed: boolean) {
+  const participant = callSession.activeRoom()?.remoteParticipants.get(ownerId);
+  if (!participant) return;
+  for (const publication of participant.trackPublications.values()) {
+    if (publication.source === Track.Source.ScreenShare) void publication.setSubscribed(subscribed);
+  }
+  if (subscribed) logClient("watch.requested", { owner: ownerId });
+}
+
+/** Adds `reason` as a reason to watch `ownerId`'s screen in the active call.
+ *  The first reason subscribes; further reasons are no-ops. */
+export function watchStream(ownerId: string, reason: WatchReason): void {
+  const reasons = watchIntent.get(ownerId) ?? new Set<WatchReason>();
+  const hadAny = reasons.size > 0;
+  reasons.add(reason);
+  watchIntent.set(ownerId, reasons);
+  if (!hadAny) applySubscription(ownerId, true);
+}
+
+/** Drops `reason`. Only when no reason remains is the subscription cancelled
+ *  (RC-17: leaving the hover must not drop the "stage" subscription). */
+export function stopWatchingStream(ownerId: string, reason: WatchReason): void {
+  const reasons = watchIntent.get(ownerId);
+  if (!reasons) return;
+  reasons.delete(reason);
+  if (reasons.size === 0) {
+    watchIntent.delete(ownerId);
+    applySubscription(ownerId, false);
   }
 }
-export async function unpublishScreen(_: string, __: string) {
-  const activeRoom = room();
-  if (activeRoom) for (const publication of activeRoom.localParticipant.trackPublications.values()) if ((publication.source === Track.Source.ScreenShare || publication.source === Track.Source.ScreenShareAudio) && publication.track) {
-    const isAudio = publication.source === Track.Source.ScreenShareAudio;
-    await activeRoom.localParticipant.unpublishTrack(publication.track);
-    reportTrack(false, isAudio ? "screen_share_audio" : "screen_share", publication.trackSid);
-  }
-  stopNativeScreen(); screen?.getTracks().forEach(track => track.stop()); screen = null;
-}
-export function reconfigureScreen(height: number, fps: number) { reconfigureNativeScreen(screenSource, height, fps, screenAudioEnabled); }
-export function switchScreenSource(source: string) { screenSource = source; }
-export function getLocalScreenStream() { return screen; }
-function screenPublication(sid: string, owner: string) {
-  const participant = viewRoom()?.remoteParticipants.get(owner);
-  if (!participant) return undefined;
-  // The control plane's stream id is separate from LiveKit's track SID.
-  // Falling back to this owner's screen track keeps subscription reliable.
-  return participant.trackPublications.get(sid)
-    ?? [...participant.trackPublications.values()].find(publication => publication.source === Track.Source.ScreenShare);
-}
-export function watchStream(_: string, sid: string, owner: string) {
-  wantedScreens.set(owner, sid);
-  const publication = screenPublication(sid, owner);
-  if (publication) void publication.setSubscribed(true);
-  return Boolean(publication);
-}
-export function stopWatchingStream(_: string, sid: string, owner: string) {
-  wantedScreens.delete(owner);
-  void screenPublication(sid, owner)?.setSubscribed(false);
-}
-export async function spectate(id: string, sid: string, owner: string) {
-  // Only spectate from outside a call; SPEC-011 hardens this boundary.
-  if (!callSession.activeRoom() && !spectatorRoom) {
-    const credential = await credentials(id, "spectator");
-    const spectator = new Room({ adaptiveStream: true, dynacast: true });
-    bindMedia(spectator, 0); // sessionId 0: not a call session, guards are no-ops
-    await spectator.connect(credential.url, credential.token);
-    spectatorRoom = spectator;
-  }
-  watchStream(id, sid, owner);
-}
-export function stopSpectate(_: string) { teardownSpectator(); }
-export function onRemoteStream(listener: Remote) { remotes.add(listener); return () => { remotes.delete(listener); }; }
 export function onCallDisconnected(listener: (reason: EndReason) => void) { callEnded.add(listener); return () => { callEnded.delete(listener); }; }
 export function onSpeaking(listener: (ids: Set<string>) => void) { speakers.add(listener); return () => { speakers.delete(listener); }; }
 export function onConnectionQuality(listener: (quality: ConnQuality) => void) { qualities.add(listener); return () => { qualities.delete(listener); }; }

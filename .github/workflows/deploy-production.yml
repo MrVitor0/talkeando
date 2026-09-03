@@ -278,5 +278,21 @@ jobs:
               # discards a stale webhook retry queue after a bad configuration.
               docker compose -f docker-compose.production.yml up -d --force-recreate caddy livekit
               docker compose -f docker-compose.production.yml ps
+
+              # Fail the deploy if a service did not come up, instead of
+              # finding out from a user report (SPEC-016 §4.5).
+              sleep 20
+              unhealthy=$(docker compose -f docker-compose.production.yml ps \
+                --format "{{.Service}} {{.State}}" | grep -v " running" || true)
+              if [ -n "$unhealthy" ]; then
+                echo "Services down after deploy:"
+                echo "$unhealthy"
+                docker compose -f docker-compose.production.yml logs --tail 50
+                docker logout ghcr.io
+                exit 1
+              fi
+              # Memory, informational only: a momentary spike during start is
+              # not a reason to roll back.
+              docker stats --no-stream --format "{{.Name}} {{.MemUsage}} {{.MemPerc}}"
               docker logout ghcr.io
             '

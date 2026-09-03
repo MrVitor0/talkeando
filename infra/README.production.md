@@ -35,6 +35,42 @@ checagem de IP de datacenter. Para reativar o player YouTube como último
 recurso, defina `PROVIDER_CHAIN=cache,library,soundcloud,audius,youtube` no
 ambiente do bot (sem cookies, o YouTube costuma bloquear).
 
+## Verificar saúde da VM
+
+A VM tem 2 GB e hospeda todos os serviços. Os limites de memória do compose
+(SPEC-016) existem para controlar a **ordem de morte**: o `music-bot` estoura o
+próprio limite antes de o kernel escolher o `livekit`. Rode isto logo após um
+deploy e 24 h depois.
+
+```bash
+ssh ubuntu@$HOST
+cd /opt/talkeando/infra
+
+# Consumo por container. livekit não pode passar de ~600 MB.
+docker stats --no-stream
+
+# Confirmar o nome exato dos containers (o projeto do compose é "talkeando").
+docker compose -f docker-compose.production.yml ps
+
+# Os limites foram realmente aplicados? Deve devolver bytes, nunca 0.
+# Trocar o nome pelo que o `ps` acima mostrou.
+docker inspect talkeando-livekit-1 --format '{{.HostConfig.Memory}}'   # 671088640
+
+# OOM killer atuou? Zero linhas é o esperado. É isto que confirma ou
+# refuta RC-20 em produção.
+dmesg -T | grep -i "killed process"
+
+# Quantas vezes cada container reiniciou desde o deploy.
+docker compose -f docker-compose.production.yml ps --format '{{.Service}} {{.Status}}'
+
+# Estado da voz, com a diferença contra o LiveKit.
+curl -s -H "Authorization: Bearer $OWNER_TOKEN" \
+  "https://$API_DOMAIN/api/debug/voice?live=1" | jq '.livekit_diff'
+
+# Liveness sem autenticação (o healthcheck do container usa este endpoint).
+curl -s "https://$API_DOMAIN/api/health"   # {"ok":true}
+```
+
 ## Antes de empacotar o cliente beta
 
 Copie `client/native/Talkeando.Client/talkeando.settings.production.example.json`

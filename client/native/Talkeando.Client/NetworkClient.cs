@@ -180,6 +180,24 @@ public sealed class NetworkClient
         return result.RootElement.Clone();
     }
 
+    /// Sends the UI's diagnostics report (SPEC-014). The session token lives
+    /// here, never in the WebView. The recent native `DebugLog` tail is
+    /// appended before sending — the host has context the UI does not.
+    public async Task UploadClientLogsAsync(JsonElement report)
+    {
+        var payload = JsonNode.Parse(report.GetRawText())!.AsObject();
+        payload["native_log"] = JsonSerializer.SerializeToNode(DebugLog.Tail(100));
+
+        using var request = new HttpRequestMessage(HttpMethod.Post, "client-logs")
+        {
+            Content = new StringContent(payload.ToJsonString(), Encoding.UTF8, "application/json"),
+        };
+        AddAuthorization(request);
+        using var response = await _http.SendAsync(request);
+        if (!response.IsSuccessStatusCode)
+            throw new InvalidOperationException("Não foi possível enviar o diagnóstico.");
+    }
+
     public async Task<JsonElement> UploadAttachmentAsync(Guid channelId, string filePath)
     {
         if (!File.Exists(filePath)) throw new FileNotFoundException("Arquivo não encontrado.", filePath);

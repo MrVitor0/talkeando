@@ -15,6 +15,7 @@ vi.mock("./ipc", () => ({ send: ipc.send, subscribe: ipc.subscribe }));
 
 const features = vi.hoisted(() => ({ set: new Set<string>(["voice.room.v2"]) }));
 vi.mock("./serverInfo", () => ({ hasFeature: (name: string) => features.set.has(name) }));
+vi.mock("./clientLog", () => ({ logClient: () => {}, maybeAutoSend: () => {} }));
 
 import * as store from "./voiceStore";
 
@@ -155,5 +156,26 @@ describe("voiceStore", () => {
     ipc.dispatch("voice.room.delta", delta({ channel_id: "ghost" }));
     expect(ipc.send).toHaveBeenCalledWith("voice.room.request", { channel_ids: ["ghost"] });
     expect(store.getState().rooms["ghost"]).toBeUndefined();
+  });
+
+  it("the speaking slice updates without touching rooms (SPEC-013)", () => {
+    store.initVoiceStore();
+    ipc.dispatch("voice.room.state", { full: true, rooms: [room({ participants: [{ user_id: "a" }] })] });
+    const roomsBefore = store.getState().rooms;
+
+    store.setSpeaking(new Set(["a"]));
+    expect(store.getState().speaking.has("a")).toBe(true);
+    // `rooms` is the same reference — a selector on `rooms` would not re-render.
+    expect(store.getState().rooms).toBe(roomsBefore);
+  });
+
+  it("setSpeaking is a no-op when the set is unchanged", () => {
+    store.initVoiceStore();
+    let emits = 0;
+    store.subscribeVoice(() => emits++);
+    store.setSpeaking(new Set(["a", "b"]));
+    const after = emits;
+    store.setSpeaking(new Set(["b", "a"])); // same members
+    expect(emits).toBe(after);
   });
 });

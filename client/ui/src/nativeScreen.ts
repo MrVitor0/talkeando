@@ -11,9 +11,20 @@
 // MediaStreamTrackGenerator as an AudioData frame, yielding an audio track
 // that rides on the same peer connection as the video.
 
-import { send } from "./ipc";
+import { send, subscribe } from "./ipc";
 
-const webview = (window as { chrome?: { webview?: any } }).chrome?.webview;
+/**
+ * Generation of the current capture. Frames that arrive with a different
+ * generation are dropped: the native host can take up to ~800 ms to stop its
+ * capture thread (ScreenCapture.cs Join(800)), and without this, frames from
+ * the old capture get drawn onto the new canvas (RC-16).
+ */
+let captureGeneration = 0;
+
+const webview =
+  typeof window !== "undefined"
+    ? (window as { chrome?: { webview?: any } }).chrome?.webview
+    : undefined;
 
 type SharedBufferEvent = { getBuffer: () => ArrayBuffer; additionalData?: unknown };
 
@@ -62,8 +73,11 @@ webview?.addEventListener("sharedbufferreceived", (event: SharedBufferEvent) => 
 // A dedicated `message` listener alongside ipc.ts's — keeps the 30fps frame /
 // 100Hz audio notifications out of the React subscribe loop.
 webview?.addEventListener("message", (event: MessageEvent<unknown>) => {
-  const envelope = event.data as { op?: string; data?: { slot: number; len: number } };
+  const envelope = event.data as { op?: string; data?: { slot: number; len: number; generation?: number } };
   if (!envelope?.data) return;
+  // Drop frames/packets from a previous capture (RC-16). A missing generation
+  // (older native host) is accepted.
+  if (envelope.data.generation !== undefined && envelope.data.generation !== captureGeneration) return;
   if (envelope.op === "screen.frame") void onVideoFrame(envelope.data.slot, envelope.data.len);
   else if (envelope.op === "screen.audio") onAudioPacket(envelope.data.slot, envelope.data.len);
 });
@@ -89,7 +103,7 @@ async function onVideoFrame(slot: number, len: number) {
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-const win = window as any;
+const win: any = typeof window !== "undefined" ? window : {};
 
 function onAudioPacket(slot: number, len: number) {
   if (!active || !audioBuffer || !audioWriter || len <= 0) return;
@@ -132,8 +146,15 @@ function makeAudioTrack(): MediaStreamTrack | null {
 /// Starts the host capturing `sourceId`. Returns a MediaStream with a live
 /// video track (canvas) and, when `withAudio`, an audio track fed by the
 /// process-loopback PCM. Caller owns stopping it.
-export function startNativeScreen(sourceId: string, maxHeight: number, fps: number, withAudio: boolean): MediaStream {
+export function startNativeScreen(options: {
+  generation: number;
+  sourceId: string;
+  maxHeight: number;
+  fps: number;
+  withAudio: boolean;
+}): MediaStream {
   active = true;
+  captureGeneration = options.generation;
   framesOk = 0;
   framesBad = 0;
   if (!videoBuffer) console.warn("[nativeScreen] no video shared buffer yet — frames drop until it arrives");
@@ -144,13 +165,19 @@ export function startNativeScreen(sourceId: string, maxHeight: number, fps: numb
   ctx = canvas.getContext("2d");
   if (ctx) { ctx.fillStyle = "#000"; ctx.fillRect(0, 0, canvas.width, canvas.height); }
 
-  const videoStream = (canvas as HTMLCanvasElement & { captureStream: (fps?: number) => MediaStream }).captureStream(fps);
+  const videoStream = (canvas as HTMLCanvasElement & { captureStream: (fps?: number) => MediaStream }).captureStream(options.fps);
   const tracks: MediaStreamTrack[] = [videoStream.getVideoTracks()[0]];
 
-  const audioTrack = withAudio ? makeAudioTrack() : null;
+  const audioTrack = options.withAudio ? makeAudioTrack() : null;
   if (audioTrack) tracks.push(audioTrack);
 
-  send("screen.capture.start", { source_id: sourceId, max_height: maxHeight, max_fps: fps, audio: withAudio && !!audioTrack });
+  send("screen.capture.start", {
+    source_id: options.sourceId,
+    max_height: options.maxHeight,
+    max_fps: options.fps,
+    audio: options.withAudio && !!audioTrack,
+    generation: options.generation,
+  });
   return new MediaStream(tracks);
 }
 
@@ -164,14 +191,39 @@ export function reconfigureNativeScreen(sourceId: string, maxHeight: number, fps
   send("screen.capture.start", { source_id: sourceId, max_height: maxHeight, max_fps: fps, audio: withAudio });
 }
 
-export function stopNativeScreen() {
-  if (!active) return;
+/**
+ * Now async: resolves only after the host confirms the stop
+ * (`screen.capture.stopped`), or after a 1 s timeout. That confirmation means
+ * "the capture threads ended" (the host's Join(800) completed) — the guarantee
+ * INV-D2 needs before a new capture may start. Pass `generation` to make a
+ * stale stop a no-op.
+ */
+export async function stopNativeScreen(generation?: number): Promise<void> {
+  if (generation !== undefined && generation !== captureGeneration) return;
+  if (!active && captureGeneration === 0) return;
   active = false;
-  send("screen.capture.stop", {});
+  captureGeneration = 0;
   canvas = null;
   ctx = null;
-  try { void audioWriter?.close(); } catch { /* already closed */ }
+  try { await audioWriter?.close(); } catch { /* already closed */ }
   audioWriter = null;
   audioGenerator?.stop();
   audioGenerator = null;
+  audioFrameCount = 0;
+  audioPackets = 0;
+  await requestCaptureStop();
+}
+
+/** Sends `screen.capture.stop` and waits for `screen.capture.stopped`. */
+function requestCaptureStop(): Promise<void> {
+  return new Promise(resolve => {
+    const timer = setTimeout(() => { off(); resolve(); }, 1000);
+    const off = subscribe(event => {
+      if (event.op !== "screen.capture.stopped") return;
+      clearTimeout(timer);
+      off();
+      resolve();
+    });
+    send("screen.capture.stop", {});
+  });
 }

@@ -18,5 +18,7 @@ pub fn server_features(config: &crate::config::Config) -> Vec<String> {
         features.push("voice.room.v2".to_string());
         features.push("voice.hints".to_string());
     }
+    // `POST /api/client-logs` is always available (SPEC-014).
+    features.push("client.logs".to_string());
     features
 }

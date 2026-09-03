@@ -313,6 +313,8 @@ if ($NoClients) {
     } else {
         Write-Host "`nUse existing accounts from the configured remote database." -ForegroundColor Green
     }
+    Write-Host "`nSFU integration runner (needs a local LiveKit + 2-3 accounts):" -ForegroundColor Green
+    Write-Host "  node integration/sfu/run.cjs   # see integration/sfu/README.md"
     return
 }
 

@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef } from "react";
 import { Icon } from "./Icon";
 import { send } from "./ipc";
 import * as rtc from "./rtc";
+import { sendDiagnostics } from "./clientLog";
 import type { AudioPipelineStatus, NoiseSuppressionMode } from "./audioPipeline";
 import { BANNER_PRESETS, getBannerPreset } from "./banners";
 
@@ -62,6 +63,7 @@ export function SettingsModal({
   initialTab = "voice",
 }: SettingsModalProps) {
   const [activeTab, setActiveTab] = useState<"voice" | "account" | "appearance">(initialTab);
+  const [diagnosticsState, setDiagnosticsState] = useState<"idle" | "sending" | "sent" | "failed">("idle");
   const [selectedBanner, setSelectedBanner] = useState<string>(currentUser?.banner_preset || currentBanner);
   const [displayName, setDisplayName] = useState(currentUser?.display_name || "");
   const [pronouns, setPronouns] = useState(currentUser?.pronouns || "");
@@ -587,6 +589,32 @@ export function SettingsModal({
                     </div>
                   )}
                 </div>
+              </section>
+
+              <section className="settings-section">
+                <h3 className="settings-section-heading">Diagnóstico</h3>
+                <p style={{ fontSize: "13px", color: "var(--text-muted)", margin: "0 0 12px" }}>
+                  Envia os últimos eventos de conexão para quem administra o Tupi.
+                  Não inclui mensagens, áudio, vídeo nem senhas.
+                </p>
+                <button
+                  className="settings-btn is-primary"
+                  disabled={diagnosticsState === "sending"}
+                  onClick={async () => {
+                    setDiagnosticsState("sending");
+                    const ok = await sendDiagnostics("manual");
+                    setDiagnosticsState(ok ? "sent" : "failed");
+                    window.setTimeout(() => setDiagnosticsState("idle"), 4000);
+                  }}
+                >
+                  {diagnosticsState === "sending"
+                    ? "Enviando…"
+                    : diagnosticsState === "sent"
+                      ? "Enviado"
+                      : diagnosticsState === "failed"
+                        ? "Falhou — tente novamente"
+                        : "Enviar diagnóstico"}
+                </button>
               </section>
             </div>
           )}

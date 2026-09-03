@@ -12,9 +12,12 @@
  *     the server projection. It is the same structure the audio comes from, so
  *     a ghost is impossible (INV-C1).
  */
+import { useRef } from "react";
+import { useSyncExternalStore } from "react";
+
 import { hasFeature } from "./serverInfo";
 import { send, subscribe } from "./ipc";
-import { logClient } from "./clientLog";
+import { logClient, maybeAutoSend } from "./clientLog";
 
 const MUSIC_BOT_ID = "00000000-0000-0000-0000-000000000001";
 
@@ -69,6 +72,9 @@ export type VoiceState = {
     channelId: string | null;
     participants: LiveParticipant[];
   };
+  /** User ids currently making sound. A slice of its own so a speaking change
+   *  re-renders one row, not the tree (SPEC-013 §4.5). */
+  speaking: Set<string>;
 };
 
 // ---- wire shapes ----
@@ -113,7 +119,7 @@ type V1RoomWire = {
 
 // ---- module state ----
 
-let state: VoiceState = { rooms: {}, session: { channelId: null, participants: [] } };
+let state: VoiceState = { rooms: {}, session: { channelId: null, participants: [] }, speaking: new Set<string>() };
 const listeners = new Set<(state: VoiceState) => void>();
 /** Channels awaiting a snapshot after a version gap; their deltas are dropped
  *  until it lands (protocol §2.2). */
@@ -130,7 +136,7 @@ export function getState(): VoiceState {
 
 /** Test hook only: wipes module state so each case starts clean. */
 export function __resetForTest() {
-  state = { rooms: {}, session: { channelId: null, participants: [] } };
+  state = { rooms: {}, session: { channelId: null, participants: [] }, speaking: new Set<string>() };
   listeners.clear();
   awaitingSnapshot.clear();
   lastRequestAt = 0;
@@ -272,6 +278,7 @@ function applyDelta(delta: DeltaWire) {
     received_version: delta.version,
   });
   requestSnapshot([channelId], "version_gap");
+  maybeAutoSend("version_gap");
 }
 
 // ---- v1 application ----
@@ -304,6 +311,14 @@ function requestSnapshot(channelIds: string[], reason: string) {
   if (hasFeature("voice.room.v2")) send("voice.room.request", { channel_ids: channelIds });
   else send("voice.rooms.request", {});
   logClient("voice.snapshot_requested", { reason, channels: channelIds.length });
+}
+
+/** Asks the server for a full snapshot of every visible channel. Used after a
+ *  WebSocket reconnect or a machine wake, when local state may have missed
+ *  deltas (SPEC-012). */
+export function requestFullSnapshot(reason: string) {
+  // The server treats an empty `channel_ids` as "all visible".
+  requestSnapshot([], reason);
 }
 
 // ---- the session (INV-C1) ----
@@ -418,4 +433,44 @@ export function sessionParticipants(session: VoiceState["session"]): Participant
     deafened: p.deafened,
     is_bot: p.isBot,
   }));
+}
+
+// ---- speaking slice (SPEC-013 §4.5) ----
+
+/** Replaces the "who is speaking" set. Called by rtc.ts on every
+ *  ActiveSpeakersChanged and every local speech-monitor transition. */
+export function setSpeaking(ids: Set<string>) {
+  // Skip the emit when nothing actually changed.
+  if (ids.size === state.speaking.size && [...ids].every(id => state.speaking.has(id))) return;
+  state = { ...state, speaking: ids };
+  emit();
+}
+
+// ---- React selectors ----
+
+/**
+ * Subscribe to just one slice of the voice state. A selector that returns an
+ * object or array MUST pass an `isEqual` — the default `Object.is` would treat
+ * every fresh object as a change and defeat the point.
+ */
+export function useVoiceSelector<T>(
+  selector: (state: VoiceState) => T,
+  isEqual: (a: T, b: T) => boolean = Object.is,
+): T {
+  const lastRef = useRef<{ value: T } | null>(null);
+  return useSyncExternalStore(
+    subscribeVoice,
+    () => {
+      const next = selector(getState());
+      if (lastRef.current && isEqual(lastRef.current.value, next)) return lastRef.current.value;
+      lastRef.current = { value: next };
+      return next;
+    },
+    () => selector(getState()),
+  );
+}
+
+/** True iff this specific user is speaking. Re-renders only its own row. */
+export function useIsSpeaking(userId: string): boolean {
+  return useVoiceSelector(s => s.speaking.has(userId));
 }

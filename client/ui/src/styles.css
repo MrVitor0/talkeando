@@ -478,6 +478,13 @@ a:hover {
   color: var(--text-muted);
   font-size: 15px;
   cursor: pointer;
+  /* SPEC-013 §4.6: a short opacity settle on mount (stable key => no
+     re-trigger). Deliberately no exit animation and no scale. */
+  animation: voice-member-in 0.14s ease-out;
+}
+@keyframes voice-member-in {
+  from { opacity: 0; transform: translateY(-2px); }
+  to   { opacity: 1; transform: none; }
 }
 .voice-member:hover {
   background: var(--bg-hover);

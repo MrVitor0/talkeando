@@ -25,4 +25,20 @@ internal static class DebugLog
     {
         try { File.AppendAllText(Path, $"{DateTime.Now:HH:mm:ss.fff} {message}\n"); } catch { /* best effort */ }
     }
+
+    /// The last `count` lines of the log file, oldest first. Empty when the
+    /// file does not exist. Attached to a diagnostics report (SPEC-014).
+    public static string[] Tail(int count)
+    {
+        try
+        {
+            if (!File.Exists(Path)) return System.Array.Empty<string>();
+            var lines = File.ReadAllLines(Path);
+            return count >= lines.Length ? lines : lines[^count..];
+        }
+        catch
+        {
+            return System.Array.Empty<string>();
+        }
+    }
 }

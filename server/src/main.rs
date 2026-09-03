@@ -170,6 +170,25 @@ fn spawn_attachment_cleanup(state: AppState) {
                     Err(error) => tracing::warn!(%id, %error, "failed to delete orphaned attachment row"),
                 }
             }
+
+            // SPEC-014: prune client diagnostics reports older than 7 days.
+            let logs_dir = std::path::Path::new(&state.config.attachment_storage_path).join("_client_logs");
+            if let Ok(mut entries) = tokio::fs::read_dir(&logs_dir).await {
+                let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(7 * 24 * 60 * 60);
+                while let Ok(Some(entry)) = entries.next_entry().await {
+                    let too_old = entry
+                        .metadata()
+                        .await
+                        .ok()
+                        .and_then(|m| m.modified().ok())
+                        .is_some_and(|modified| modified < cutoff);
+                    if too_old {
+                        if let Err(error) = tokio::fs::remove_file(entry.path()).await {
+                            tracing::warn!(%error, path = ?entry.path(), "failed to remove old client log");
+                        }
+                    }
+                }
+            }
         }
     });
 }

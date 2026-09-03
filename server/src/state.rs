@@ -36,6 +36,9 @@ pub struct AppState {
     /// Channels that need confirming against LiveKit, with the instant they
     /// become due. Drained by the 1 s tick in `main.rs` (SPEC-004).
     pub pending_reconcile: Arc<Mutex<HashMap<Uuid, Instant>>>,
+    /// Last time each user uploaded a client diagnostics report (SPEC-014).
+    /// One per 60 s.
+    pub last_client_log: Arc<Mutex<HashMap<Uuid, Instant>>>,
     /// `channel_id -> (community_id, fetched_at)`. Channels almost never move
     /// communities; a 5 min TTL removes a Postgres query per roster event.
     pub channel_community_cache: Arc<Mutex<HashMap<Uuid, (Uuid, Instant)>>>,
@@ -63,6 +66,7 @@ impl AppState {
             started_at: Instant::now(),
             last_debug_live: Arc::new(Mutex::new(None)),
             pending_reconcile: Arc::new(Mutex::new(HashMap::new())),
+            last_client_log: Arc::new(Mutex::new(HashMap::new())),
             channel_community_cache: Arc::new(Mutex::new(HashMap::new())),
             community_members_cache: Arc::new(Mutex::new(HashMap::new())),
             room_request_limiter: Arc::new(Mutex::new(HashMap::new())),
@@ -190,6 +194,19 @@ impl AppState {
         } else {
             false
         }
+    }
+
+    /// Returns true (and stamps "now") when this user has not uploaded a
+    /// diagnostics report in the last 60 s (SPEC-014).
+    pub async fn allow_client_log(&self, user_id: Uuid) -> bool {
+        const MIN_INTERVAL: Duration = Duration::from_secs(60);
+        let mut guard = self.last_client_log.lock().await;
+        let now = Instant::now();
+        if guard.get(&user_id).is_some_and(|last| now.duration_since(*last) < MIN_INTERVAL) {
+            return false;
+        }
+        guard.insert(user_id, now);
+        true
     }
 
     /// Fixed-window brute-force guard on login attempts, keyed by
