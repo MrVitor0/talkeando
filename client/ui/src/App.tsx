@@ -1,6 +1,8 @@
 import { FormEvent, KeyboardEvent as ReactKeyboardEvent, MouseEvent as ReactMouseEvent, RefObject, useEffect, useMemo, useRef, useState } from "react";
 import { send, subscribe } from "./ipc";
 import * as rtc from "./rtc";
+import { setServerInfo } from "./serverInfo";
+import { subscribeVoice, roomRoster, roomStreams, sessionParticipants } from "./voiceStore";
 import { playSound, setSoundsMuted } from "./sounds";
 import { Icon, IconName } from "./Icon";
 import { HashIcon, SearchIcon, PencilIcon, TrashIcon, CrownIcon, FullscreenIcon, ContractIcon, PipIcon, DotsIcon, TheaterIcon, MusicNoteIcon } from "./Glyphs";
@@ -100,6 +102,17 @@ type ActivityDto = {
 /* ------------------------------------------------------------------ */
 /* small presentational helpers                                        */
 /* ------------------------------------------------------------------ */
+
+/** Maps a join failure to a short Portuguese phrase instead of leaking the
+ *  SDK's `error.message` (SPEC-007 §4.5). */
+function friendlyJoinError(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  if (/token/i.test(message) && /timeout/i.test(message)) return "o servidor demorou para responder";
+  if (/channel_full|já está cheio/i.test(message)) return "este canal já está cheio";
+  if (/permission|NotAllowed/i.test(message)) return "o microfone não foi liberado";
+  if (/network|ServerUnreachable|unreachable/i.test(message)) return "não foi possível alcançar o servidor de voz";
+  return "erro de conexão";
+}
 
 function initials(name: string) {
   const parts = name.trim().split(/\s+/).filter(Boolean);
@@ -1251,6 +1264,7 @@ export function App() {
   useEffect(() => {
     const unsubscribe = subscribe(event => {
       if (event.op === "auth.state_changed") { setAuthenticated(event.data.state === "authenticated"); setAuthResolved(true); }
+      if (event.op === "auth.ok") setServerInfo(event.data ?? {});
       if (event.op === "app.bootstrap") {
         setAuthResolved(true);
         setAuthenticated(true); setChannels(event.data.channels ?? []); setCategories(event.data.categories ?? []); setMembers(event.data.members ?? []);
@@ -1342,7 +1356,10 @@ export function App() {
         else next[event.data.user_id] = list;
         return next;
       });
-      if (event.op === "call.state.update") setCall(current => !current || current.channelId !== event.data.channel_id ? current : { channelId: current.channelId, participants: current.participants.map(participant => participant.user_id === event.data.user_id ? { ...participant, muted: event.data.muted, deafened: event.data.deafened } : participant) });
+      // Roster, session participants and mute/deafen now live in `voiceStore`
+      // (SPEC-008); the `call.state.update` / `voice.rooms` / `voice.roster`
+      // handlers moved there. The bridge effect below mirrors the store into
+      // the `call` / `voiceRooms` / `voiceRoomStreams` / `streams` state.
       // The owner dragged us (or we dragged ourselves) into another voice
       // channel — join it, reusing the normal join path.
       if (event.op === "voice.moved") {
@@ -1355,36 +1372,6 @@ export function App() {
       // The owner kicked us out of the voice channel — tear our call down.
       if (event.op === "voice.disconnected") {
         leaveCall();
-      }
-      if (event.op === "voice.rooms") {
-        const rooms: Array<{ channel_id: string; participants: VoiceRosterEntry[]; streams?: StreamInfo[] }> = event.data.rooms ?? [];
-        setVoiceRooms(Object.fromEntries(rooms.map(room => [room.channel_id, room.participants])));
-        setVoiceRoomStreams(Object.fromEntries(rooms.map(room => [room.channel_id, room.streams ?? []])));
-      }
-      if (event.op === "voice.roster") {
-        const { channel_id, participants, streams: roomStreams } = event.data as { channel_id: string; participants: VoiceRosterEntry[]; streams?: StreamInfo[] };
-        setVoiceRooms(current => {
-          const botWasHere = (current[channel_id] ?? []).some(entry => entry.user_id === MUSIC_BOT_ID);
-          const botIsHere = (participants ?? []).some(entry => entry.user_id === MUSIC_BOT_ID);
-          // The bot's entrance is a real call event. Play it only for people
-          // already in this channel, never while receiving the initial rooms
-          // snapshot after opening the app.
-          if (channel_id === callChannelIdRef.current && !botWasHere && botIsHere) playSound("joinCall");
-          if (channel_id === callChannelIdRef.current && botWasHere && !botIsHere) playSound("leaveCall");
-          const next = { ...current };
-          if (!participants || participants.length === 0) delete next[channel_id];
-          else next[channel_id] = participants;
-          return next;
-        });
-        setVoiceRoomStreams(current => ({ ...current, [channel_id]: roomStreams ?? [] }));
-        if (channel_id === callChannelIdRef.current) {
-          setCall({ channelId: channel_id, participants: participants ?? [] });
-          setStreams(roomStreams ?? []);
-        }
-        // If the share we're peeking just disappeared, drop the preview.
-        if (peekMetaRef.current && (roomStreams ?? []).every(s => s.stream_id !== peekMetaRef.current!.streamId)) {
-          endPeek();
-        }
       }
       // The music bot's status cards now arrive as ordinary persisted messages
       // (`chat.message.created` with a `music_status` payload) and load with
@@ -1783,7 +1770,7 @@ export function App() {
   useEffect(() => { void rtc.listCameras().then(setCameras); }, []);
 
   useEffect(() => rtc.onSpeaking(setSpeakingUsers), []);
-  useEffect(() => rtc.onCallDisconnected(() => {
+  useEffect(() => rtc.onCallDisconnected((reason: rtc.EndReason) => {
     callChannelIdRef.current = null;
     musicStreamRef.current = null;
     setVoiceConnState("disconnected");
@@ -1795,9 +1782,60 @@ export function App() {
     setSelfCameraStream(null);
     setWatching({});
     setRemoteVideos({});
-    setError("A conexão de voz foi encerrada. Entre novamente no canal.");
+    // Only surface a banner for reasons the user actually needs to act on.
+    const messages: Record<rtc.EndReason, string | null> = {
+      server_shutdown: "O servidor de voz reiniciou. Entre novamente no canal.",
+      duplicate_identity: "Sua conta entrou nesta call em outro dispositivo.",
+      participant_removed: null, // voice.disconnected already carries the message
+      room_deleted: null,
+      signal_close: "A conexão de voz caiu. Entre novamente no canal.",
+      unknown: "A conexão de voz foi encerrada. Entre novamente no canal.",
+    };
+    const message = messages[reason];
+    if (message) setError(message);
   }), []);
   useEffect(() => rtc.onMediaError(message => setError(message)), []);
+
+  // SPEC-008: the single voice-state bridge. `voiceStore` owns the IPC listener
+  // (mounted once) and applies snapshots/deltas with version-gap detection; this
+  // mirrors its output into the render state the tree already consumes. The
+  // session participants come from the LiveKit Room, so a server ghost is
+  // impossible (INV-C1).
+  const prevVoiceRoomsRef = useRef<Record<string, VoiceRosterEntry[]>>({});
+  useEffect(() => subscribeVoice(voice => {
+    const rooms: Record<string, VoiceRosterEntry[]> = {};
+    const streamsByRoom: Record<string, StreamInfo[]> = {};
+    for (const [id, projection] of Object.entries(voice.rooms)) {
+      rooms[id] = roomRoster(projection) as VoiceRosterEntry[];
+      streamsByRoom[id] = roomStreams(projection) as StreamInfo[];
+    }
+
+    // The bot's arrival/departure in our own channel is a real call event.
+    const here = callChannelIdRef.current;
+    if (here) {
+      const botWas = (prevVoiceRoomsRef.current[here] ?? []).some(e => e.user_id === MUSIC_BOT_ID);
+      const botIs = (rooms[here] ?? []).some(e => e.user_id === MUSIC_BOT_ID);
+      if (!botWas && botIs) playSound("joinCall");
+      if (botWas && !botIs) playSound("leaveCall");
+    }
+    prevVoiceRoomsRef.current = rooms;
+
+    setVoiceRooms(rooms);
+    setVoiceRoomStreams(streamsByRoom);
+
+    const sessionChannel = voice.session.channelId;
+    if (sessionChannel) {
+      setCall({ channelId: sessionChannel, participants: sessionParticipants(voice.session) as Participant[] });
+      setStreams(streamsByRoom[sessionChannel] ?? []);
+    }
+
+    // Drop a hover preview whose share just vanished.
+    const peek = peekMetaRef.current;
+    if (peek) {
+      const list = peek.channelId === sessionChannel ? (streamsByRoom[sessionChannel] ?? []) : (streamsByRoom[peek.channelId] ?? []);
+      if (list.every(s => s.stream_id !== peek.streamId)) endPeek();
+    }
+  }), []);
 
   useEffect(() => { setSoundsMuted(deafened); }, [deafened]);
   useEffect(() => rtc.onAudioPipelineStatus(status => {
@@ -2175,13 +2213,13 @@ export function App() {
         setVoiceConnState("connected");
       })
       .catch(error => {
-        if (error instanceof Error && error.name === "AbortError") return;
+        if (error instanceof Error && error.name === "AbortError") return; // INV-C4
         voiceConnTimers.current.forEach(id => window.clearTimeout(id));
         voiceConnTimers.current = [];
         setVoiceConnState("disconnected");
         setCall(current => current?.channelId === channel.id ? null : current);
         console.error("[ui] LiveKit voice connection failed", error);
-        setError(`Não foi possível conectar o áudio: ${error instanceof Error ? error.message : "erro desconhecido"}`);
+        setError(`Não foi possível conectar o áudio: ${friendlyJoinError(error)}`);
       });
   }
   function leaveCall() {

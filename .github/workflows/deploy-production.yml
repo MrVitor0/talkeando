@@ -21,7 +21,7 @@ permissions:
 
 jobs:
   validate:
-    name: Test server and music bot
+    name: Test server, web UI and music bot
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -44,6 +44,10 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 20
+          cache: npm
+          cache-dependency-path: |
+            music-bot/package-lock.json
+            client/ui/package-lock.json
 
       - name: Install music bot dependencies
         working-directory: music-bot
@@ -52,6 +56,15 @@ jobs:
       - name: Test music bot
         working-directory: music-bot
         run: npm test
+
+      # SPEC-006 §4.5: client/ui was only built at release time, so a type
+      # error in the UI surfaced late. Specs 007–014 touch it heavily.
+      - name: Build and test web UI
+        working-directory: client/ui
+        run: |
+          npm ci
+          npm run build
+          npm test
 
       - uses: dtolnay/rust-toolchain@stable
 

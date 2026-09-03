@@ -666,13 +666,14 @@ async fn v1_client_receives_voice_rooms_and_roster() {
     app.send_webhook(wh("participant_joined", channel,
         serde_json::json!({ "participant": { "identity": bootstrap.owner_id.to_string(), "sid": "PA_1" } }))).await;
 
-    let env = ws
-        .recv_matching_pub(std::time::Duration::from_secs(3), |e| {
-            e["op"] == "voice.roster" || e["op"] == "voice.room.delta"
-        })
-        .await
-        .expect("some voice op");
-    assert_eq!(env["op"], "voice.roster", "v1 must not get a delta");
+    assert!(
+        ws.recv_matching_op("voice.roster", |d| d["channel_id"] == channel.to_string().as_str(), std::time::Duration::from_secs(3)).await.is_some(),
+        "v1 must receive voice.roster"
+    );
+    assert!(
+        ws.expect_no_op("voice.room.delta", std::time::Duration::from_millis(500)).await,
+        "v1 must NOT receive voice.room.delta"
+    );
 }
 
 /// I-14 — a v2 connection gets `voice.room.delta` and never `voice.roster`.
@@ -693,16 +694,17 @@ async fn v2_client_receives_only_v2_room_ops() {
     app.send_webhook(wh("participant_joined", channel,
         serde_json::json!({ "participant": { "identity": bootstrap.owner_id.to_string(), "sid": "PA_1" } }))).await;
 
-    let env = ws
-        .recv_matching_pub(std::time::Duration::from_secs(3), |e| {
-            e["op"] == "voice.roster" || e["op"] == "voice.room.delta"
-        })
+    let delta = ws
+        .recv_matching_op("voice.room.delta", |d| d["channel_id"] == channel.to_string().as_str(), std::time::Duration::from_secs(3))
         .await
-        .expect("some voice op");
-    assert_eq!(env["op"], "voice.room.delta", "v2 must not get a v1 roster");
-    assert_eq!(env["data"]["reason"], "webhook.participant_joined");
-    assert_eq!(env["data"]["previous_version"], 0);
-    assert_eq!(env["data"]["version"], 1);
+        .expect("v2 must receive voice.room.delta");
+    assert_eq!(delta["reason"], "webhook.participant_joined");
+    assert_eq!(delta["previous_version"], 0);
+    assert_eq!(delta["version"], 1);
+    assert!(
+        ws.expect_no_op("voice.roster", std::time::Duration::from_millis(500)).await,
+        "v2 must NOT receive a v1 voice.roster"
+    );
 }
 
 /// I-16 — `voice.track.hint unpublished` from a non-owner is rejected and the
@@ -797,6 +799,138 @@ async fn protocol_v2_flag_off_forces_v1() {
     .await;
     assert_eq!(ws.auth_ok["protocol_version"], 1);
     assert_eq!(ws.auth_ok["features"], serde_json::json!([]));
+
+    app.teardown().await;
+}
+
+// ---- SPEC-006: remaining integration coverage ----
+
+/// I-12 — a `voice.room.request` returns a `full: true` snapshot.
+#[tokio::test]
+async fn version_gap_request_returns_full_snapshot() {
+    let app = TestApp::spawn().await;
+    let bootstrap = app.bootstrap().await;
+    let channel = bootstrap.voice_channel_id;
+    let mut ws = WsClient::connect_and_authenticate_with(
+        &app.ws_url,
+        &bootstrap.owner_token,
+        serde_json::json!({ "protocol_version": 2 }),
+    )
+    .await;
+
+    app.webhook_participant_joined(channel, bootstrap.owner_id, "PA_1").await;
+    let _ = ws.recv_op("voice.room.delta").await;
+
+    ws.send("voice.room.request", serde_json::json!({ "channel_ids": [channel] })).await;
+    let state = ws.recv_op("voice.room.state").await.expect("a voice.room.state");
+    assert_eq!(state["full"], true);
+    let room = state["rooms"].as_array().unwrap().iter()
+        .find(|r| r["channel_id"] == channel.to_string().as_str())
+        .expect("the requested channel in the snapshot");
+    assert_eq!(room["version"], 1);
+    assert_eq!(room["participants"][0]["participant_sid"], "PA_1");
+
+    app.teardown().await;
+}
+
+/// I-19 — `voice.disconnect_member` calls LiveKit's RemoveParticipant and does
+/// NOT evict the registry locally; the webhook is what removes the row.
+#[tokio::test]
+async fn disconnect_member_calls_remove_participant_and_waits_for_webhook() {
+    let (app, fake) = TestApp::spawn_with_fake_livekit().await;
+    let bootstrap = app.bootstrap().await;
+    let channel = bootstrap.voice_channel_id;
+    let owner = bootstrap.owner_id;
+    let (b_token, b) = app.register_member(bootstrap.community_id, "bee").await;
+    let _b_ws = WsClient::connect_and_authenticate(&app.ws_url, &b_token).await;
+    let mut owner_ws = WsClient::connect_and_authenticate(&app.ws_url, &bootstrap.owner_token).await;
+
+    fake.set_room(channel.to_string(), vec![
+        FakeParticipant::new(owner, "PA_o"),
+        FakeParticipant::new(b, "PA_b"),
+    ]).await;
+    app.webhook_participant_joined(channel, owner, "PA_o").await;
+    app.webhook_participant_joined(channel, b, "PA_b").await;
+
+    owner_ws.send("voice.disconnect_member", serde_json::json!({ "user_id": b, "channel_id": channel })).await;
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+
+    // The server asked LiveKit to remove B...
+    assert!(
+        fake.removed().await.iter().any(|(r, id)| r == &channel.to_string() && id == &b.to_string()),
+        "RemoveParticipant was not called for B"
+    );
+    // ...but did not evict B from the registry itself.
+    assert!(app.state.hub.voice.read().await.is_participant(channel, b), "B was evicted locally, not by LiveKit");
+
+    // The webhook is the authority that removes B.
+    app.webhook_participant_left(channel, b, "PA_b").await;
+    assert!(!app.state.hub.voice.read().await.is_participant(channel, b));
+
+    app.teardown().await;
+}
+
+/// I-20 — `voice.move_member` schedules a reconcile of both the source and
+/// destination channels.
+#[tokio::test]
+async fn move_member_schedules_reconcile_of_both_channels() {
+    let app = TestApp::spawn().await;
+    let bootstrap = app.bootstrap().await;
+    let source = bootstrap.voice_channel_id;
+    let owner = bootstrap.owner_id;
+
+    // A second voice channel to move into.
+    let dest: (Uuid,) = sqlx::query_as(
+        "INSERT INTO channels (community_id, name, kind, position) VALUES ($1, 'voice-2', 'voice', 2) RETURNING id",
+    )
+    .bind(bootstrap.community_id)
+    .fetch_one(&app.pool)
+    .await
+    .unwrap();
+    let dest = dest.0;
+
+    let (b_token, b) = app.register_member(bootstrap.community_id, "bee").await;
+    let mut b_ws = WsClient::connect_and_authenticate(&app.ws_url, &b_token).await;
+    let mut owner_ws = WsClient::connect_and_authenticate(&app.ws_url, &bootstrap.owner_token).await;
+    let _ = owner; // owner acts as the mover
+
+    // B is sitting in `source`.
+    b_ws.send("voice.presence.enter", serde_json::json!({ "channel_id": source })).await;
+    let _ = b_ws.recv_op("voice.roster").await;
+
+    owner_ws.send("voice.move_member", serde_json::json!({ "user_id": b, "channel_id": dest })).await;
+    let moved = b_ws.recv_op("voice.moved").await.expect("B is told to move");
+    assert_eq!(moved["channel_id"], dest.to_string());
+
+    let due = app.state.take_due_reconciles().await;
+    assert!(due.contains(&source), "source channel not scheduled: {due:?}");
+    assert!(due.contains(&dest), "dest channel not scheduled: {due:?}");
+
+    app.teardown().await;
+}
+
+/// Reconcile degrades gracefully when LiveKit is unreachable — the registry is
+/// left intact, and `reconciles_failed` is bumped.
+#[tokio::test]
+async fn reconcile_survives_livekit_failure_without_dropping_state() {
+    let (app, fake) = TestApp::spawn_with_fake_livekit().await;
+    let bootstrap = app.bootstrap().await;
+    let channel = bootstrap.voice_channel_id;
+    let a = Uuid::new_v4();
+
+    fake.set_room(channel.to_string(), vec![FakeParticipant::new(a, "PA_a")]).await;
+    app.force_reconcile().await;
+    assert_eq!(app.voice_snapshot(channel).await.unwrap()["participants"].as_array().unwrap().len(), 1);
+
+    fake.set_failing(true).await;
+    app.force_reconcile().await;
+
+    // Still there — a failed reconcile must never wipe.
+    assert_eq!(
+        app.voice_snapshot(channel).await.unwrap()["participants"].as_array().unwrap().len(),
+        1,
+        "a failed reconcile dropped state"
+    );
 
     app.teardown().await;
 }

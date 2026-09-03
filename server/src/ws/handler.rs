@@ -711,8 +711,7 @@ async fn handle_music_command(state: &AppState, user_id: Uuid, data: MusicComman
         state.hub.send_to(user_id, OutboundEnvelope::error("validation_error", "comando de música desconhecido", None)).await;
         return;
     }
-    let participants = state.hub.calls.read().await.participant_ids(data.voice_channel_id);
-    if !participants.contains(&user_id) {
+    if !state.hub.voice.read().await.is_participant(data.voice_channel_id, user_id) {
         state.hub.send_to(user_id, OutboundEnvelope::error("forbidden", "entre no canal de voz antes de controlar o bot", None)).await;
         return;
     }
@@ -1773,11 +1772,12 @@ async fn handle_voice_move_member(state: &AppState, actor_id: Uuid, data: VoiceM
 
     // Target must be online and already sitting in some voice call — dragging
     // is for relocating an occupant, not pulling someone into voice cold.
-    let in_a_call = {
-        let calls = state.hub.calls.read().await;
-        calls.calls.values().any(|call| call.participants.contains_key(&data.user_id))
+    let source_channel = state.hub.voice.read().await.channel_of(data.user_id);
+    let Some(source_channel) = source_channel else {
+        state.hub.send_to(actor_id, OutboundEnvelope::error("validation_error", "that member is not in a voice channel", None)).await;
+        return;
     };
-    if !state.hub.is_online(data.user_id).await || !in_a_call {
+    if !state.hub.is_online(data.user_id).await {
         state.hub.send_to(actor_id, OutboundEnvelope::error("validation_error", "that member is not in a voice channel", None)).await;
         return;
     }
@@ -1785,7 +1785,11 @@ async fn handle_voice_move_member(state: &AppState, actor_id: Uuid, data: VoiceM
     state.hub.send_to(data.user_id, OutboundEnvelope::new(
         "voice.moved", VoiceMoved { channel_id: data.channel_id, moved_by: actor_id },
     )).await;
-    tracing::info!(%actor_id, target = %data.user_id, channel_id = %data.channel_id, "voice.move_member");
+    // The target's own client performs the join/leave; confirm both ends
+    // against LiveKit shortly after (I-20).
+    state.schedule_reconcile(source_channel, Duration::from_secs(2)).await;
+    state.schedule_reconcile(data.channel_id, Duration::from_secs(2)).await;
+    tracing::info!(%actor_id, target = %data.user_id, from = %source_channel, to = %data.channel_id, "voice.move_member");
 }
 
 /// Kick a member out of a voice channel. Humans: community-owner only. The
@@ -1812,7 +1816,7 @@ async fn handle_voice_disconnect_member(state: &AppState, actor_id: Uuid, data: 
         return;
     }
 
-    if !state.hub.calls.read().await.is_participant(data.channel_id, data.user_id) {
+    if !state.hub.voice.read().await.is_participant(data.channel_id, data.user_id) {
         state.hub.send_to(actor_id, OutboundEnvelope::error("validation_error", "that member is not in this voice channel", None)).await;
         return;
     }

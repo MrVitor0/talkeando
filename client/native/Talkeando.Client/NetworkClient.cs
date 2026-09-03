@@ -23,10 +23,9 @@ public sealed class NetworkClient
     private const int ProfileImageMaxPixels = 256;
     /// Signaling-protocol version this build understands. Bump only alongside a
     /// change in tupi-v2-refactor/05-protocol-spec.md. The UI learns the
-    /// version actually negotiated from `auth.ok`. Stays at 1 until SPEC-008,
-    /// which is when the client actually speaks the v2 ops — announcing 2
-    /// earlier would make the server send ops this build would ignore.
-    private const int ClientProtocolVersion = 1;
+    /// version actually negotiated from `auth.ok`. Promoted to 2 in SPEC-008:
+    /// the UI's `voiceStore` now speaks the v2 `voice.room.*` dialect.
+    private const int ClientProtocolVersion = 2;
     private static readonly TimeSpan WebSocketSendTimeout = TimeSpan.FromSeconds(6);
     private readonly SessionStore _sessions;
     private readonly HttpClient _http;

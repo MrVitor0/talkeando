@@ -148,6 +148,60 @@ impl TestApp {
             .status()
     }
 
+    // ---- webhook shortcuts (SPEC-006 §4.2) ----
+
+    async fn webhook(&self, event: &str, room: Uuid, extra: serde_json::Value) -> reqwest::StatusCode {
+        let mut body = serde_json::json!({
+            "event": event,
+            "id": Uuid::new_v4().to_string(),
+            "createdAt": chrono::Utc::now().timestamp(),
+            "room": { "name": room.to_string() },
+        });
+        let obj = body.as_object_mut().unwrap();
+        for (k, v) in extra.as_object().unwrap() {
+            obj.insert(k.clone(), v.clone());
+        }
+        self.send_webhook(body).await
+    }
+
+    pub async fn webhook_participant_joined(&self, room: Uuid, user: Uuid, sid: &str) -> reqwest::StatusCode {
+        self.webhook("participant_joined", room, serde_json::json!({ "participant": { "identity": user.to_string(), "sid": sid } })).await
+    }
+    pub async fn webhook_participant_left(&self, room: Uuid, user: Uuid, sid: &str) -> reqwest::StatusCode {
+        self.webhook("participant_left", room, serde_json::json!({ "participant": { "identity": user.to_string(), "sid": sid } })).await
+    }
+    pub async fn webhook_track_published(&self, room: Uuid, user: Uuid, psid: &str, tsid: &str, source: &str) -> reqwest::StatusCode {
+        self.webhook("track_published", room, serde_json::json!({
+            "participant": { "identity": user.to_string(), "sid": psid },
+            "track": { "sid": tsid, "source": source, "muted": false },
+        })).await
+    }
+    pub async fn webhook_track_unpublished(&self, room: Uuid, user: Uuid, psid: &str, tsid: &str, source: &str) -> reqwest::StatusCode {
+        self.webhook("track_unpublished", room, serde_json::json!({
+            "participant": { "identity": user.to_string(), "sid": psid },
+            "track": { "sid": tsid, "source": source, "muted": false },
+        })).await
+    }
+    pub async fn webhook_room_finished(&self, room: Uuid) -> reqwest::StatusCode {
+        self.webhook("room_finished", room, serde_json::json!({})).await
+    }
+
+    /// Runs a full reconcile now, then drains and runs any directed reconciles
+    /// that came due — the work the 1 s `main.rs` tick would have done.
+    pub async fn force_reconcile(&self) {
+        tupi_server::ws::handler::reconcile_voice_rooms(&self.state).await;
+        for channel_id in self.state.take_due_reconciles().await {
+            tupi_server::ws::handler::reconcile_one_room(&self.state, channel_id).await;
+        }
+    }
+
+    /// The v2 registry's view of one channel, as JSON — without going through
+    /// the HTTP endpoint.
+    pub async fn voice_snapshot(&self, channel_id: Uuid) -> Option<serde_json::Value> {
+        let voice = self.state.hub.voice.read().await;
+        voice.room(channel_id).map(|room| serde_json::to_value(room.to_dto(channel_id)).unwrap())
+    }
+
     /// Best-effort cleanup. Call at the end of a test; a panic before this
     /// runs just leaves a small, harmlessly-named test database and temp
     /// dir behind (acceptable at this project's scale — see
@@ -373,6 +427,29 @@ impl WsClient {
         self.recv_matching(timeout, predicate).await
     }
 
+    /// Waits for an envelope with `op` whose `data` satisfies `predicate`.
+    pub async fn recv_matching_op(
+        &mut self,
+        op: &str,
+        predicate: impl Fn(&serde_json::Value) -> bool,
+        timeout: std::time::Duration,
+    ) -> Option<serde_json::Value> {
+        let op = op.to_string();
+        self.recv_matching(timeout, move |env| env["op"] == op.as_str() && predicate(&env["data"]))
+            .await
+            .map(|env| env["data"].clone())
+    }
+
+    /// Returns `true` iff `op` does NOT arrive within `within`. Essential for
+    /// I-13 / I-14 (a v1 conn must never receive `voice.room.delta`, and vice
+    /// versa).
+    pub async fn expect_no_op(&mut self, op: &str, within: std::time::Duration) -> bool {
+        let op = op.to_string();
+        self.recv_matching(within, move |env| env["op"] == op.as_str())
+            .await
+            .is_none()
+    }
+
     /// Reads envelopes (discarding non-matching ones, e.g. an unrelated
     /// presence.snapshot) until `predicate` matches the full envelope, or
     /// `timeout` elapses. Returns the whole envelope (not just `data`) so
@@ -431,18 +508,20 @@ fn sign_hs256(claims: &serde_json::Value, secret: &str) -> String {
 }
 
 /// One participant as the fake LiveKit should report them.
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct FakeParticipant {
     pub identity: String,
     pub sid: String,
     pub hidden: bool,
+    /// `None` reports as `"ACTIVE"`; set `"DISCONNECTED"` to exercise the filter.
+    pub state: Option<String>,
     /// `(track_sid, LiveKit source, muted)` — source e.g. `"SCREEN_SHARE"`.
     pub tracks: Vec<(String, String, bool)>,
 }
 
 impl FakeParticipant {
     pub fn new(identity: uuid::Uuid, sid: &str) -> Self {
-        Self { identity: identity.to_string(), sid: sid.to_string(), hidden: false, tracks: Vec::new() }
+        Self { identity: identity.to_string(), sid: sid.to_string(), ..Default::default() }
     }
     pub fn hidden(mut self) -> Self {
         self.hidden = true;
@@ -456,70 +535,100 @@ impl FakeParticipant {
 
 type FakeRooms = std::collections::HashMap<String, Vec<FakeParticipant>>;
 
-/// A local HTTP server that answers the two LiveKit RoomService endpoints the
-/// reconcile path calls, from state the test mutates via `set_room`.
+#[derive(Default)]
+struct FakeState {
+    rooms: FakeRooms,
+    failing: bool,
+    /// `room -> ListParticipants call count`.
+    list_calls: std::collections::HashMap<String, usize>,
+    /// `(room, identity)` pairs passed to RemoveParticipant.
+    removed: Vec<(String, String)>,
+}
+
+/// A local HTTP server standing in for `livekit-server` in integration tests.
+/// Implements `ListRooms`, `ListParticipants` and `RemoveParticipant` — all the
+/// reconcile / kick paths touch — from state the test mutates.
 pub struct FakeLiveKit {
     base_url: String,
-    rooms: std::sync::Arc<tokio::sync::Mutex<FakeRooms>>,
+    state: std::sync::Arc<tokio::sync::Mutex<FakeState>>,
 }
 
 impl FakeLiveKit {
     async fn start() -> Self {
-        use axum::{routing::post, Json, Router};
-        let rooms: std::sync::Arc<tokio::sync::Mutex<FakeRooms>> = Default::default();
+        use axum::{extract::State, http::StatusCode, response::IntoResponse, routing::post, Json, Router};
 
-        let list_rooms_rooms = rooms.clone();
-        let list_participants_rooms = rooms.clone();
+        let state: std::sync::Arc<tokio::sync::Mutex<FakeState>> = Default::default();
+
+        async fn list_rooms(State(state): State<std::sync::Arc<tokio::sync::Mutex<FakeState>>>) -> axum::response::Response {
+            let guard = state.lock().await;
+            if guard.failing {
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+            let names: Vec<_> = guard
+                .rooms
+                .iter()
+                .filter(|(_, p)| !p.is_empty())
+                .map(|(name, _)| serde_json::json!({ "name": name, "sid": format!("RM_{name}") }))
+                .collect();
+            Json(serde_json::json!({ "rooms": names })).into_response()
+        }
+
+        async fn list_participants(
+            State(state): State<std::sync::Arc<tokio::sync::Mutex<FakeState>>>,
+            Json(body): Json<serde_json::Value>,
+        ) -> axum::response::Response {
+            let room = body["room"].as_str().unwrap_or_default().to_string();
+            let mut guard = state.lock().await;
+            *guard.list_calls.entry(room.clone()).or_insert(0) += 1;
+            if guard.failing {
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+            let participants: Vec<_> = guard
+                .rooms
+                .get(&room)
+                .into_iter()
+                .flatten()
+                .map(|p| {
+                    serde_json::json!({
+                        "identity": p.identity,
+                        "sid": p.sid,
+                        "state": p.state.clone().unwrap_or_else(|| "ACTIVE".into()),
+                        "permission": { "hidden": p.hidden, "canPublish": true },
+                        "tracks": p.tracks.iter().map(|(sid, source, muted)| serde_json::json!({
+                            "sid": sid, "source": source, "muted": muted,
+                        })).collect::<Vec<_>>(),
+                    })
+                })
+                .collect();
+            Json(serde_json::json!({ "participants": participants })).into_response()
+        }
+
+        async fn remove_participant(
+            State(state): State<std::sync::Arc<tokio::sync::Mutex<FakeState>>>,
+            Json(body): Json<serde_json::Value>,
+        ) -> axum::response::Response {
+            let room = body["room"].as_str().unwrap_or_default().to_string();
+            let identity = body["identity"].as_str().unwrap_or_default().to_string();
+            let mut guard = state.lock().await;
+            guard.removed.push((room.clone(), identity.clone()));
+            if let Some(list) = guard.rooms.get_mut(&room) {
+                list.retain(|p| p.identity != identity);
+            }
+            Json(serde_json::json!({})).into_response()
+        }
+
         let router = Router::new()
-            .route(
-                "/twirp/livekit.RoomService/ListRooms",
-                post(move || {
-                    let rooms = list_rooms_rooms.clone();
-                    async move {
-                        let guard = rooms.lock().await;
-                        let names: Vec<_> = guard
-                            .iter()
-                            .filter(|(_, p)| !p.is_empty())
-                            .map(|(name, _)| serde_json::json!({ "name": name }))
-                            .collect();
-                        Json(serde_json::json!({ "rooms": names }))
-                    }
-                }),
-            )
-            .route(
-                "/twirp/livekit.RoomService/ListParticipants",
-                post(move |Json(body): Json<serde_json::Value>| {
-                    let rooms = list_participants_rooms.clone();
-                    async move {
-                        let room = body["room"].as_str().unwrap_or_default().to_string();
-                        let guard = rooms.lock().await;
-                        let participants: Vec<_> = guard
-                            .get(&room)
-                            .into_iter()
-                            .flatten()
-                            .map(|p| {
-                                serde_json::json!({
-                                    "identity": p.identity,
-                                    "sid": p.sid,
-                                    "state": "ACTIVE",
-                                    "permission": { "hidden": p.hidden, "canPublish": true },
-                                    "tracks": p.tracks.iter().map(|(sid, source, muted)| serde_json::json!({
-                                        "sid": sid, "source": source, "muted": muted,
-                                    })).collect::<Vec<_>>(),
-                                })
-                            })
-                            .collect();
-                        Json(serde_json::json!({ "participants": participants }))
-                    }
-                }),
-            );
+            .route("/twirp/livekit.RoomService/ListRooms", post(list_rooms))
+            .route("/twirp/livekit.RoomService/ListParticipants", post(list_participants))
+            .route("/twirp/livekit.RoomService/RemoveParticipant", post(remove_participant))
+            .with_state(state.clone());
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
             axum::serve(listener, router).await.unwrap();
         });
-        Self { base_url: format!("http://{addr}"), rooms }
+        Self { base_url: format!("http://{addr}"), state }
     }
 
     fn base_url(&self) -> String {
@@ -529,6 +638,24 @@ impl FakeLiveKit {
     /// Sets the exact participant list the fake reports for `room` (a channel
     /// UUID string). An empty list makes the room disappear from `ListRooms`.
     pub async fn set_room(&self, room: impl Into<String>, participants: Vec<FakeParticipant>) {
-        self.rooms.lock().await.insert(room.into(), participants);
+        self.state.lock().await.rooms.insert(room.into(), participants);
+    }
+
+    pub async fn clear_room(&self, room: &str) {
+        self.state.lock().await.rooms.remove(room);
+    }
+
+    /// When `true`, every Twirp call answers `500` (degradation testing).
+    pub async fn set_failing(&self, failing: bool) {
+        self.state.lock().await.failing = failing;
+    }
+
+    pub async fn list_participants_calls(&self, room: &str) -> usize {
+        self.state.lock().await.list_calls.get(room).copied().unwrap_or(0)
+    }
+
+    /// `(room, identity)` pairs the server asked to remove.
+    pub async fn removed(&self) -> Vec<(String, String)> {
+        self.state.lock().await.removed.clone()
     }
 }
