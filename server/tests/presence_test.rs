@@ -28,7 +28,7 @@ async fn a_newly_connected_client_sees_who_is_already_online() {
 
 #[tokio::test]
 async fn disconnecting_marks_the_user_offline_only_after_the_grace_period() {
-    let app = TestApp::spawn().await;
+    let app = TestApp::spawn_with_offline_grace(8).await;
     let bootstrap = app.bootstrap().await;
     let (member_token, member_id) = app.register_member(bootstrap.community_id, "flaky_connection").await;
 
@@ -60,7 +60,7 @@ async fn disconnecting_marks_the_user_offline_only_after_the_grace_period() {
 
 #[tokio::test]
 async fn reconnecting_within_the_grace_period_cancels_the_offline_transition() {
-    let app = TestApp::spawn().await;
+    let app = TestApp::spawn_with_offline_grace(8).await;
     let bootstrap = app.bootstrap().await;
     let (member_token, member_id) = app.register_member(bootstrap.community_id, "quick_reconnector").await;
 

@@ -40,14 +40,25 @@ impl TestApp {
 
     /// Spawns with the v2 voice dialect switched off (`TUPI_VOICE_PROTOCOL_V2=false`).
     pub async fn spawn_v1_only() -> Self {
-        Self::spawn_with(None, false).await
+        Self::spawn_with(None, false, 1).await
+    }
+
+    /// Spawns with an explicit WS offline grace. The default harness uses 1 s so
+    /// the voice-reconnect tests stay fast; the presence tests assert against a
+    /// production-like 8 s window and pin it here.
+    pub async fn spawn_with_offline_grace(seconds: u64) -> Self {
+        Self::spawn_with(None, true, seconds).await
     }
 
     async fn spawn_inner(livekit_url_override: Option<String>) -> Self {
-        Self::spawn_with(livekit_url_override, true).await
+        Self::spawn_with(livekit_url_override, true, 1).await
     }
 
-    async fn spawn_with(livekit_url_override: Option<String>, voice_protocol_v2: bool) -> Self {
+    async fn spawn_with(
+        livekit_url_override: Option<String>,
+        voice_protocol_v2: bool,
+        ws_offline_grace_seconds: u64,
+    ) -> Self {
         let admin_url = std::env::var("TEST_DATABASE_ADMIN_URL")
             .unwrap_or_else(|_| "postgres://talkeando:talkeando@localhost:5434/postgres".to_string());
         let admin_pool = PgPoolOptions::new()
@@ -96,7 +107,7 @@ impl TestApp {
             livekit_api_secret: Some("test-livekit-secret".to_string()),
             livekit_token_ttl_seconds: 21_600,
             voice_protocol_v2,
-            ws_offline_grace_seconds: 1,
+            ws_offline_grace_seconds,
         };
 
         let state = AppState::new(pool.clone(), config);
@@ -370,7 +381,12 @@ impl WsClient {
             }
         }
         client.send("auth.hello", hello).await;
-        let ok = client.recv_op("auth.ok").await;
+        // Handshake, not a latency assertion: give it plenty of headroom so the
+        // whole suite running in parallel on a 2-core CI box does not flake here
+        // (the per-op default of 3 s is for the tests' own assertions).
+        let ok = client
+            .recv_op_timeout("auth.ok", std::time::Duration::from_secs(20))
+            .await;
         assert!(ok.is_some(), "expected auth.ok after auth.hello");
         client.auth_ok = ok.unwrap();
         client

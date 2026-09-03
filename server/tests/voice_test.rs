@@ -18,6 +18,30 @@ async fn next_roster(ws: &mut WsClient, channel_id: Uuid) -> serde_json::Value {
         .clone()
 }
 
+/// Like `next_roster`, but skips rosters until one satisfies `pred`. Webhook
+/// events land as separate broadcasts, so a test that cares about the state
+/// *after* a specific event must not grab an earlier one.
+async fn roster_matching(
+    ws: &mut WsClient,
+    channel_id: Uuid,
+    pred: impl Fn(&serde_json::Value) -> bool,
+) -> serde_json::Value {
+    let target = channel_id.to_string();
+    loop {
+        let data = ws
+            .recv_matching_pub(std::time::Duration::from_secs(3), {
+                let target = target.clone();
+                move |env| env["op"] == "voice.roster" && env["data"]["channel_id"] == target.as_str()
+            })
+            .await
+            .expect("expected a voice.roster")["data"]
+            .clone();
+        if pred(&data) {
+            return data;
+        }
+    }
+}
+
 /// GETs `/api/debug/voice` as the owner and returns the parsed body.
 async fn debug_voice(app: &TestApp, owner_token: &str) -> serde_json::Value {
     reqwest::Client::new()
@@ -39,8 +63,9 @@ fn room_in<'a>(body: &'a serde_json::Value, channel_id: Uuid) -> Option<&'a serd
 }
 
 /// A client that sends `auth.hello` with no protocol fields (a v1 client)
-/// negotiates version 1 and gets an empty `features` list, and the handshake
-/// otherwise behaves exactly as before.
+/// negotiates version 1. `features` still advertises the full server capability
+/// set — it describes the server, not the negotiated dialect, and a v1 client
+/// ignores the names it does not know (protocol-spec §1.2).
 #[tokio::test]
 async fn hello_without_protocol_version_negotiates_v1() {
     let app = TestApp::spawn().await;
@@ -48,7 +73,10 @@ async fn hello_without_protocol_version_negotiates_v1() {
     let client = WsClient::connect_and_authenticate(&app.ws_url, &bootstrap.owner_token).await;
 
     assert_eq!(client.auth_ok["protocol_version"], 1);
-    assert_eq!(client.auth_ok["features"], serde_json::json!([]));
+    assert_eq!(
+        client.auth_ok["features"],
+        serde_json::json!(["voice.room.v2", "voice.hints", "client.logs"])
+    );
     assert!(
         client.auth_ok["server_version"].as_str().is_some_and(|v| !v.is_empty()),
         "server_version must be present and non-empty: {:?}",
@@ -56,8 +84,8 @@ async fn hello_without_protocol_version_negotiates_v1() {
     );
 }
 
-/// A client that asks for protocol version 2 gets version 2 back, but still an
-/// empty `features` list in this spec — so it must fall back to the v1 dialect.
+/// A client that asks for protocol version 2 gets version 2 back and the full
+/// feature set, so it uses the v2 dialect.
 #[tokio::test]
 async fn hello_with_v2_negotiates_v2_and_reports_features() {
     let app = TestApp::spawn().await;
@@ -70,7 +98,10 @@ async fn hello_with_v2_negotiates_v2_and_reports_features() {
     .await;
 
     assert_eq!(client.auth_ok["protocol_version"], 2);
-    assert_eq!(client.auth_ok["features"], serde_json::json!([]));
+    assert_eq!(
+        client.auth_ok["features"],
+        serde_json::json!(["voice.room.v2", "voice.hints", "client.logs"])
+    );
 }
 
 /// An absurd requested version is clamped down to the server ceiling, never
@@ -550,7 +581,10 @@ async fn v1_stream_id_is_stable_across_two_broadcasts() {
         "participant": { "identity": user.to_string(), "sid": "PA_1" },
         "track": { "sid": "TR_1", "source": "screen_share", "muted": false },
     }))).await;
-    let first = next_roster(&mut ws, channel).await;
+    let has_screen = |d: &serde_json::Value| {
+        d["streams"].as_array().is_some_and(|s| s.iter().any(|s| s["kind"] == "screen"))
+    };
+    let first = roster_matching(&mut ws, channel, has_screen).await;
     let stream_id_1 = first["streams"].as_array().unwrap().iter()
         .find(|s| s["kind"] == "screen").unwrap()["stream_id"].as_str().unwrap().to_string();
 
@@ -558,7 +592,7 @@ async fn v1_stream_id_is_stable_across_two_broadcasts() {
     app.send_webhook(wh("track_muted", channel, serde_json::json!({
         "track": { "sid": "TR_1", "source": "screen_share", "muted": true },
     }))).await;
-    let second = next_roster(&mut ws, channel).await;
+    let second = roster_matching(&mut ws, channel, has_screen).await;
     let stream_id_2 = second["streams"].as_array().unwrap().iter()
         .find(|s| s["kind"] == "screen").unwrap()["stream_id"].as_str().unwrap().to_string();
 
@@ -689,7 +723,7 @@ async fn v2_client_receives_only_v2_room_ops() {
     )
     .await;
     assert_eq!(ws.auth_ok["protocol_version"], 2);
-    assert_eq!(ws.auth_ok["features"], serde_json::json!(["voice.room.v2", "voice.hints"]));
+    assert_eq!(ws.auth_ok["features"], serde_json::json!(["voice.room.v2", "voice.hints", "client.logs"]));
 
     app.send_webhook(wh("participant_joined", channel,
         serde_json::json!({ "participant": { "identity": bootstrap.owner_id.to_string(), "sid": "PA_1" } }))).await;
@@ -785,8 +819,8 @@ async fn voice_room_request_is_rate_limited() {
     app.teardown().await;
 }
 
-/// §7 — with `TUPI_VOICE_PROTOCOL_V2=false`, nobody negotiates 2 and features
-/// is empty.
+/// §7 — with `TUPI_VOICE_PROTOCOL_V2=false`, nobody negotiates 2 and the voice
+/// features drop out. `client.logs` is independent of the flag and stays.
 #[tokio::test]
 async fn protocol_v2_flag_off_forces_v1() {
     let app = TestApp::spawn_v1_only().await;
@@ -798,7 +832,7 @@ async fn protocol_v2_flag_off_forces_v1() {
     )
     .await;
     assert_eq!(ws.auth_ok["protocol_version"], 1);
-    assert_eq!(ws.auth_ok["features"], serde_json::json!([]));
+    assert_eq!(ws.auth_ok["features"], serde_json::json!(["client.logs"]));
 
     app.teardown().await;
 }
@@ -902,9 +936,11 @@ async fn move_member_schedules_reconcile_of_both_channels() {
     let moved = b_ws.recv_op("voice.moved").await.expect("B is told to move");
     assert_eq!(moved["channel_id"], dest.to_string());
 
-    let due = app.state.take_due_reconciles().await;
-    assert!(due.contains(&source), "source channel not scheduled: {due:?}");
-    assert!(due.contains(&dest), "dest channel not scheduled: {due:?}");
+    // The move schedules both reconciles 2 s out (I-20), so they are not "due"
+    // yet — assert they are queued, not that they have fired.
+    let scheduled: Vec<Uuid> = app.state.pending_reconcile.lock().await.keys().copied().collect();
+    assert!(scheduled.contains(&source), "source channel not scheduled: {scheduled:?}");
+    assert!(scheduled.contains(&dest), "dest channel not scheduled: {scheduled:?}");
 
     app.teardown().await;
 }
