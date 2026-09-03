@@ -52,9 +52,29 @@ pub struct ErrorData {
 
 // ---- auth.* ----
 
+/// Highest protocol dialect this server speaks. Bump only alongside a
+/// documented dialect change in tupi-v2-refactor/05-protocol-spec.md.
+///
+/// This is `2` from SPEC-001 on, even though SPEC-001 implements nothing of
+/// v2: SPEC-005 is what starts emitting the new ops, and the `features` list
+/// in `auth.ok` is what actually declares availability. A client that
+/// negotiates `protocol_version: 2` but sees an empty `features` MUST operate
+/// in the v1 dialect (see 05-protocol-spec.md §1.2).
+pub const MAX_SERVER_PROTOCOL: u8 = 2;
+
 #[derive(Debug, Deserialize)]
 pub struct AuthHello {
     pub token: String,
+    #[serde(default = "default_protocol_version")]
+    pub protocol_version: u8,
+    #[serde(default)]
+    pub client_version: Option<String>,
+    #[serde(default)]
+    pub client_platform: Option<String>,
+}
+
+fn default_protocol_version() -> u8 {
+    1
 }
 
 #[derive(Debug, Serialize)]
@@ -64,6 +84,13 @@ pub struct AuthOk {
     pub display_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub livekit_url: Option<String>,
+    /// Protocol version actually negotiated for this connection:
+    /// `min(client, MAX_SERVER_PROTOCOL)`.
+    pub protocol_version: u8,
+    /// The server's `CARGO_PKG_VERSION`.
+    pub server_version: String,
+    /// Optional capabilities; the client ignores names it does not know.
+    pub features: Vec<String>,
 }
 
 // ---- presence.* ----
@@ -421,6 +448,82 @@ pub struct VoiceRoster {
 #[derive(Debug, Serialize, Clone)]
 pub struct VoiceRoomsSnapshot {
     pub rooms: Vec<VoiceRoster>,
+}
+
+// ---- voice.room.* ---- (protocol v2; see tupi-v2-refactor/05-protocol-spec.md §2)
+// SPEC-003 only defines these DTOs. Nothing emits them yet — SPEC-005 does.
+
+#[derive(Debug, Serialize, Clone)]
+pub struct VoiceParticipantDto {
+    pub user_id: Uuid,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub participant_sid: Option<String>,
+    pub muted: bool,
+    pub deafened: bool,
+    pub is_bot: bool,
+    pub provisional: bool,
+    pub joined_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct VoiceTrackDto {
+    pub track_sid: String,
+    pub owner: Uuid,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_sid: Option<String>,
+    pub source: String,
+    pub muted: bool,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct VoiceRoomDto {
+    pub channel_id: Uuid,
+    pub version: u64,
+    pub participants: Vec<VoiceParticipantDto>,
+    pub tracks: Vec<VoiceTrackDto>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct VoiceRoomState {
+    pub full: bool,
+    pub rooms: Vec<VoiceRoomDto>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct VoiceRoomDelta {
+    pub channel_id: Uuid,
+    pub version: u64,
+    pub previous_version: u64,
+    pub participants_added: Vec<VoiceParticipantDto>,
+    pub participants_updated: Vec<VoiceParticipantDto>,
+    pub participants_removed: Vec<Uuid>,
+    pub tracks_added: Vec<VoiceTrackDto>,
+    pub tracks_removed: Vec<String>,
+    pub reason: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct VoiceRoomRequest {
+    #[serde(default)]
+    pub channel_ids: Vec<Uuid>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct VoicePresenceHint {
+    pub channel_id: Uuid,
+    /// `"joining"` | `"leaving"`
+    pub state: String,
+    #[serde(default)]
+    pub participant_sid: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct VoiceTrackHint {
+    pub channel_id: Uuid,
+    pub track_sid: String,
+    pub source: String,
+    /// `"published"` | `"unpublished"`
+    pub state: String,
 }
 
 // ---- rtc.* ---- (relayed verbatim between two participants of the same call)

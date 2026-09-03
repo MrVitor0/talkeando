@@ -80,6 +80,11 @@ const IDLE_TIMEOUT_MS = 5 * 60 * 1000;
 
 let ws, voiceChannel = null;
 let lastStatusChannelId = null;
+// SPEC-015: the bot is a v2 client now. `serverFeatures` decides the dialect
+// of the presence hints; empty means v1 (server on the flag-off path).
+const PROTOCOL_VERSION = 2;
+const BOT_VERSION = require("./package.json").version;
+let serverFeatures = new Set();
 // The server-side id of the `music` stream we currently have published, so we
 // can retract it the moment playback ends instead of leaving a phantom
 // "TOCANDO" in everyone's sidebar.
@@ -96,18 +101,36 @@ const statusReporter = new MusicStatusReporter({ send, createId: () => crypto.ra
 // ------------------------------------------------------------- peer plumbing
 let audioSource = null;
 function musicSource() { return audioSource || (audioSource = new AudioSource(SAMPLE_RATE, CHANNELS)); }
+/** Emits the presence hint in the connection's dialect (SPEC-005 / SPEC-015). */
+function sendPresenceHint(channelId, state, participantSid) {
+  if (serverFeatures.has("voice.hints")) {
+    send("voice.presence.hint", { channel_id: channelId, state, participant_sid: participantSid ?? null });
+  } else {
+    send(state === "joining" ? "voice.presence.enter" : "voice.presence.leave", { channel_id: channelId });
+  }
+}
+
+async function disconnectLiveKit() {
+  const room = livekitRoom;
+  livekitRoom = null;
+  if (!room) return;
+  try { await room.disconnect(); }
+  catch (error) { log(`livekit disconnect failed: ${error && error.message ? error.message : error}`); }
+}
+
 async function joinLiveKit(channelId) {
   if (livekitRoom && voiceChannel === channelId) {
-    send("voice.presence.enter", { channel_id: channelId });
+    sendPresenceHint(channelId, "joining", livekitRoom.localParticipant?.sid);
     return;
   }
-  livekitRoom?.disconnect();
+  // Wait for real: without this the old room and the new one coexist for an
+  // instant and LiveKit can reject on duplicate identity.
+  await disconnectLiveKit();
   const response = await fetch(`${API_URL}/api/livekit/token`, { method: "POST", headers: { authorization: `Bearer ${token}`, "content-type": "application/json" }, body: JSON.stringify({ channel_id: channelId }) });
   if (!response.ok) throw new Error(`LiveKit token request failed (${response.status})`);
   const credentials = await response.json();
   const room = new Room();
   await room.connect(process.env.LIVEKIT_URL || credentials.url || LIVEKIT_URL, credentials.token);
-  send("voice.presence.enter", { channel_id: channelId });
   await room.localParticipant.publishTrack(
     LocalAudioTrack.createAudioTrack("music", musicSource()),
     // Publish as MICROPHONE: clients treat it as ordinary voice audio and just
@@ -117,6 +140,31 @@ async function joinLiveKit(channelId) {
     new TrackPublishOptions({ source: TrackSource.SOURCE_MICROPHONE }),
   );
   livekitRoom = room;
+  // The hint goes AFTER connecting and publishing, with the real sid, so the
+  // server marks the bot confirmed instead of provisional (SPEC-003 §4.4).
+  sendPresenceHint(channelId, "joining", room.localParticipant?.sid);
+}
+
+/**
+ * The WebSocket dropped and came back, but the media did not. Re-announce
+ * presence without touching the LiveKit room — disconnecting here would cut
+ * the music for everyone.
+ */
+async function rejoinAfterReconnect(channelId) {
+  if (livekitRoom && livekitRoom.isConnected !== false) {
+    sendPresenceHint(channelId, "joining", livekitRoom.localParticipant?.sid);
+    if (publishedStreamId) {
+      send("stream.publish", {
+        channel_id: channelId,
+        stream_id: publishedStreamId,
+        kind: "music",
+        label: current?.title ?? null,
+        has_audio: true,
+      });
+    }
+    return;
+  }
+  await join(channelId);
 }
 
 // One RTCAudioSource for the process lifetime — every song's PCM is fed into
@@ -788,39 +836,43 @@ function sourceFromQuery(query) {
   return "text";
 }
 
+/**
+ * Joins (or re-joins) a voice channel. A re-join of the same channel only
+ * re-announces presence; the LiveKit room is preserved so the music never
+ * cuts.
+ */
 async function join(channelId) {
   if (voiceChannel === channelId) {
-    // We think we're already here — but a WS reconnect or a server restart can
-    // drop us from the server's call registry while `voiceChannel` still points
-    // at this channel, so `call.peer_joined` for anyone who joined since never
-    // reached us and they hear nothing. Re-announcing is a server-side upsert:
-    // it hands back a fresh `call.snapshot` that the handler reconciles against.
     await joinLiveKit(channelId); startFeeder();
     return;
   }
-  if (voiceChannel) send("voice.presence.leave", { channel_id: voiceChannel });
-  livekitRoom?.disconnect(); livekitRoom = null;
+  if (voiceChannel) sendPresenceHint(voiceChannel, "leaving", livekitRoom?.localParticipant?.sid);
+  await disconnectLiveKit();
   voiceChannel = channelId;
   await joinLiveKit(channelId);
   startFeeder();
 }
-function leaveVoice() {
+async function leaveVoice() {
   stopCurrent();
   stopPrepared();
   queue.length = 0;
   unpublishCurrent();
   stopFeeder();
-  if (voiceChannel) send("voice.presence.leave", { channel_id: voiceChannel });
-  livekitRoom?.disconnect(); livekitRoom = null;
+  // Capture the sid BEFORE disconnecting — afterwards it is gone, and a hint
+  // without it would make the server wait 2 s for the reconcile.
+  const channel = voiceChannel;
+  const sid = livekitRoom?.localParticipant?.sid;
   voiceChannel = null;
+  await disconnectLiveKit();
+  if (channel) sendPresenceHint(channel, "leaving", sid);
   paused = false;
   idleSince = 0;
   lastStatusChannelId = null;
 }
 
 async function onEvent(op, data) {
-  // Mesh call events (legacy.call_*) are gone: LiveKit owns room membership and
-  // media now. The bot only reacts to music.command from the server.
+  // The bot only reacts to music.command from the server; LiveKit owns room
+  // membership and media.
   if (op === "music.command") {
     log(`music.command: ${data.command} ${JSON.stringify(data.query ?? "")}`);
     try {
@@ -869,7 +921,7 @@ async function onEvent(op, data) {
         const statusChannelId = data.channel_id || current?.meta.entry.channelId || lastStatusChannelId;
         const kind = data.reason === "disconnected" || data.reason === "dj_left" ? "disconnected" : "stopped";
         statusReporter.report(statusChannelId, kind, current ? statusDetails(current.meta) : {});
-        leaveVoice();
+        void leaveVoice();
       } else if (data.command === "queue") {
         const upcoming = queue.slice(0, 5).map((entry, index) => `${index + 1}. ${entryTitle(entry, { candidate: {} })}`);
         statusReporter.report(data.channel_id, "queue", {
@@ -911,7 +963,7 @@ setInterval(() => {
   if (Date.now() - idleSince >= IDLE_TIMEOUT_MS) {
     log("idle timeout reached, leaving voice channel");
     statusReporter.report(current?.meta.entry.channelId || lastStatusChannelId, "disconnected", current ? statusDetails(current.meta) : {});
-    leaveVoice();
+    void leaveVoice();
   }
 }, 30 * 1000);
 
@@ -920,16 +972,26 @@ let wsBackoff = 1000;
 function connect() {
   log(`connecting to ${WS_URL}`);
   ws = new WebSocket(WS_URL);
-  ws.on("open", () => { wsBackoff = 1000; log("ws open — sending auth.hello"); send("auth.hello", { token }); });
+  ws.on("open", () => {
+    wsBackoff = 1000;
+    log("ws open — sending auth.hello");
+    send("auth.hello", {
+      token,
+      protocol_version: PROTOCOL_VERSION,
+      client_version: BOT_VERSION,
+      client_platform: "music-bot",
+    });
+  });
   ws.on("message", raw => {
     try {
       const e = JSON.parse(raw);
       if (e.op === "auth.ok") {
-        log("authenticated as the music bot");
-        // A reconnect (or server restart) drops us from the call registry
-        // silently. If we still believe we're in a voice channel, re-announce
-        // so new/rejoined listeners get an offer instead of silence.
-        if (voiceChannel) { log(`re-announcing presence in ${voiceChannel} after (re)connect`); void join(voiceChannel); }
+        serverFeatures = new Set(e.data?.features ?? []);
+        log(`authenticated as the music bot (protocol ${e.data?.protocol_version ?? 1}, server ${e.data?.server_version ?? "?"})`);
+        // The WebSocket dropped and came back. If the media is still alive,
+        // re-announce presence WITHOUT touching the LiveKit room, or the music
+        // stops for everyone.
+        if (voiceChannel) { log(`re-announcing presence in ${voiceChannel} after (re)connect`); void rejoinAfterReconnect(voiceChannel); }
       }
       if (e.op === "auth.rejected") log(`AUTH REJECTED: ${JSON.stringify(e.data)} — check MUSIC_BOT_TOKEN matches the server`);
       if (e.op === "error") log(`server error: ${JSON.stringify(e.data)}`);

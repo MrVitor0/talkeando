@@ -1,9 +1,24 @@
 name: talkeando
 
+# Resource limits (SPEC-016). The VM is 2 GB and hosts every service here, so
+# the point is not the total but the *order of death*: music-bot has the
+# smallest limit relative to its variable footprint (yt-dlp + ffmpeg), so it is
+# the one that hits its ceiling first, and hitting a container's mem_limit kills
+# only that container. Without limits the kernel OOM killer picks by absolute
+# usage, which is usually livekit — the one process that must not die.
+#
+# mem_limit / cpus at the service level work with `docker compose` v2 outside
+# Swarm, which is how this is deployed. Do NOT switch to `deploy.resources`;
+# that key is ignored outside Swarm. Verify a limit landed with:
+#   docker inspect <container> --format '{{.HostConfig.Memory}}'   # bytes, not 0
+
 services:
   tupi-server:
     image: ${TUPI_SERVER_IMAGE:?set by the deployment workflow}
     restart: unless-stopped
+    mem_limit: 384m
+    mem_reservation: 128m
+    cpus: 1.0
     environment:
       DATABASE_URL: ${DATABASE_URL:?set the Neon production connection string}
       BIND_ADDR: 0.0.0.0:8080
@@ -12,16 +27,33 @@ services:
       LIVEKIT_URL: ${LIVEKIT_URL:?set in production env}
       LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:?set in production env}
       LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:?set in production env}
+      # 24 h token TTL (SPEC-007 §4.4). config.rs already reads this with a
+      # 21600 default; pinning it here makes the operational value visible.
+      LIVEKIT_TOKEN_TTL_SECONDS: ${LIVEKIT_TOKEN_TTL_SECONDS:-86400}
       TURN_REALM: ${TURN_REALM:?set in production env}
       TURN_URIS: ${TURN_URIS:?set in production env}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:?set in production env}
       ATTACHMENT_STORAGE_PATH: /var/lib/tupi/attachments
     volumes:
       - attachments_data:/var/lib/tupi/attachments
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://127.0.0.1:8080/api/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
 
   music-bot:
     image: ${MUSIC_BOT_IMAGE:?set by the deployment workflow}
     restart: unless-stopped
+    mem_limit: 320m
+    mem_reservation: 64m
+    cpus: 0.75
     depends_on:
       - tupi-server
     env_file:
@@ -42,10 +74,17 @@ services:
     volumes:
       # Persist yt-dlp's cache so a redeploy doesn't re-fetch it on first use.
       - ytdlp_cache:/home/node/.cache/yt-dlp
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
   caddy:
     image: caddy:2.10-alpine
     restart: unless-stopped
+    mem_limit: 128m
+    mem_reservation: 32m
     depends_on:
       - tupi-server
     environment:
@@ -62,10 +101,17 @@ services:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - caddy_data:/data
       - caddy_config:/config
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "2"
 
   coturn:
     image: coturn/coturn:4.7-alpine
     restart: unless-stopped
+    mem_limit: 128m
+    mem_reservation: 32m
     network_mode: host
     command:
       - -n
@@ -81,16 +127,29 @@ services:
       - --min-port=49160
       - --max-port=49200
       - --external-ip=${TURN_EXTERNAL_IP:?set the Lightsail static public IP}/${TURN_PRIVATE_IP:?set the Lightsail private IP}
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "2"
 
   livekit:
     image: livekit/livekit-server:v1.9.12
     restart: unless-stopped
+    mem_limit: 640m
+    mem_reservation: 256m
+    cpus: 1.5
     command: --config /etc/livekit.yaml
     network_mode: host
     volumes:
       - ./livekit/livekit.yaml:/etc/livekit.yaml:ro
     depends_on:
       - tupi-server
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
 volumes:
   attachments_data:

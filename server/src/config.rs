@@ -20,6 +20,14 @@ pub struct Config {
     pub livekit_api_key: Option<String>,
     pub livekit_api_secret: Option<String>,
     pub livekit_token_ttl_seconds: i64,
+    /// Rollout emergency hatch (tupi-v2-refactor/08-rollout-plan.md §4). When
+    /// `false`, the server negotiates protocol v1 with every connection and
+    /// `auth.ok.features` is empty, disabling the v2 dialect without a
+    /// rollback. Default `true`.
+    pub voice_protocol_v2: bool,
+    /// Grace window after the last socket drops before presence flips to
+    /// offline. Tests set this to 1 to exercise INV-A3 without a 30 s wait.
+    pub ws_offline_grace_seconds: u64,
 }
 
 impl Config {
@@ -69,6 +77,13 @@ impl Config {
             livekit_api_key: env::var("LIVEKIT_API_KEY").ok().filter(|value| !value.is_empty()),
             livekit_api_secret: env::var("LIVEKIT_API_SECRET").ok().filter(|value| !value.is_empty()),
             livekit_token_ttl_seconds: env::var("LIVEKIT_TOKEN_TTL_SECONDS").ok().and_then(|v| v.parse().ok()).unwrap_or(21_600),
+            voice_protocol_v2: env::var("TUPI_VOICE_PROTOCOL_V2")
+                .map(|value| value != "0" && value.to_ascii_lowercase() != "false")
+                .unwrap_or(true),
+            ws_offline_grace_seconds: env::var("WS_OFFLINE_GRACE_SECONDS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(8),
         }
     }
 }

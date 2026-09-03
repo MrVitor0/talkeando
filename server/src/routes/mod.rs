@@ -3,6 +3,8 @@ mod auth;
 mod attachments;
 mod channels;
 mod communities;
+mod client_logs;
+mod debug;
 mod invites;
 pub mod messages;
 mod media;
@@ -11,7 +13,7 @@ mod livekit;
 
 use axum::{
     routing::{delete, get, patch, post},
-    Router,
+    Json, Router,
 };
 
 use crate::state::AppState;
@@ -23,6 +25,10 @@ use crate::state::AppState;
 /// out of sync with the realtime one.
 pub fn router() -> Router<AppState> {
     Router::new()
+        // Unauthenticated liveness probe for the container healthcheck
+        // (SPEC-016 §4.1). Exposes nothing; only proves the process answers
+        // HTTP. Kept here as a three-line inline handler on purpose.
+        .route("/api/health", get(|| async { Json(serde_json::json!({ "ok": true })) }))
         .route("/api/auth/register", post(auth::register))
         .route("/api/auth/login", post(auth::login))
         .route("/api/auth/logout", post(auth::logout))
@@ -59,4 +65,6 @@ pub fn router() -> Router<AppState> {
         .route("/api/invites/:id", delete(invites::revoke))
         .route("/api/livekit/token", post(livekit::token))
         .route("/api/livekit/webhook", post(livekit::webhook))
+        .route("/api/debug/voice", get(debug::voice))
+        .route("/api/client-logs", post(client_logs::upload))
 }

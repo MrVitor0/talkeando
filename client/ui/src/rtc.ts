@@ -1,32 +1,33 @@
 /** SFU media adapter. WebSocket remains control-plane only; media connects directly to LiveKit. */
 import { Room, RoomEvent, Track } from "livekit-client";
-import { startNativeScreen, stopNativeScreen, reconfigureNativeScreen } from "./nativeScreen";
+import type { RemoteVideoTrack } from "livekit-client";
+import * as screenPublisher from "./screenPublisher";
 import { AudioPipelineManager, type AudioPipelineStatus, type NoiseSuppressionMode } from "./audioPipeline";
 import { send, subscribe } from "./ipc";
+import * as callSession from "./callSession";
+import { hasFeature } from "./serverInfo";
+import * as voiceStore from "./voiceStore";
+import * as remoteMedia from "./remoteMedia";
+export { subscribeRemoteVideos, getRemoteVideos, findRemoteVideo, watchRequestedAt } from "./remoteMedia";
+export type { RemoteVideo } from "./remoteMedia";
+import { logClient } from "./clientLog";
 
 export type ConnQuality = "good" | "medium" | "poor";
-type Remote = (id: string, stream: MediaStream | null, id2: string | null) => void;
+export type { EndReason } from "./callSession";
+import type { EndReason } from "./callSession";
 type DeviceLists = { audioInputs: MediaDeviceInfo[]; audioOutputs: MediaDeviceInfo[]; videoInputs: MediaDeviceInfo[] };
 
-let active: Room | null = null;
-let connecting: Room | null = null;
-let connectAttempt = 0;
+// The call's lifecycle now lives in `callSession` (SPEC-007). `rtc.ts` reads
+// the active room through it and never mutates it directly.
+function room(): Room | null { return callSession.activeRoom(); }
+function channelId(): string | null { return callSession.snapshot().channelId; }
 let controlPlaneSubscription: (() => void) | null = null;
-// The voice channel the server currently lists us in. Mirrors `active`, but
-// outlives a `RoomEvent.Disconnected` long enough to send the matching
-// `voice.presence.leave` — the server roster is driven by these signals, not
-// by LiveKit's webhooks.
-let presentChannelId: string | null = null;
-let screen: MediaStream | null = null;
-let screenSource = "";
-let screenAudioEnabled = false;
 let audioInputDeviceId = storedString("tk.audioInputDeviceId");
 let audioOutputDeviceId = storedString("tk.audioOutputDeviceId");
 let inputVolume = storedNumber("tk.inputVolume", 1);
 let outputVolume = storedNumber("tk.outputVolume", 1);
-const remotes = new Set<Remote>();
 const cameras = new Set<(stream: MediaStream | null) => void>();
-const callEnded = new Set<() => void>();
+const callEnded = new Set<(reason: EndReason) => void>();
 const speakers = new Set<(ids: Set<string>) => void>();
 // LiveKit's active-speaker event is authoritative for remote people, but it
 // reaches us only after the SFU has received and classified a few audio
@@ -50,10 +51,14 @@ const screenVolumes = new Map<string, number>(Object.entries(stored("tk.screenVo
 const muted = new Map<string, boolean>(Object.entries(storedBooleans("tk.peerMuted")));
 const screenMuted = new Map<string, boolean>(Object.entries(storedBooleans("tk.screenMuted")));
 const audio = new Map<string, HTMLAudioElement[]>(), screenAudio = new Map<string, HTMLAudioElement[]>();
-// A sidebar action can arrive before LiveKit has announced the matching
-// remote publication. Keep the intent and apply it from TrackPublished so
-// "AO VIVO" never turns into a UI-only watch with no actual subscription.
-const wantedScreens = new Map<string, string>();
+/**
+ * Who we want to watch, and why. The hover preview and the "AO VIVO" button are
+ * two independent reasons for the SAME subscription; without the counter,
+ * leaving the hover cancelled the subscription the button had just created
+ * (RC-17). The intent also survives a republish (applied from `TrackPublished`).
+ */
+export type WatchReason = "hover" | "stage";
+const watchIntent = new Map<string, Set<WatchReason>>();
 let locallyDeafened = false;
 
 function stored(key: string): Record<string, number> { try { return JSON.parse(localStorage.getItem(key) || "{}"); } catch { return {}; } }
@@ -94,6 +99,9 @@ function emitSpeaking() {
   const ids = new Set(remoteSpeakers);
   if (localSpeaking && localSpeakerIdentity) ids.add(localSpeakerIdentity);
   speakers.forEach(listener => listener(ids));
+  // A slice in the store, so a speaking change can re-render one row instead
+  // of the whole tree (SPEC-013 §4.5).
+  voiceStore.setSpeaking(ids);
 }
 
 function stopLocalSpeechMonitor() {
@@ -108,9 +116,9 @@ function stopLocalSpeechMonitor() {
   emitSpeaking();
 }
 
-function startLocalSpeechMonitor(room: Room) {
+function startLocalSpeechMonitor(activeRoom: Room, sessionId: number) {
   stopLocalSpeechMonitor();
-  const track = [...room.localParticipant.audioTrackPublications.values()]
+  const track = [...activeRoom.localParticipant.audioTrackPublications.values()]
     .map(publication => publication.track)
     .find((candidate): candidate is NonNullable<typeof candidate> => !!candidate);
   if (!track) return;
@@ -123,11 +131,14 @@ function startLocalSpeechMonitor(room: Room) {
     context.createMediaStreamSource(new MediaStream([track.mediaStreamTrack])).connect(analyser);
     localAudioContext = context;
     localAnalyser = analyser;
-    localSpeakerIdentity = room.localParticipant.identity;
+    localSpeakerIdentity = activeRoom.localParticipant.identity;
+    // A7: the AudioContext and the pending frame are tracked resources, torn
+    // down by callSession — never leaked on a failed/superseded join.
+    callSession.registerResource(sessionId, () => stopLocalSpeechMonitor());
     void context.resume().catch(() => {});
     const samples = new Uint8Array(analyser.fftSize);
     const tick = () => {
-      if (active !== room || localAnalyser !== analyser) return;
+      if (!callSession.isCurrent(sessionId) || localAnalyser !== analyser) return;
       analyser.getByteTimeDomainData(samples);
       let energy = 0;
       for (const sample of samples) { const value = (sample - 128) / 128; energy += value * value; }
@@ -145,6 +156,11 @@ function startLocalSpeechMonitor(room: Room) {
   }
 }
 
+/** Requests a LiveKit token over IPC. Exported for `spectator.ts`, which mints
+ *  its own `mode: "spectator"` credential. */
+export async function mintCredentials(channel_id: string, mode = "participant") {
+  return credentials(channel_id, mode);
+}
 async function credentials(channel_id: string, mode = "participant") {
   const request_id = crypto.randomUUID();
   return new Promise<{ url: string; token: string }>((resolve, reject) => {
@@ -173,21 +189,65 @@ async function setSink(element: HTMLMediaElement) {
   const sink = (element as HTMLMediaElement & { setSinkId?: (id: string) => Promise<void> }).setSinkId;
   if (audioOutputDeviceId && sink) await sink.call(element, audioOutputDeviceId).catch(() => {});
 }
-function bind(room: Room) {
+/**
+ * Media-plane wiring only. Connection lifecycle (Disconnected / Reconnecting /
+ * Reconnected / teardown) belongs to `callSession` now (SPEC-007). Every
+ * handler that touches shared speaking/remote state guards on
+ * `callSession.isCurrent(sessionId)` so a stale room can't write.
+ */
+function bindMedia(room: Room, sessionId: number) {
+  // INV-C1: the session participant list is the LiveKit Room's, nothing else.
+  // Feed it to the store on every membership change.
+  const syncParticipants = () => {
+    if (!callSession.isCurrent(sessionId)) return;
+    const channel = callSession.snapshot().channelId;
+    if (!channel) return;
+    voiceStore.setLiveParticipants(channel, [
+      { identity: room.localParticipant.identity, sid: room.localParticipant.sid ?? "", isLocal: true },
+      ...[...room.remoteParticipants.values()].map(p => ({ identity: p.identity, sid: p.sid, isLocal: false })),
+    ]);
+  };
+  room.on(RoomEvent.ParticipantConnected, syncParticipants);
+  room.on(RoomEvent.ParticipantDisconnected, syncParticipants);
+  room.on(RoomEvent.Reconnected, syncParticipants);
+  room.on(RoomEvent.ConnectionStateChanged, syncParticipants);
+  if (sessionId !== 0) {
+    syncParticipants();
+    callSession.registerResource(sessionId, () => voiceStore.clearSession());
+  }
+
   room.on(RoomEvent.TrackPublished, (publication, participant) => {
     if (publication.source !== Track.Source.ScreenShare) return;
-    if (wantedScreens.has(participant.identity)) void publication.setSubscribed(true);
+    if (watchIntent.has(participant.identity)) void publication.setSubscribed(true);
   });
   room.on(RoomEvent.TrackSubscribed, (track, publication, participant) => {
-    const element = track.attach() as HTMLMediaElement;
+    if (track.kind === Track.Kind.Video) {
+      // RC-12: do NOT attach here. The component that displays the video is the
+      // one that attaches, so the SDK observes the element the user sees and
+      // `adaptiveStream` reports visibility correctly.
+      remoteMedia.addRemoteVideo({
+        ownerId: participant.identity,
+        trackSid: publication.trackSid,
+        source: publication.source === Track.Source.Camera ? "camera" : "screen_share",
+        track: track as RemoteVideoTrack,
+        roomKey: "call",
+      });
+      logClient("watch.subscribed", { owner: participant.identity, track_sid: publication.trackSid });
+      return;
+    }
+    // Audio: hidden element on the body (adaptiveStream does not manage audio).
+    const element = track.attach() as HTMLAudioElement;
     element.autoplay = true; element.style.display = "none"; document.body.appendChild(element);
     const isScreen = publication.source === Track.Source.ScreenShareAudio;
     const sinks = isScreen ? screenAudio : audio;
-    sinks.set(participant.identity, [...(sinks.get(participant.identity) || []), element as HTMLAudioElement]);
+    sinks.set(participant.identity, [...(sinks.get(participant.identity) || []), element]);
     apply(participant.identity, isScreen);
-    if (track.kind === Track.Kind.Video) remotes.forEach(listener => listener(participant.identity, new MediaStream([track.mediaStreamTrack]), publication.trackSid));
   });
   room.on(RoomEvent.TrackUnsubscribed, (track, publication, participant) => {
+    if (track.kind === Track.Kind.Video) {
+      remoteMedia.removeRemoteVideo(publication.trackSid);
+      return;
+    }
     const detached = track.detach() as HTMLMediaElement[];
     detached.forEach(element => element.remove());
     const isScreen = publication.source === Track.Source.ScreenShareAudio;
@@ -195,10 +255,9 @@ function bind(room: Room) {
     const remaining = (sinks.get(participant.identity) || []).filter(element => !detached.includes(element));
     if (remaining.length) sinks.set(participant.identity, remaining);
     else sinks.delete(participant.identity);
-    if (track.kind === Track.Kind.Video) remotes.forEach(listener => listener(participant.identity, null, publication.trackSid));
   });
   room.on(RoomEvent.ActiveSpeakersChanged, list => {
-    if (active !== room && connecting !== room) return;
+    if (!callSession.isCurrent(sessionId)) return;
     remoteSpeakers.clear();
     list.forEach(participant => remoteSpeakers.add(participant.identity));
     emitSpeaking();
@@ -211,34 +270,41 @@ function bind(room: Room) {
   room.on(RoomEvent.AudioPlaybackStatusChanged, () => {
     if (!room.canPlaybackAudio) mediaErrors.forEach(listener => listener("O aplicativo bloqueou a reprodução de áudio. Clique novamente no canal para ativá-la."));
   });
-  room.on(RoomEvent.Disconnected, () => {
-    if (active !== room && connecting !== room) return;
-    if (active === room) active = null;
-    if (connecting === room) connecting = null;
-    stopLocalSpeechMonitor();
-    void microphone.dispose();
-    if (presentChannelId) { send("voice.presence.leave", { channel_id: presentChannelId }); presentChannelId = null; }
-    // The UI owns the visible call state. Without this notification a failed
-    // LiveKit room left the stage rendered as connected even though capture
-    // had already been disposed, making every later music command look like
-    // it broke the call.
-    callEnded.forEach(listener => listener());
-  });
-  room.on(RoomEvent.Reconnecting, () => logAudio("audio.livekit.reconnect.started"));
-  room.on(RoomEvent.Reconnected, () => logAudio("audio.livekit.reconnect.completed"));
 }
 
 // Tell the server about a local camera/screen publication so every other
-// member's sidebar learns who is sharing — the server no longer waits on
-// LiveKit's `track_*` webhooks for this. `source` matches LiveKit's names:
-// "camera" | "screen_share" | "screen_share_audio".
+// member's sidebar learns who is sharing. Emits the v2 `voice.track.hint` when
+// the server advertised `voice.hints`, else the v1 op. `source` matches
+// LiveKit's names: "camera" | "screen_share" | "screen_share_audio".
 function reportTrack(published: boolean, source: string, trackSid?: string) {
-  if (!presentChannelId) return;
+  const channel = channelId();
+  if (!channel) return;
+  if (hasFeature("voice.hints")) {
+    if (!trackSid) return; // v2 requires the sid; the webhook covers the gap
+    send("voice.track.hint", {
+      channel_id: channel,
+      track_sid: trackSid,
+      source,
+      state: published ? "published" : "unpublished",
+    });
+    return;
+  }
   send(published ? "voice.track.published" : "voice.track.unpublished", {
-    channel_id: presentChannelId,
+    channel_id: channel,
     source,
     track_sid: trackSid ?? null,
   });
+}
+
+// Presence hint: the v2 op carries our LiveKit session sid (which gives an
+// immediate exit on leave, SPEC-005 §4.3); the v1 op does not exist in a
+// "hint" form, so it maps to enter/leave.
+function sendPresenceHint(channel: string, state: "joining" | "leaving", participantSid?: string) {
+  if (hasFeature("voice.hints")) {
+    send("voice.presence.hint", { channel_id: channel, state, participant_sid: participantSid ?? null });
+  } else {
+    send(state === "joining" ? "voice.presence.enter" : "voice.presence.leave", { channel_id: channel });
+  }
 }
 
 // LiveKit media and the application WebSocket recover independently.  A brief
@@ -247,164 +313,164 @@ function reportTrack(published: boolean, source: string, trackSid?: string) {
 // presence after its reconnect grace window.  Re-announce the call (and any
 // already-published visual tracks) once the control plane comes back.
 function restoreControlPlanePresence() {
-  const room = active;
-  const channelId = presentChannelId;
-  if (!room || !channelId) return;
+  const activeRoom = room();
+  const channel = channelId();
+  if (!activeRoom || !channel) return;
 
-  send("voice.presence.enter", { channel_id: channelId });
-  for (const publication of room.localParticipant.trackPublications.values()) {
+  // The presence hint carries our participant_sid so the server marks us
+  // confirmed at once (SPEC-005 §4.3): we only know the sid because the LiveKit
+  // connection actually exists.
+  sendPresenceHint(channel, "joining", callSession.snapshot().participantSid ?? undefined);
+  for (const publication of activeRoom.localParticipant.trackPublications.values()) {
     if (!publication.track) continue;
     if (publication.source === Track.Source.Camera) reportTrack(true, "camera", publication.trackSid);
     if (publication.source === Track.Source.ScreenShare) reportTrack(true, "screen_share", publication.trackSid);
     if (publication.source === Track.Source.ScreenShareAudio) reportTrack(true, "screen_share_audio", publication.trackSid);
   }
+  logClient("call.presence.restored", { channel_id: channel });
 }
 
 export function init(_: string) {
+  // The voice store's single IPC listener is mounted here, once (idempotent).
+  voiceStore.initVoiceStore();
   // app.bootstrap may be delivered again after login/reload. Keep exactly one
   // observer so a reconnect does not multiply presence notifications.
   if (controlPlaneSubscription) return;
   controlPlaneSubscription = subscribe(event => {
     if (event.op === "connection.state" && event.data?.state === "connected") {
       restoreControlPlanePresence();
+      // Local room state may have missed deltas while the socket was down.
+      voiceStore.requestFullSnapshot("ws_reconnected");
     }
   });
 }
 export async function joinCall(id: string, isMuted: boolean, isDeafened: boolean) {
   locallyDeafened = isDeafened;
-  const attempt = ++connectAttempt;
-  const previous = active ?? connecting;
-  active = null; connecting = null;
-  wantedScreens.clear();
-  if (presentChannelId) { send("voice.presence.leave", { channel_id: presentChannelId }); presentChannelId = null; }
-  previous?.disconnect();
-  screen?.getTracks().forEach(track => track.stop()); screen = null;
-  const room = new Room({ adaptiveStream: true, dynacast: true });
-  connecting = room;
-  bind(room);
-  // Invoke this while handling the channel click. Some WebViews require a user
-  // gesture before they allow remote audio to play.
-  void room.startAudio().catch(() => {});
-  try {
-    const credential = await credentials(id);
-    await room.connect(credential.url, credential.token);
-    if (attempt !== connectAttempt) {
-      room.disconnect();
-      const cancelled = new Error("Voice connection superseded by a newer channel");
-      cancelled.name = "AbortError";
-      throw cancelled;
-    }
-    active = room;
-    connecting = null;
-    // Tell the server we're a participant now. It evicts us from any channel we
-    // were previously in, so switching channels never shows us in two at once.
-    send("voice.presence.enter", { channel_id: id });
-    presentChannelId = id;
-    localMuted = isMuted;
-    await microphone.start({ mode: noiseSuppressionMode, deviceId: audioInputDeviceId }, async (track, pipeline) => {
-      logAudio("audio.track.publishing", { origin: pipeline.origin, processed: pipeline.isProcessed });
-      await room.localParticipant.publishTrack(track, { source: Track.Source.Microphone });
-      logAudio("audio.track.published", { origin: pipeline.origin, processed: pipeline.isProcessed });
-      if (localMuted) {
-        const publication = [...room.localParticipant.audioTrackPublications.values()]
-          .find(item => item.source === Track.Source.Microphone);
-        await publication?.track?.mute();
-      }
-    });
-    startLocalSpeechMonitor(room);
-  } catch (error) {
-    if (connecting === room) connecting = null;
-    await unpublishMicrophone(room);
-    room.disconnect();
-    await microphone.dispose();
-    throw error;
-  }
+  localMuted = isMuted;
+  watchIntent.clear();
+
+  await callSession.join(id, {
+    credentials: channel => credentials(channel),
+    afterConnect: async (activeRoom, sessionId) => {
+      bindMedia(activeRoom, sessionId);
+      // Some WebViews require a user gesture before they allow remote audio.
+      void activeRoom.startAudio().catch(() => {});
+
+      sendPresenceHint(id, "joining", activeRoom.localParticipant.sid ?? undefined);
+
+      await microphone.start(
+        { mode: noiseSuppressionMode, deviceId: audioInputDeviceId },
+        async (track, pipeline) => {
+          if (!callSession.isCurrent(sessionId)) return;
+          logAudio("audio.track.publishing", { origin: pipeline.origin, processed: pipeline.isProcessed });
+          await activeRoom.localParticipant.publishTrack(track, { source: Track.Source.Microphone });
+          logAudio("audio.track.published", { origin: pipeline.origin, processed: pipeline.isProcessed });
+          if (localMuted) {
+            const publication = [...activeRoom.localParticipant.audioTrackPublications.values()]
+              .find(item => item.source === Track.Source.Microphone);
+            await publication?.track?.mute();
+          }
+        },
+      );
+      // Registered AFTER the speech monitor below? No: the mic must be
+      // disposed before the monitor's context closes, and disposers run in
+      // reverse registration order — so register the mic first.
+      callSession.registerResource(sessionId, () => microphone.dispose());
+      callSession.registerResource(sessionId, () => {
+        remoteMedia.clearRemoteVideos();
+        for (const elements of [...audio.values(), ...screenAudio.values()]) {
+          for (const element of elements) { element.pause(); element.srcObject = null; element.remove(); }
+        }
+        audio.clear();
+        screenAudio.clear();
+      });
+      startLocalSpeechMonitor(activeRoom, sessionId);
+    },
+    onUnexpectedEnd: reason => {
+      callEnded.forEach(listener => listener(reason));
+    },
+  });
 }
 export async function leaveCall() {
-  ++connectAttempt;
-  if (presentChannelId) { send("voice.presence.leave", { channel_id: presentChannelId }); presentChannelId = null; }
-  const room = active ?? connecting;
-  active = null; connecting = null;
-  wantedScreens.clear();
-  stopLocalSpeechMonitor();
-  await unpublishMicrophone(room);
-  await microphone.dispose();
-  room?.disconnect();
-  screen?.getTracks().forEach(track => track.stop()); screen = null;
+  const channel = channelId();
+  if (channel) sendPresenceHint(channel, "leaving", callSession.snapshot().participantSid ?? undefined);
+  watchIntent.clear();
   locallyDeafened = false;
+  await callSession.leave();
 }
 export async function setLocalAudioState(isMuted: boolean, isDeafened: boolean) {
   localMuted = isMuted;
   locallyDeafened = isDeafened;
   audio.forEach((_, id) => apply(id));
   screenAudio.forEach((_, id) => apply(id, true));
-  const publication = active && [...active.localParticipant.audioTrackPublications.values()]
+  const activeRoom = room();
+  const publication = activeRoom && [...activeRoom.localParticipant.audioTrackPublications.values()]
     .find(item => item.source === Track.Source.Microphone);
   if (publication?.track) {
     if (isMuted) await publication.track.mute();
     else await publication.track.unmute();
   }
-  if (!isMuted && active) startLocalSpeechMonitor(active);
+  if (!isMuted && activeRoom) startLocalSpeechMonitor(activeRoom, callSession.snapshot().id);
 }
 export async function startCamera(_: string, __: string, deviceId?: string) {
-  if (!active) return;
-  await active.localParticipant.setCameraEnabled(true, { deviceId, resolution: { width: 1280, height: 720 } });
-  const publication = [...active.localParticipant.videoTrackPublications.values()].find(item => item.source === Track.Source.Camera);
+  const activeRoom = room();
+  if (!activeRoom) return;
+  await activeRoom.localParticipant.setCameraEnabled(true, { deviceId, resolution: { width: 1280, height: 720 } });
+  const publication = [...activeRoom.localParticipant.videoTrackPublications.values()].find(item => item.source === Track.Source.Camera);
   cameras.forEach(listener => listener(publication?.track ? new MediaStream([publication.track.mediaStreamTrack]) : null));
   if (publication) reportTrack(true, "camera", publication.trackSid);
 }
 export async function stopCamera(_: string, __: string) {
-  const trackSid = active
-    ? [...active.localParticipant.videoTrackPublications.values()].find(item => item.source === Track.Source.Camera)?.trackSid
+  const activeRoom = room();
+  const trackSid = activeRoom
+    ? [...activeRoom.localParticipant.videoTrackPublications.values()].find(item => item.source === Track.Source.Camera)?.trackSid
     : undefined;
-  await active?.localParticipant.setCameraEnabled(false);
+  await activeRoom?.localParticipant.setCameraEnabled(false);
   cameras.forEach(listener => listener(null));
   reportTrack(false, "camera", trackSid);
 }
 export async function switchCamera(deviceId: string) { await stopCamera("", ""); await startCamera("", "", deviceId); }
 export function onLocalCamera(listener: (stream: MediaStream | null) => void) { cameras.add(listener); return () => { cameras.delete(listener); }; }
-export async function publishScreen(_: string, __: string, source: string, height: number, fps: number, withAudio: boolean) {
-  if (!active) return;
-  screenSource = source; screenAudioEnabled = withAudio; screen = startNativeScreen(source, height, fps, withAudio);
-  for (const track of screen.getTracks()) {
-    const isAudio = track.kind === "audio";
-    const publication = await active.localParticipant.publishTrack(track, { source: isAudio ? Track.Source.ScreenShareAudio : Track.Source.ScreenShare, simulcast: !isAudio });
-    reportTrack(true, isAudio ? "screen_share_audio" : "screen_share", publication?.trackSid);
+// Screen sharing now lives entirely in `screenPublisher` (SPEC-010). These
+// thin re-exports keep the call sites that still import from `rtc`.
+export const publishScreen = screenPublisher.start;
+export const unpublishScreen = screenPublisher.stop;
+export const switchScreenSource = screenPublisher.switchSource;
+export const reconfigureScreen = screenPublisher.reconfigure;
+export function getLocalScreenStream(): MediaStream | null {
+  return screenPublisher.active()?.stream ?? null;
+}
+function applySubscription(ownerId: string, subscribed: boolean) {
+  const participant = callSession.activeRoom()?.remoteParticipants.get(ownerId);
+  if (!participant) return;
+  for (const publication of participant.trackPublications.values()) {
+    if (publication.source === Track.Source.ScreenShare) void publication.setSubscribed(subscribed);
+  }
+  if (subscribed) logClient("watch.requested", { owner: ownerId });
+}
+
+/** Adds `reason` as a reason to watch `ownerId`'s screen in the active call.
+ *  The first reason subscribes; further reasons are no-ops. */
+export function watchStream(ownerId: string, reason: WatchReason): void {
+  const reasons = watchIntent.get(ownerId) ?? new Set<WatchReason>();
+  const hadAny = reasons.size > 0;
+  reasons.add(reason);
+  watchIntent.set(ownerId, reasons);
+  if (!hadAny) applySubscription(ownerId, true);
+}
+
+/** Drops `reason`. Only when no reason remains is the subscription cancelled
+ *  (RC-17: leaving the hover must not drop the "stage" subscription). */
+export function stopWatchingStream(ownerId: string, reason: WatchReason): void {
+  const reasons = watchIntent.get(ownerId);
+  if (!reasons) return;
+  reasons.delete(reason);
+  if (reasons.size === 0) {
+    watchIntent.delete(ownerId);
+    applySubscription(ownerId, false);
   }
 }
-export async function unpublishScreen(_: string, __: string) {
-  if (active) for (const publication of active.localParticipant.trackPublications.values()) if ((publication.source === Track.Source.ScreenShare || publication.source === Track.Source.ScreenShareAudio) && publication.track) {
-    const isAudio = publication.source === Track.Source.ScreenShareAudio;
-    await active.localParticipant.unpublishTrack(publication.track);
-    reportTrack(false, isAudio ? "screen_share_audio" : "screen_share", publication.trackSid);
-  }
-  stopNativeScreen(); screen?.getTracks().forEach(track => track.stop()); screen = null;
-}
-export function reconfigureScreen(height: number, fps: number) { reconfigureNativeScreen(screenSource, height, fps, screenAudioEnabled); }
-export function switchScreenSource(source: string) { screenSource = source; }
-export function getLocalScreenStream() { return screen; }
-function screenPublication(sid: string, owner: string) {
-  const participant = active?.remoteParticipants.get(owner);
-  if (!participant) return undefined;
-  // The control plane's stream id is separate from LiveKit's track SID.
-  // Falling back to this owner's screen track keeps subscription reliable.
-  return participant.trackPublications.get(sid)
-    ?? [...participant.trackPublications.values()].find(publication => publication.source === Track.Source.ScreenShare);
-}
-export function watchStream(_: string, sid: string, owner: string) {
-  wantedScreens.set(owner, sid);
-  const publication = screenPublication(sid, owner);
-  if (publication) void publication.setSubscribed(true);
-  return Boolean(publication);
-}
-export function stopWatchingStream(_: string, sid: string, owner: string) {
-  wantedScreens.delete(owner);
-  void screenPublication(sid, owner)?.setSubscribed(false);
-}
-export async function spectate(id: string, sid: string, owner: string) { if (!active) { const credential = await credentials(id, "spectator"); const room = new Room({ adaptiveStream: true, dynacast: true }); bind(room); await room.connect(credential.url, credential.token); active = room; } watchStream(id, sid, owner); }
-export function stopSpectate(_: string) {}
-export function onRemoteStream(listener: Remote) { remotes.add(listener); return () => { remotes.delete(listener); }; }
-export function onCallDisconnected(listener: () => void) { callEnded.add(listener); return () => { callEnded.delete(listener); }; }
+export function onCallDisconnected(listener: (reason: EndReason) => void) { callEnded.add(listener); return () => { callEnded.delete(listener); }; }
 export function onSpeaking(listener: (ids: Set<string>) => void) { speakers.add(listener); return () => { speakers.delete(listener); }; }
 export function onConnectionQuality(listener: (quality: ConnQuality) => void) { qualities.add(listener); return () => { qualities.delete(listener); }; }
 export function onMediaError(listener: (message: string) => void) { mediaErrors.add(listener); return () => { mediaErrors.delete(listener); }; }
@@ -419,7 +485,7 @@ export async function listCameras(): Promise<MediaDeviceInfo[]> { return (await 
 export async function listAllMediaDevices(): Promise<DeviceLists> { const devices = await navigator.mediaDevices.enumerateDevices(); return { audioInputs: devices.filter(device => device.kind === "audioinput"), audioOutputs: devices.filter(device => device.kind === "audiooutput"), videoInputs: devices.filter(device => device.kind === "videoinput") }; }
 export function getAudioInputDeviceId() { return audioInputDeviceId; }
 export function getAudioOutputDeviceId() { return audioOutputDeviceId; }
-export async function setAudioOutputDevice(deviceId: string) { audioOutputDeviceId = deviceId || undefined; if (deviceId) persistValue("tk.audioOutputDeviceId", deviceId); await active?.switchActiveDevice("audiooutput", deviceId).catch(() => {}); for (const items of [...audio.values(), ...screenAudio.values()]) for (const element of items) void setSink(element); }
+export async function setAudioOutputDevice(deviceId: string) { audioOutputDeviceId = deviceId || undefined; if (deviceId) persistValue("tk.audioOutputDeviceId", deviceId); await room()?.switchActiveDevice("audiooutput", deviceId).catch(() => {}); for (const items of [...audio.values(), ...screenAudio.values()]) for (const element of items) void setSink(element); }
 export function getInputVolume() { return inputVolume; }
 export function getOutputVolume() { return outputVolume; }
 export function setInputVolumeLevel(value: number) { inputVolume = Math.max(0, Math.min(1, value)); persistValue("tk.inputVolume", inputVolume); }
@@ -429,12 +495,13 @@ export function onAudioPipelineStatus(listener: (status: AudioPipelineStatus) =>
 export async function setNoiseSuppressionMode(mode: NoiseSuppressionMode) {
   noiseSuppressionMode = mode;
   try { localStorage.setItem("tk.noiseSuppressionMode", mode); } catch {}
-  if (!active || !microphone.current) {
+  const activeRoom = room();
+  if (!activeRoom || !microphone.current) {
     microphone.setDesiredMode(mode);
     return;
   }
-  await microphone.switchMode(mode, async (track, pipeline) => replaceMicrophoneTrack(active!, track, pipeline));
-  if (!localMuted) startLocalSpeechMonitor(active);
+  await microphone.switchMode(mode, async (track, pipeline) => replaceMicrophoneTrack(activeRoom, track, pipeline));
+  if (!localMuted) startLocalSpeechMonitor(activeRoom, callSession.snapshot().id);
 }
 async function replaceMicrophoneTrack(room: Room, track: MediaStreamTrack, pipeline: { origin: string; isProcessed: boolean }) {
   const publication = [...room.localParticipant.audioTrackPublications.values()]
@@ -462,11 +529,12 @@ async function unpublishMicrophone(room: Room | null) {
 export async function setAudioInputDevice(deviceId: string) {
   audioInputDeviceId = deviceId || undefined;
   if (deviceId) persistValue("tk.audioInputDeviceId", deviceId);
-  if (!active || !microphone.current) return;
+  const activeRoom = room();
+  if (!activeRoom || !microphone.current) return;
   try {
     logAudio("audio.device.switch.started", { hasDeviceSelection: !!deviceId });
-    await microphone.switchDevice(audioInputDeviceId, async (track, pipeline) => replaceMicrophoneTrack(active!, track, pipeline));
-    if (!localMuted) startLocalSpeechMonitor(active);
+    await microphone.switchDevice(audioInputDeviceId, async (track, pipeline) => replaceMicrophoneTrack(activeRoom, track, pipeline));
+    if (!localMuted) startLocalSpeechMonitor(activeRoom, callSession.snapshot().id);
     logAudio("audio.device.switch.completed");
   } catch (error) {
     logAudio("audio.device.switch.failed", { reason: error instanceof Error ? error.message : String(error) });

@@ -1,6 +1,13 @@
-import { FormEvent, KeyboardEvent as ReactKeyboardEvent, MouseEvent as ReactMouseEvent, RefObject, useEffect, useMemo, useRef, useState } from "react";
+import { FormEvent, KeyboardEvent as ReactKeyboardEvent, MouseEvent as ReactMouseEvent, RefObject, memo, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { countRender } from "./renderStats";
 import { send, subscribe } from "./ipc";
 import * as rtc from "./rtc";
+import { setServerInfo } from "./serverInfo";
+import { subscribeVoice, roomRoster, roomStreams, sessionParticipants } from "./voiceStore";
+import { logClient, maybeAutoSend } from "./clientLog";
+import * as screenPublisher from "./screenPublisher";
+import * as spectator from "./spectator";
+import { installShutdownHandler } from "./shutdown";
 import { playSound, setSoundsMuted } from "./sounds";
 import { Icon, IconName } from "./Icon";
 import { HashIcon, SearchIcon, PencilIcon, TrashIcon, CrownIcon, FullscreenIcon, ContractIcon, PipIcon, DotsIcon, TheaterIcon, MusicNoteIcon } from "./Glyphs";
@@ -73,10 +80,12 @@ const SLASH_COMMANDS: SlashCommand[] = [
 type Participant = { user_id: string; muted: boolean; deafened: boolean; is_bot?: boolean };
 type StreamInfo = { stream_id: string; owner: string; kind: string; label?: string | null; msid?: string | null };
 // Remote video tracks for one peer, tagged with the sender's MediaStream.id
-// so a screen and a camera from the same peer stay separate. `kind` is
-// resolved at render time by matching `msid` against the published-stream
-// list (a track whose msid matches nothing is treated as a screen).
-type RemoteVid = { stream: MediaStream; msid: string | null };
+// The media a video tile shows: a remote LiveKit track (attached to the
+// visible <video> so adaptiveStream reports it correctly — RC-12) or a local
+// MediaStream (own camera / own screen mirror).
+type TileMedia =
+  | { kind: "remote"; video: rtc.RemoteVideo }
+  | { kind: "local"; stream: MediaStream };
 // Community-wide projection of a voice channel's occupants — kept live for
 // every voice channel, not just the one this client has joined.
 type VoiceRosterEntry = { user_id: string; muted: boolean; deafened: boolean; sharing: boolean; is_bot?: boolean };
@@ -100,6 +109,17 @@ type ActivityDto = {
 /* ------------------------------------------------------------------ */
 /* small presentational helpers                                        */
 /* ------------------------------------------------------------------ */
+
+/** Maps a join failure to a short Portuguese phrase instead of leaking the
+ *  SDK's `error.message` (SPEC-007 §4.5). */
+function friendlyJoinError(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error);
+  if (/token/i.test(message) && /timeout/i.test(message)) return "o servidor demorou para responder";
+  if (/channel_full|já está cheio/i.test(message)) return "este canal já está cheio";
+  if (/permission|NotAllowed/i.test(message)) return "o microfone não foi liberado";
+  if (/network|ServerUnreachable|unreachable/i.test(message)) return "não foi possível alcançar o servidor de voz";
+  return "erro de conexão";
+}
 
 function initials(name: string) {
   const parts = name.trim().split(/\s+/).filter(Boolean);
@@ -462,12 +482,23 @@ function tileGridColumns(count: number) {
 // True once the <video> is actually painting frames from `stream` (not just
 // attached). Flips back to false if the track re-mutes — e.g. the sharer idles
 // their screen — so the loading state can come back.
-function useVideoReady(videoRef: RefObject<HTMLVideoElement | null>, stream: MediaStream | null | undefined) {
+function mediaVideoTrack(media: TileMedia | null | undefined): MediaStreamTrack | null {
+  if (!media) return null;
+  return media.kind === "local"
+    ? media.stream.getVideoTracks()[0] ?? null
+    : media.video.track.mediaStreamTrack;
+}
+function mediaKey(media: TileMedia | null | undefined): string {
+  if (!media) return "";
+  return media.kind === "local" ? `local:${media.stream.id}` : `remote:${media.video.trackSid}`;
+}
+
+function useVideoReady(videoRef: RefObject<HTMLVideoElement | null>, media: TileMedia | null | undefined) {
   const [ready, setReady] = useState(false);
   useEffect(() => {
     const video = videoRef.current;
-    if (!video || !stream) { setReady(false); return; }
-    const track = stream.getVideoTracks()[0] ?? null;
+    if (!video || !media) { setReady(false); return; }
+    const track = mediaVideoTrack(media);
     const compute = () => setReady(
       !!track && track.readyState === "live" && !track.muted
       && video.readyState >= 2 && video.videoWidth > 0 && !video.paused,
@@ -482,8 +513,40 @@ function useVideoReady(videoRef: RefObject<HTMLVideoElement | null>, stream: Med
       track?.removeEventListener("mute", compute);
       track?.removeEventListener("unmute", compute);
     };
-  }, [videoRef, stream]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [videoRef, mediaKey(media)]);
   return ready;
+}
+
+/** Attaches `media` to `element`: for a remote track via `track.attach` (so the
+ *  SDK observes the visible element — RC-12), for a local stream via srcObject.
+ *  Keyed by track identity so an unrelated re-render never re-attaches. */
+function useAttachMedia(videoRef: RefObject<HTMLVideoElement | null>, media: TileMedia | null | undefined) {
+  useEffect(() => {
+    const element = videoRef.current;
+    if (!element || !media) return;
+    if (media.kind === "local") {
+      element.srcObject = media.stream;
+      void element.play().catch(() => {});
+      return () => { element.srcObject = null; };
+    }
+    media.video.track.attach(element);
+    const requestedAt = rtc.watchRequestedAt.get(media.video.trackSid) ?? Date.now();
+    const onPlaying = () => {
+      logClient("watch.first_frame", {
+        owner: media.video.ownerId,
+        track_sid: media.video.trackSid,
+        duration_ms: Date.now() - requestedAt,
+      });
+      element.removeEventListener("playing", onPlaying);
+    };
+    element.addEventListener("playing", onPlaying);
+    return () => {
+      element.removeEventListener("playing", onPlaying);
+      media.video.track.detach(element);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [videoRef, mediaKey(media)]);
 }
 
 // Shown over a video that is attached but not yet painting frames (the old
@@ -499,15 +562,10 @@ function StreamLoading({ label = "Carregando transmissão" }: { label?: string }
   );
 }
 
-function MiniVideo({ stream, className }: { stream: MediaStream; className?: string }) {
+function MiniVideo({ media, className }: { media: TileMedia; className?: string }) {
   const ref = useRef<HTMLVideoElement>(null);
-  const ready = useVideoReady(ref, stream);
-  useEffect(() => {
-    const video = ref.current;
-    if (!video) return;
-    video.srcObject = stream;
-    void video.play().catch(() => {});
-  }, [stream]);
+  useAttachMedia(ref, media);
+  const ready = useVideoReady(ref, media);
   return (
     <>
       <video ref={ref} autoPlay playsInline muted className={className} />
@@ -522,14 +580,14 @@ function MiniVideo({ stream, className }: { stream: MediaStream; className?: str
 /// gap; hovering it expands the tile and reveals the "Assistir" button.
 function VoiceMemberPreview({
   anchor,
-  stream,
+  media,
   expanded,
   onEnter,
   onLeave,
   onWatch,
 }: {
   anchor: HTMLElement | null;
-  stream: MediaStream;
+  media: TileMedia;
   expanded: boolean;
   onEnter: () => void;
   onLeave: () => void;
@@ -550,7 +608,7 @@ function VoiceMemberPreview({
       onMouseEnter={onEnter}
       onMouseLeave={onLeave}
     >
-      <MiniVideo stream={stream} className="voice-member__preview-video" />
+      <MiniVideo media={media} className="voice-member__preview-video" />
       {expanded && onWatch && (
         <button
           className="voice-member__preview-watch"
@@ -563,24 +621,8 @@ function VoiceMemberPreview({
   );
 }
 
-function VideoTile({
-  stream,
-  name,
-  micMuted,
-  peerMuted,
-  focused,
-  speaking = false,
-  onToggleMute,
-  onToggleFocus,
-  isSelf = false,
-  variant = "screen",
-  onStopWatch,
-  screenAudioMuted = false,
-  screenAudioVolume = 1,
-  onToggleScreenAudioMute,
-  onScreenAudioVolumeChange,
-}: {
-  stream: MediaStream;
+type VideoTileProps = {
+  media: TileMedia;
   name: string;
   micMuted: boolean;
   peerMuted: boolean;
@@ -597,7 +639,47 @@ function VideoTile({
   screenAudioVolume?: number;
   onToggleScreenAudioMute?: () => void;
   onScreenAudioVolumeChange?: (volume: number) => void;
-}) {
+};
+
+/** Compares by media *identity* (trackSid / local stream id) and the scalar
+ *  props. Callbacks are ignored — they change identity every parent render and
+ *  don't affect the output; the roster event that would re-render the whole
+ *  tree stops here (SPEC-013 §4.2). */
+function videoTilePropsEqual(a: VideoTileProps, b: VideoTileProps): boolean {
+  const key = (p: VideoTileProps) =>
+    p.media?.kind === "remote" ? `r:${p.media.video.trackSid}`
+      : p.media?.kind === "local" ? `l:${p.media.stream.id}`
+      : "none";
+  return key(a) === key(b)
+    && a.name === b.name
+    && a.micMuted === b.micMuted
+    && a.peerMuted === b.peerMuted
+    && a.focused === b.focused
+    && (a.speaking ?? false) === (b.speaking ?? false)
+    && a.isSelf === b.isSelf
+    && a.variant === b.variant
+    && a.screenAudioMuted === b.screenAudioMuted
+    && a.screenAudioVolume === b.screenAudioVolume;
+}
+
+const VideoTile = memo(function VideoTile({
+  media,
+  name,
+  micMuted,
+  peerMuted,
+  focused,
+  speaking = false,
+  onToggleMute,
+  onToggleFocus,
+  isSelf = false,
+  variant = "screen",
+  onStopWatch,
+  screenAudioMuted = false,
+  screenAudioVolume = 1,
+  onToggleScreenAudioMute,
+  onScreenAudioVolumeChange,
+}: VideoTileProps) {
+  countRender("VideoTile");
   const isCamera = variant === "camera";
   // On a screen tile the mute/volume act on the share's audio; on a camera
   // tile they act on the person (same as their avatar tile).
@@ -607,19 +689,8 @@ function VideoTile({
   const videoRef = useRef<HTMLVideoElement>(null);
   const [menuOpen, setMenuOpen] = useState(false);
   const [isFullscreen, setIsFullscreen] = useState(false);
-  const ready = useVideoReady(videoRef, stream);
-
-  useEffect(() => {
-    const video = videoRef.current;
-    if (!video) return;
-    video.srcObject = stream;
-    void video.play().catch(error => console.error("[ui] tile play() failed", error));
-    const track = stream.getVideoTracks()[0];
-    console.log(`[ui] VideoTile mounted: track muted=${track?.muted} readyState=${track?.readyState}`);
-    const onUnmute = () => console.log("[ui] VideoTile: track unmuted (real frames flowing)");
-    track?.addEventListener("unmute", onUnmute);
-    return () => track?.removeEventListener("unmute", onUnmute);
-  }, [stream]);
+  useAttachMedia(videoRef, media);
+  const ready = useVideoReady(videoRef, media);
 
   useEffect(() => {
     const onChange = () => setIsFullscreen(document.fullscreenElement === wrapRef.current);
@@ -727,7 +798,7 @@ function VideoTile({
       </div>
     </div>
   );
-}
+}, videoTilePropsEqual);
 
 /* ------------------------------------------------------------------ */
 
@@ -1059,7 +1130,10 @@ export function App() {
   const [muted, setMuted] = useState(false);
   const [deafened, setDeafened] = useState(false);
   const [streams, setStreams] = useState<StreamInfo[]>([]);
-  const [mySharingStreamId, setMySharingStreamId] = useState<string | null>(null);
+  // SPEC-010: the screen share's lifecycle lives in `screenPublisher`; the UI
+  // derives from it instead of holding a fabricated stream id.
+  const activeShare = useSyncExternalStore(screenPublisher.onChange, screenPublisher.active, screenPublisher.active);
+  const isSharing = !!activeShare;
   const [myMusicStreamId, setMyMusicStreamId] = useState<string | null>(null);
   const musicStreamRef = useRef<string | null>(null);
   // Resolution + frame-rate are chosen in the screen-share wizard now
@@ -1094,13 +1168,13 @@ export function App() {
   const callChannelIdRef = useRef<string | null>(null);
   // Channel + stream of the share we're currently peeking (may be a channel we
   // haven't joined → spectator subscribe).
-  const peekMetaRef = useRef<{ channelId: string; streamId: string; spectator: boolean } | null>(null);
+  const peekMetaRef = useRef<{ channelId: string; ownerId: string; spectator: boolean } | null>(null);
   const peekOwnerRef = useRef<string | null>(null);
   // Set when "Assistir" is clicked for a channel we haven't joined: after the
   // join completes and the stream shows up, promote it to a full watch.
-  const pendingWatchRef = useRef<{ ownerId: string; streamId?: string } | null>(null);
+  const pendingWatchRef = useRef<{ ownerId: string } | null>(null);
   const voiceRowRefs = useRef<Record<string, HTMLElement>>({});
-  const [remoteVideos, setRemoteVideos] = useState<Record<string, RemoteVid[]>>({});
+  const [remoteVideos, setRemoteVideos] = useState<rtc.RemoteVideo[]>([]);
   // Our own webcam publication (streamId for unpublish) + live preview stream.
   const [myCameraStreamId, setMyCameraStreamId] = useState<string | null>(null);
   const [selfCameraStream, setSelfCameraStream] = useState<MediaStream | null>(null);
@@ -1251,6 +1325,7 @@ export function App() {
   useEffect(() => {
     const unsubscribe = subscribe(event => {
       if (event.op === "auth.state_changed") { setAuthenticated(event.data.state === "authenticated"); setAuthResolved(true); }
+      if (event.op === "auth.ok") setServerInfo(event.data ?? {});
       if (event.op === "app.bootstrap") {
         setAuthResolved(true);
         setAuthenticated(true); setChannels(event.data.channels ?? []); setCategories(event.data.categories ?? []); setMembers(event.data.members ?? []);
@@ -1342,7 +1417,10 @@ export function App() {
         else next[event.data.user_id] = list;
         return next;
       });
-      if (event.op === "call.state.update") setCall(current => !current || current.channelId !== event.data.channel_id ? current : { channelId: current.channelId, participants: current.participants.map(participant => participant.user_id === event.data.user_id ? { ...participant, muted: event.data.muted, deafened: event.data.deafened } : participant) });
+      // Roster, session participants and mute/deafen now live in `voiceStore`
+      // (SPEC-008); the `call.state.update` / `voice.rooms` / `voice.roster`
+      // handlers moved there. The bridge effect below mirrors the store into
+      // the `call` / `voiceRooms` / `voiceRoomStreams` / `streams` state.
       // The owner dragged us (or we dragged ourselves) into another voice
       // channel — join it, reusing the normal join path.
       if (event.op === "voice.moved") {
@@ -1355,36 +1433,6 @@ export function App() {
       // The owner kicked us out of the voice channel — tear our call down.
       if (event.op === "voice.disconnected") {
         leaveCall();
-      }
-      if (event.op === "voice.rooms") {
-        const rooms: Array<{ channel_id: string; participants: VoiceRosterEntry[]; streams?: StreamInfo[] }> = event.data.rooms ?? [];
-        setVoiceRooms(Object.fromEntries(rooms.map(room => [room.channel_id, room.participants])));
-        setVoiceRoomStreams(Object.fromEntries(rooms.map(room => [room.channel_id, room.streams ?? []])));
-      }
-      if (event.op === "voice.roster") {
-        const { channel_id, participants, streams: roomStreams } = event.data as { channel_id: string; participants: VoiceRosterEntry[]; streams?: StreamInfo[] };
-        setVoiceRooms(current => {
-          const botWasHere = (current[channel_id] ?? []).some(entry => entry.user_id === MUSIC_BOT_ID);
-          const botIsHere = (participants ?? []).some(entry => entry.user_id === MUSIC_BOT_ID);
-          // The bot's entrance is a real call event. Play it only for people
-          // already in this channel, never while receiving the initial rooms
-          // snapshot after opening the app.
-          if (channel_id === callChannelIdRef.current && !botWasHere && botIsHere) playSound("joinCall");
-          if (channel_id === callChannelIdRef.current && botWasHere && !botIsHere) playSound("leaveCall");
-          const next = { ...current };
-          if (!participants || participants.length === 0) delete next[channel_id];
-          else next[channel_id] = participants;
-          return next;
-        });
-        setVoiceRoomStreams(current => ({ ...current, [channel_id]: roomStreams ?? [] }));
-        if (channel_id === callChannelIdRef.current) {
-          setCall({ channelId: channel_id, participants: participants ?? [] });
-          setStreams(roomStreams ?? []);
-        }
-        // If the share we're peeking just disappeared, drop the preview.
-        if (peekMetaRef.current && (roomStreams ?? []).every(s => s.stream_id !== peekMetaRef.current!.streamId)) {
-          endPeek();
-        }
       }
       // The music bot's status cards now arrive as ordinary persisted messages
       // (`chat.message.created` with a `music_status` payload) and load with
@@ -1735,41 +1783,20 @@ export function App() {
     if (atBottomRef.current) pinToBottom();
   }, [messages]);
 
-  // After joining a channel via a preview's "Assistir", auto-promote to a full
-  // watch once that stream is in the joined call's stream list.
+  // After joining a channel via a preview's "Assistir", promote to a stage
+  // watch. `watchStream` only needs the owner now, and the subscription is
+  // applied as soon as the publication appears (TrackPublished handler).
   useEffect(() => {
     const pending = pendingWatchRef.current;
     if (!pending || !call) return;
-    const stream = streams.find(s => s.owner === pending.ownerId && s.kind === "screen" && (!pending.streamId || s.stream_id === pending.streamId));
-    if (!stream) return;
     pendingWatchRef.current = null;
-    if (!watching[pending.ownerId]) {
-      rtc.watchStream(call.channelId, stream.stream_id, pending.ownerId);
-      setWatching(current => ({ ...current, [pending.ownerId]: true }));
-    }
-  }, [streams, call, watching]);
+    rtc.watchStream(pending.ownerId, "stage");
+    setWatching(current => ({ ...current, [pending.ownerId]: true }));
+  }, [call?.channelId]);
 
-  useEffect(() => rtc.onRemoteStream((peerUserId, stream, msid) => {
-    setRemoteVideos(current => {
-      const list = current[peerUserId] ?? [];
-      // Removal: `null` msid clears every video for the peer (peer left /
-      // connection closed); a specific msid clears just that track.
-      if (!stream) {
-        if (msid == null) {
-          if (!(peerUserId in current)) return current;
-          const next = { ...current }; delete next[peerUserId]; return next;
-        }
-        const trimmed = list.filter(v => v.msid !== msid);
-        if (trimmed.length === list.length) return current;
-        const next = { ...current };
-        if (trimmed.length) next[peerUserId] = trimmed; else delete next[peerUserId];
-        return next;
-      }
-      // Upsert by msid (and de-dupe by the stream object itself).
-      const rest = list.filter(v => v.msid !== msid && v.stream.id !== stream.id);
-      return { ...current, [peerUserId]: [...rest, { stream, msid: msid ?? stream.id }] };
-    });
-  }), []);
+  // Live remote video tracks, from `remoteMedia` (SPEC-009). Classified by
+  // `publication.source`, never by a possibly-stale msid.
+  useEffect(() => rtc.subscribeRemoteVideos(setRemoteVideos), []);
 
   // Keep the self-preview stream and publish id in sync with the engine — a
   // camera the OS revokes (unplug / another app) ends the track, and the
@@ -1783,21 +1810,80 @@ export function App() {
   useEffect(() => { void rtc.listCameras().then(setCameras); }, []);
 
   useEffect(() => rtc.onSpeaking(setSpeakingUsers), []);
-  useEffect(() => rtc.onCallDisconnected(() => {
+  useEffect(() => rtc.onCallDisconnected((reason: rtc.EndReason) => {
     callChannelIdRef.current = null;
     musicStreamRef.current = null;
     setVoiceConnState("disconnected");
     setCall(null);
     setStreams([]);
-    setMySharingStreamId(null);
     setMyMusicStreamId(null);
     setMyCameraStreamId(null);
     setSelfCameraStream(null);
     setWatching({});
-    setRemoteVideos({});
-    setError("A conexão de voz foi encerrada. Entre novamente no canal.");
+    setRemoteVideos([]);
+    // Only surface a banner for reasons the user actually needs to act on.
+    const messages: Record<rtc.EndReason, string | null> = {
+      server_shutdown: "O servidor de voz reiniciou. Entre novamente no canal.",
+      duplicate_identity: "Sua conta entrou nesta call em outro dispositivo.",
+      participant_removed: null, // voice.disconnected already carries the message
+      room_deleted: null,
+      signal_close: "A conexão de voz caiu. Entre novamente no canal.",
+      unknown: "A conexão de voz foi encerrada. Entre novamente no canal.",
+    };
+    const message = messages[reason];
+    if (message) setError(message);
+    maybeAutoSend("unexpected_disconnect");
   }), []);
   useEffect(() => rtc.onMediaError(message => setError(message)), []);
+
+  // The spectator room is independent of the call (INV-D3); make sure it never
+  // outlives the app.
+  useEffect(() => () => void spectator.stop(), []);
+
+  // Graceful shutdown handshake with the native host + machine-wake detector
+  // (SPEC-012). Mounted once.
+  useEffect(() => { installShutdownHandler(); }, []);
+
+  // SPEC-008: the single voice-state bridge. `voiceStore` owns the IPC listener
+  // (mounted once) and applies snapshots/deltas with version-gap detection; this
+  // mirrors its output into the render state the tree already consumes. The
+  // session participants come from the LiveKit Room, so a server ghost is
+  // impossible (INV-C1).
+  const prevVoiceRoomsRef = useRef<Record<string, VoiceRosterEntry[]>>({});
+  useEffect(() => subscribeVoice(voice => {
+    const rooms: Record<string, VoiceRosterEntry[]> = {};
+    const streamsByRoom: Record<string, StreamInfo[]> = {};
+    for (const [id, projection] of Object.entries(voice.rooms)) {
+      rooms[id] = roomRoster(projection) as VoiceRosterEntry[];
+      streamsByRoom[id] = roomStreams(projection) as StreamInfo[];
+    }
+
+    // The bot's arrival/departure in our own channel is a real call event.
+    const here = callChannelIdRef.current;
+    if (here) {
+      const botWas = (prevVoiceRoomsRef.current[here] ?? []).some(e => e.user_id === MUSIC_BOT_ID);
+      const botIs = (rooms[here] ?? []).some(e => e.user_id === MUSIC_BOT_ID);
+      if (!botWas && botIs) playSound("joinCall");
+      if (botWas && !botIs) playSound("leaveCall");
+    }
+    prevVoiceRoomsRef.current = rooms;
+
+    setVoiceRooms(rooms);
+    setVoiceRoomStreams(streamsByRoom);
+
+    const sessionChannel = voice.session.channelId;
+    if (sessionChannel) {
+      setCall({ channelId: sessionChannel, participants: sessionParticipants(voice.session) as Participant[] });
+      setStreams(streamsByRoom[sessionChannel] ?? []);
+    }
+
+    // Drop a hover preview whose share just vanished.
+    const peek = peekMetaRef.current;
+    if (peek) {
+      const list = streamsByRoom[peek.channelId] ?? [];
+      if (!list.some(s => s.owner === peek.ownerId && s.kind === "screen")) endPeek();
+    }
+  }), []);
 
   useEffect(() => { setSoundsMuted(deafened); }, [deafened]);
   useEffect(() => rtc.onAudioPipelineStatus(status => {
@@ -1819,11 +1905,11 @@ export function App() {
   // The "you're sharing" toast shows briefly on start, then hides — there's
   // no OS capture border, but a permanent banner is nagging.
   useEffect(() => {
-    if (!mySharingStreamId) { setShowSharingToast(false); setShareMenuOpen(false); setShareQualityOpen(false); return; }
+    if (!isSharing) { setShowSharingToast(false); setShareMenuOpen(false); setShareQualityOpen(false); return; }
     setShowSharingToast(true);
     const timer = setTimeout(() => setShowSharingToast(false), 4000);
     return () => clearTimeout(timer);
-  }, [mySharingStreamId]);
+  }, [isSharing]);
 
   useEffect(() => {
     try { localStorage.setItem("tk.activeDmUsers", JSON.stringify(activeDmConversations)); } catch {}
@@ -2175,13 +2261,14 @@ export function App() {
         setVoiceConnState("connected");
       })
       .catch(error => {
-        if (error instanceof Error && error.name === "AbortError") return;
+        if (error instanceof Error && error.name === "AbortError") return; // INV-C4
         voiceConnTimers.current.forEach(id => window.clearTimeout(id));
         voiceConnTimers.current = [];
         setVoiceConnState("disconnected");
         setCall(current => current?.channelId === channel.id ? null : current);
         console.error("[ui] LiveKit voice connection failed", error);
-        setError(`Não foi possível conectar o áudio: ${error instanceof Error ? error.message : "erro desconhecido"}`);
+        setError(`Não foi possível conectar o áudio: ${friendlyJoinError(error)}`);
+        maybeAutoSend("join_failed");
       });
   }
   function leaveCall() {
@@ -2195,9 +2282,11 @@ export function App() {
     voiceConnTimers.current = [];
     setVoiceConnState("disconnected");
     musicStreamRef.current = null;
-    setCall(null); setStreams([]); setMySharingStreamId(null); setMyMusicStreamId(null);
+    setCall(null); setStreams([]); setMyMusicStreamId(null);
     setMyCameraStreamId(null); setSelfCameraStream(null); setCameraMenuOpen(false);
-    setWatching({}); setRemoteVideos({}); cancelPeekHide(); peekMetaRef.current = null;
+    setWatching({}); setRemoteVideos([]); cancelPeekHide();
+    void spectator.stop(); // a preview of another channel can be open on leave
+    peekMetaRef.current = null;
     peekOwnerRef.current = null; setPeekOwner(null); setPreviewHot(false);
 
     // Leaving voice should return the member to the community's landing text
@@ -2259,14 +2348,12 @@ export function App() {
     if (!call) return;
     // "Change which screen" on a live share: swap the source in place, keeping
     // the same stream so viewers don't have to re-subscribe.
-    if (pickerSourceOnly && mySharingStreamId) {
+    if (pickerSourceOnly && isSharing) {
       rtc.switchScreenSource(sourceId);
       return;
     }
-    const streamId = crypto.randomUUID();
     try {
-      await rtc.publishScreen(call.channelId, streamId, sourceId, options.height, options.fps, options.withAudio);
-      setMySharingStreamId(streamId);
+      await screenPublisher.start({ sourceId, height: options.height, fps: options.fps, withAudio: options.withAudio });
       setShareQuality({ height: options.height, fps: options.fps });
       playSound("startScreen");
     } catch (error) {
@@ -2277,7 +2364,7 @@ export function App() {
   // Clicking the share button while already sharing: open the menu instead of
   // stopping outright.
   function onShareButton() {
-    if (mySharingStreamId) setShareMenuOpen(open => !open);
+    if (isSharing) setShareMenuOpen(open => !open);
     else startSharing();
   }
   function closeShareMenu() { setShareMenuOpen(false); setShareQualityOpen(false); }
@@ -2286,7 +2373,7 @@ export function App() {
     rtc.reconfigureScreen(next.height, next.fps);
   }
   function renderSharePopover() {
-    if (!shareMenuOpen || !mySharingStreamId) return null;
+    if (!shareMenuOpen || !isSharing) return null;
     return (
       <div className="share-menu" onMouseLeave={closeShareMenu}>
         {shareQualityOpen ? (
@@ -2313,10 +2400,9 @@ export function App() {
   }
   function stopSharing() {
     closeShareMenu();
-    if (!call || !mySharingStreamId) return;
+    if (!call || !isSharing) return;
     playSound("stopScreen");
-    void rtc.unpublishScreen(call.channelId, mySharingStreamId);
-    setMySharingStreamId(null);
+    void rtc.unpublishScreen();
   }
 
   async function startCamera(deviceId?: string | null) {
@@ -2353,48 +2439,31 @@ export function App() {
       catch (error) { console.error("[ui] switchCamera failed", error); setError("Não foi possível trocar de câmera."); }
     }
   }
-  function toggleWatch(ownerId: string, streamId: string) {
+  function toggleWatch(ownerId: string) {
     if (!call) return;
-    // Decide from what's ACTUALLY on screen, not just the flag: after the share
-    // drops (or a transient blip) the flag can be stuck "true" with no video,
-    // and a click should then re-subscribe — not unsubscribe.
-    const hasVideo = !!pickRemoteVideo(ownerId, "screen");
-    const shouldStop = !!watching[ownerId] && hasVideo;
-    if (shouldStop) rtc.stopWatchingStream(call.channelId, streamId, ownerId);
-    else rtc.watchStream(call.channelId, streamId, ownerId);
-    setWatching(current => ({ ...current, [ownerId]: !shouldStop }));
+    const isWatching = watching[ownerId] === true;
+    if (isWatching) rtc.stopWatchingStream(ownerId, "stage");
+    else rtc.watchStream(ownerId, "stage");
+    setWatching(current => ({ ...current, [ownerId]: !isWatching }));
   }
-  function stopWatch(ownerId: string, streamId: string) {
-    if (!call) return;
-    rtc.stopWatchingStream(call.channelId, streamId, ownerId);
+  function stopWatch(ownerId: string) {
+    rtc.stopWatchingStream(ownerId, "stage");
     setWatching(current => ({ ...current, [ownerId]: false }));
   }
   // AO VIVO is a one-way focus action: it opens the channel and keeps the
   // screen on stage instead of toggling an existing watch off.
-  function focusLiveShare(channel: Channel, ownerId: string, stream?: StreamInfo) {
+  function focusLiveShare(channel: Channel, ownerId: string) {
     if (ownerId === currentUserId) return; // own share is already on the stage
     cancelPeekHide();
-    endPeek();
-    // `call` can still point to Alpha while the user is reading a text
-    // channel. Always select the voice channel too: subscribing alone does
-    // not change the workspace from chat to the call stage.
+    endPeek(); // ends the hover (and the spectator room)
     setFocusedUser(ownerId);
     setTheater(false);
-    chooseVoiceChannel(channel);
-    if (call?.channelId !== channel.id) {
-      // The roster can arrive before its stream list. Resolve the stream by
-      // owner after the new call completes in that case.
-      pendingWatchRef.current = { ownerId, streamId: stream?.stream_id };
-      return;
-    }
-    if (!stream) {
-      pendingWatchRef.current = { ownerId };
-      rtc.ensureChannel(channel.id);
-      return;
-    }
-    if (!watching[ownerId] || !pickRemoteVideo(ownerId, "screen")) {
-      rtc.watchStream(channel.id, stream.stream_id, ownerId);
+    chooseVoiceChannel(channel); // join the channel if not already in it
+    if (call?.channelId === channel.id) {
+      rtc.watchStream(ownerId, "stage");
       setWatching(current => ({ ...current, [ownerId]: true }));
+    } else {
+      pendingWatchRef.current = { ownerId };
     }
   }
   function toggleScreenAudioMute(ownerId: string) {
@@ -2422,30 +2491,30 @@ export function App() {
   function endPeek() {
     const meta = peekMetaRef.current;
     if (meta) {
-      if (meta.spectator) rtc.stopSpectate(peekOwnerRef.current ?? "");
-      else if (call) rtc.stopWatchingStream(meta.channelId, meta.streamId, peekOwnerRef.current ?? "");
+      if (meta.spectator) void spectator.stop();
+      else rtc.stopWatchingStream(meta.ownerId, "hover"); // only the "hover" reason
       peekMetaRef.current = null;
     }
     peekOwnerRef.current = null;
     setPeekOwner(null);
     setPreviewHot(false);
   }
-  function peekEnter(channelId: string, ownerId: string, streamId: string, isHere: boolean) {
+  function peekEnter(channelId: string, ownerId: string, isHere: boolean) {
     cancelPeekHide();
-    if (watching[ownerId] || peekOwner === ownerId) return;
+    if (peekOwner === ownerId) return;
     if (peekOwner && peekOwner !== ownerId) endPeek();
     setPreviewHot(false);
-    peekMetaRef.current = { channelId, streamId, spectator: !isHere };
+    peekMetaRef.current = { channelId, ownerId, spectator: !isHere };
     peekOwnerRef.current = ownerId;
-    if (isHere && call) rtc.watchStream(channelId, streamId, ownerId);
-    else rtc.spectate(channelId, streamId, ownerId);
+    if (isHere) rtc.watchStream(ownerId, "hover");
+    else void spectator.watch(channelId, ownerId);
     setPeekOwner(ownerId);
   }
   function peekLeave(ownerId: string) {
     cancelPeekHide();
     peekHideTimer.current = window.setTimeout(() => {
       peekHideTimer.current = null;
-      if (!watching[ownerId] && peekOwner === ownerId) endPeek();
+      if (peekOwnerRef.current === ownerId) endPeek();
       else setPreviewHot(false);
     }, 220);
   }
@@ -2658,43 +2727,41 @@ export function App() {
     setFocusedUser(current => (current === userId ? null : userId));
   }
 
-  // Resolve one of a peer's remote video tracks by kind. A track whose msid
-  // matches a published "camera" row is the camera; anything else (including
-  // an msid we haven't seen a row for yet) is treated as the screen.
-  function pickRemoteVideo(userId: string, want: "screen" | "camera"): MediaStream | undefined {
-    for (const vid of remoteVideos[userId] ?? []) {
-      const row = streams.find(s => s.msid && s.msid === vid.msid);
-      const kind = row ? row.kind : "screen";
-      if (kind === want) return vid.stream;
-    }
-    return undefined;
+  // A peer's remote video by kind, from `publication.source` (always current),
+  // never by a stale msid (RC-03). Returns a `TileMedia` ready for a tile.
+  function remoteTileMedia(userId: string, want: "camera" | "screen_share"): TileMedia | undefined {
+    const video = remoteVideos.find(v => v.ownerId === userId && v.source === want);
+    return video ? { kind: "remote", video } : undefined;
+  }
+  function localTileMedia(stream: MediaStream | null | undefined): TileMedia | undefined {
+    return stream ? { kind: "local", stream } : undefined;
   }
 
   // One participant expands to a base tile (camera video, or avatar) plus a
   // separate screen tile whenever their share is being watched.
   type VoiceTileDesc =
-    | { key: string; kind: "cam"; participant: Participant; stream?: MediaStream }
-    | { key: string; kind: "screen"; participant: Participant; stream?: MediaStream };
+    | { key: string; kind: "cam"; participant: Participant; media?: TileMedia }
+    | { key: string; kind: "screen"; participant: Participant; media?: TileMedia };
 
   function tilesForParticipant(participant: Participant): VoiceTileDesc[] {
     const isSelf = participant.user_id === currentUserId;
     const camera = isSelf
-      ? (selfCameraStream ?? undefined)
-      : pickRemoteVideo(participant.user_id, "camera");
+      ? localTileMedia(selfCameraStream)
+      : remoteTileMedia(participant.user_id, "camera");
 
     const screenRow = streams.find(s => s.owner === participant.user_id && s.kind === "screen");
     const screen = isSelf
-      ? (mySharingStreamId ? rtc.getLocalScreenStream() ?? undefined : undefined)
-      : (watching[participant.user_id] ? pickRemoteVideo(participant.user_id, "screen") : undefined);
+      ? (activeShare ? localTileMedia(activeShare.stream) : undefined)
+      : (watching[participant.user_id] ? remoteTileMedia(participant.user_id, "screen_share") : undefined);
 
-    const tiles: VoiceTileDesc[] = [{ key: `cam:${participant.user_id}`, kind: "cam", participant, stream: camera }];
+    const tiles: VoiceTileDesc[] = [{ key: `cam:${participant.user_id}`, kind: "cam", participant, media: camera }];
 
     if (isSelf) {
-      if (mySharingStreamId) {
-        tiles.push({ key: `screen:${participant.user_id}`, kind: "screen", participant, stream: screen });
+      if (isSharing) {
+        tiles.push({ key: `screen:${participant.user_id}`, kind: "screen", participant, media: screen });
       }
     } else if (screenRow) {
-      tiles.push({ key: `screen:${participant.user_id}`, kind: "screen", participant, stream: screen });
+      tiles.push({ key: `screen:${participant.user_id}`, kind: "screen", participant, media: screen });
     }
     return tiles;
   }
@@ -2708,7 +2775,7 @@ export function App() {
     const screenRow = streams.find(s => s.owner === participant.user_id && s.kind === "screen");
 
     if (desc.kind === "screen") {
-      if (!desc.stream) {
+      if (!desc.media) {
         return (
           <div className={speaking ? "vtile is-speaking" : "vtile"} key={desc.key}>
             <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', gap: '12px' }}>
@@ -2717,7 +2784,7 @@ export function App() {
                 <button
                   className="vtile__watch"
                   style={{ position: 'relative', right: 'auto', bottom: 'auto' }}
-                  onClick={() => toggleWatch(participant.user_id, screenRow.stream_id)}
+                  onClick={() => toggleWatch(participant.user_id)}
                 >
                   Assistir transmissão
                 </button>
@@ -2733,7 +2800,7 @@ export function App() {
       return (
         <VideoTile
           key={desc.key}
-          stream={desc.stream!}
+          media={desc.media}
           variant="screen"
           name={`${name} — tela`}
           micMuted={isMicMuted}
@@ -2743,7 +2810,7 @@ export function App() {
           onToggleMute={() => togglePeerMute(participant.user_id)}
           onToggleFocus={() => toggleFocus(participant.user_id)}
           isSelf={isSelf}
-          onStopWatch={isSelf || !screenRow ? undefined : () => stopWatch(participant.user_id, screenRow.stream_id)}
+          onStopWatch={isSelf || !screenRow ? undefined : () => stopWatch(participant.user_id)}
           screenAudioMuted={!!screenMutedPeers[participant.user_id]}
           screenAudioVolume={screenVolumes[participant.user_id] ?? 1}
           onToggleScreenAudioMute={() => toggleScreenAudioMute(participant.user_id)}
@@ -2752,11 +2819,11 @@ export function App() {
       );
     }
 
-    if (desc.stream) {
+    if (desc.media) {
       return (
         <VideoTile
           key={desc.key}
-          stream={desc.stream}
+          media={desc.media}
           variant="camera"
           name={name}
           micMuted={isMicMuted}
@@ -2904,7 +2971,7 @@ export function App() {
           </div>
         </div>
       )}
-      {mySharingStreamId && showSharingToast && (
+      {isSharing && showSharingToast && (
         <div className="sharing-bar">
           <Icon name="share-screen" size={16} />
           <span>Você está compartilhando sua tela</span>
@@ -3078,7 +3145,7 @@ export function App() {
                     user_id: currentUserId,
                     muted,
                     deafened,
-                    sharing: !!mySharingStreamId || roster.some(e => e.user_id === currentUserId && e.sharing),
+                    sharing: isSharing || roster.some(e => e.user_id === currentUserId && e.sharing),
                   },
                 ]
               : roster;
@@ -3143,14 +3210,14 @@ export function App() {
                       // The floating peek preview is purely a hover affordance:
                       // once you're actually watching, the main stage carries
                       // the video and the row just shows a "Parar" button.
-                      const preview = canPeek && !watching[entry.user_id] && peekOwner === entry.user_id
-                        ? pickRemoteVideo(entry.user_id, "screen")
+                      const preview: TileMedia | undefined = canPeek && !watching[entry.user_id] && peekOwner === entry.user_id
+                        ? remoteTileMedia(entry.user_id, "screen_share")
                         : undefined;
-                      const promoteWatch = () => focusLiveShare(channel, entry.user_id, share); /* legacy hover action:
+                      const promoteWatch = () => focusLiveShare(channel, entry.user_id); /* legacy hover action:
                         cancelPeekHide();
                         if (here) {
                           endPeek();
-                          toggleWatch(entry.user_id, share!.stream_id);
+                          toggleWatch(entry.user_id);
                         } else {
                           // Not in this channel yet — join it, then auto-watch
                           // once the call is up.
@@ -3177,7 +3244,7 @@ export function App() {
                             event.dataTransfer.effectAllowed = "move";
                           }) : undefined}
                           onDragEnd={canMoveMembers ? (() => setDragOverVoice(null)) : undefined}
-                          onMouseEnter={() => canPeek && peekEnter(channel.id, entry.user_id, share!.stream_id, here)}
+                          onMouseEnter={() => canPeek && peekEnter(channel.id, entry.user_id, here)}
                           onMouseLeave={() => canPeek && peekLeave(entry.user_id)}
                           onClick={event => openProfile(entry.user_id, event.currentTarget)}
                           onContextMenu={event => openMenu(event, memberMenuItems(entry.user_id))}
@@ -3199,7 +3266,7 @@ export function App() {
                               type="button"
                               className="voice-member__live-badge voice-member__live-badge--watch"
                               title={`Assistir à tela de ${name}`}
-                              onClick={event => { event.stopPropagation(); focusLiveShare(channel, entry.user_id, share); }}
+                              onClick={event => { event.stopPropagation(); focusLiveShare(channel, entry.user_id); }}
                             >
                               AO VIVO
                             </button>
@@ -3213,7 +3280,7 @@ export function App() {
                           {here && !isSelf && watching[entry.user_id] && (
                             <button
                               className="voice-member__watch"
-                              onClick={event => { event.stopPropagation(); toggleWatch(entry.user_id, share!.stream_id); }}
+                              onClick={event => { event.stopPropagation(); toggleWatch(entry.user_id); }}
                             >
                               Parar
                             </button>
@@ -3221,7 +3288,7 @@ export function App() {
                           {preview && (
                             <VoiceMemberPreview
                               anchor={voiceRowRefs.current[entry.user_id] ?? null}
-                              stream={preview}
+                              media={preview}
                               expanded={previewHot && peekOwner === entry.user_id}
                               onEnter={() => { cancelPeekHide(); setPreviewHot(true); }}
                               onLeave={() => peekLeave(entry.user_id)}
@@ -3276,9 +3343,9 @@ export function App() {
               </button>
               <div className="vp-share">
                 <button
-                  className={mySharingStreamId ? "vp-btn is-danger is-on" : "vp-btn"}
+                  className={isSharing ? "vp-btn is-danger is-on" : "vp-btn"}
                   onClick={onShareButton}
-                  title={mySharingStreamId ? "Opções de transmissão" : "Compartilhar tela"}
+                  title={isSharing ? "Opções de transmissão" : "Compartilhar tela"}
                 >
                   <Icon name="share-screen" size={18} />
                 </button>
@@ -3474,9 +3541,9 @@ export function App() {
               <button className="vc-btn" title="Efeitos sonoros"><Icon name="sound-effects" size={22} /></button>
               <div className="vc-share">
                 <button
-                  className={mySharingStreamId ? "vc-btn is-on" : "vc-btn"}
+                  className={isSharing ? "vc-btn is-on" : "vc-btn"}
                   onClick={onShareButton}
-                  title={mySharingStreamId ? "Opções de transmissão" : "Compartilhar tela"}
+                  title={isSharing ? "Opções de transmissão" : "Compartilhar tela"}
                 >
                   <Icon name="share-screen" size={22} />
                 </button>

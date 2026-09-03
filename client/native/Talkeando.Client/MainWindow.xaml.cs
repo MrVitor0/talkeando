@@ -55,10 +55,32 @@ public partial class MainWindow : System.Windows.Window
             Title = text + suffix;
         });
         Loaded += async (_, _) => await InitializeWebViewAsync();
+        // Leave the call (and stop screen/spectator) before the window really
+        // closes — without this the server and LiveKit only learn of the
+        // departure by timeout, up to 60 s (RC-18).
+        Closing += OnClosing;
         // Release the microphone and every RTCPeerConnection when the window
         // closes — otherwise WASAPI capture keeps the mic device open after
         // the app exits until process teardown.
         Closed += (_, _) => _bridge.Dispose();
+    }
+
+    private bool _shuttingDown;
+
+    private async void OnClosing(object? sender, System.ComponentModel.CancelEventArgs e)
+    {
+        if (_shuttingDown) return; // second pass: let it close
+        e.Cancel = true;
+        _shuttingDown = true;
+        try
+        {
+            await _bridge.RequestGracefulShutdownAsync("closing", TimeSpan.FromSeconds(2));
+        }
+        catch (Exception exception)
+        {
+            DebugLog.Write($"Graceful shutdown failed: {exception}");
+        }
+        Close();
     }
 
     // ---- custom title bar --------------------------------------------------

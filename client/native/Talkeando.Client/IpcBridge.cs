@@ -247,11 +247,15 @@ public sealed class IpcBridge : IDisposable
                     var maxHeight = d.TryGetProperty("max_height", out var mh) ? mh.GetInt32() : 1080;
                     var maxFps = d.TryGetProperty("max_fps", out var mf) ? mf.GetInt32() : 30;
                     var withAudio = d.TryGetProperty("audio", out var au) && au.ValueKind == JsonValueKind.True;
+                    // The UI stamps every capture with a generation; we echo it on
+                    // every frame/packet so the UI can drop stragglers from a
+                    // previous capture (RC-16).
+                    var generation = d.TryGetProperty("generation", out var gen) && gen.TryGetInt32(out var g) ? g : 0;
                     _screen.Start(sourceId, maxHeight, maxFps, jpeg =>
                     {
                         var slot = System.Threading.Interlocked.Increment(ref _frameSeq) & 1;
                         WriteFrameSlot?.Invoke(jpeg, slot);
-                        Publish("screen.frame", new { slot, len = jpeg.Length });
+                        Publish("screen.frame", new { slot, len = jpeg.Length, generation });
                     });
                     if (withAudio)
                     {
@@ -260,14 +264,24 @@ public sealed class IpcBridge : IDisposable
                         {
                             var slot = (int)((uint)System.Threading.Interlocked.Increment(ref _audioSeq) % (uint)AudioSlotCount);
                             WriteAudioSlot?.Invoke(pcm, slot);
-                            Publish("screen.audio", new { slot, len = pcm.Length });
+                            Publish("screen.audio", new { slot, len = pcm.Length, generation });
                         });
+                    }
+                    else
+                    {
+                        // A reconfigure to a no-audio source must stop the previous
+                        // WASAPI capture (RC-16 item 2).
+                        _audio.Stop();
                     }
                     break;
                 }
                 case "screen.capture.stop":
                     _screen.Stop();
                     _audio.Stop();
+                    // Both Stop() calls Join(800) their threads, so this confirms
+                    // "the capture has ended" — what the UI's requestCaptureStop
+                    // awaits before letting a new capture begin (INV-D2).
+                    Publish("screen.capture.stopped", new { });
                     break;
                 case "activity.config":
                     _activity.SetEnabled(root.GetProperty("data").GetProperty("enabled").GetBoolean());
@@ -340,7 +354,30 @@ public sealed class IpcBridge : IDisposable
                 }
                 case "update.apply":
                 {
+                    // Leave the call before Velopack kills the process (RC-18).
+                    // Otherwise everyone sees this member in the call for up to
+                    // 60 s after the restart, and the re-join can collide with
+                    // the old session (DUPLICATE_IDENTITY).
+                    await RequestGracefulShutdownAsync("update", TimeSpan.FromSeconds(2));
                     _updater.ApplyUpdate();
+                    break;
+                }
+                case "app.shutdown.ready":
+                    _shutdownAck?.TrySetResult(true);
+                    break;
+                case "diagnostics.upload":
+                {
+                    var report = root.GetProperty("data").GetProperty("report");
+                    try
+                    {
+                        await _network.UploadClientLogsAsync(report);
+                        Publish("diagnostics.uploaded", new { });
+                    }
+                    catch (Exception exception)
+                    {
+                        DebugLog.Write($"Diagnostics upload failed: {exception.Message}");
+                        Publish("diagnostics.failed", new { message = exception.Message });
+                    }
                     break;
                 }
                 default:
@@ -353,6 +390,24 @@ public sealed class IpcBridge : IDisposable
             DebugLog.Write($"FAILED: {exception}");
             Publish("error", new { code = "ipc_request_failed", message = exception.Message, in_reply_to = requestId });
         }
+    }
+
+    private TaskCompletionSource<bool>? _shutdownAck;
+
+    /// Asks the UI to tear down call, screen share and preview before the
+    /// process dies, then closes the WebSocket with a Close frame so the server
+    /// registers the departure at once instead of waiting for the heartbeat
+    /// (server/src/ws/handler.rs). Resolves even if the UI never answers — a
+    /// hung shutdown is worse than a dirty one.
+    public async Task<bool> RequestGracefulShutdownAsync(string reason, TimeSpan timeout)
+    {
+        _shutdownAck = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        Publish("app.shutdown.request", new { reason });
+        var acked = await GracefulShutdown.WaitForAckAsync(_shutdownAck.Task, timeout);
+        if (!acked) DebugLog.Write($"Graceful shutdown timed out after {timeout.TotalSeconds}s ({reason}).");
+        _shutdownAck = null;
+        await _network.DisconnectWebSocketAsync();
+        return acked;
     }
 
     private async Task PublishBootstrapAsync()

@@ -86,6 +86,26 @@ async fn login_with_unknown_username_gets_the_same_generic_error_as_wrong_passwo
 }
 
 #[tokio::test]
+async fn health_endpoint_answers_200_without_authentication() {
+    // SPEC-016 §4.1: the container healthcheck hits this. It must return 200
+    // with no bearer token, unlike every other route.
+    let app = TestApp::spawn().await;
+
+    let response = reqwest::Client::new()
+        .get(format!("{}/health", app.http_url))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), 200);
+    assert_eq!(
+        response.json::<serde_json::Value>().await.unwrap(),
+        serde_json::json!({ "ok": true })
+    );
+    app.teardown().await;
+}
+
+#[tokio::test]
 async fn a_request_without_a_bearer_token_is_unauthorized() {
     let app = TestApp::spawn().await;
 

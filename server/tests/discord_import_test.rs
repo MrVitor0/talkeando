@@ -29,6 +29,8 @@ fn test_config(attachment_storage_path: String) -> Config {
         livekit_api_key: Some("APItestkey".to_string()),
         livekit_api_secret: Some("test-livekit-secret".to_string()),
         livekit_token_ttl_seconds: 21_600,
+        voice_protocol_v2: true,
+        ws_offline_grace_seconds: 8,
     }
 }
 

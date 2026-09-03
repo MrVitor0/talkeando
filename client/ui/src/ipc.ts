@@ -12,10 +12,14 @@ declare global { interface Window { chrome?: { webview?: { postMessage: (message
 // native ever reached the UI. Confirmed by comparing a native-side log that
 // showed every step of auth/login succeeding against a UI that never
 // changed state at all.
-window.chrome?.webview?.addEventListener("message", event => {
-  try { const envelope = event.data as Envelope; listeners.forEach(listener => listener(envelope)); }
-  catch (error) { console.error("Failed to handle host event", event.data, error); }
-});
+if (typeof window !== "undefined") {
+  window.chrome?.webview?.addEventListener("message", event => {
+    try { const envelope = event.data as Envelope; listeners.forEach(listener => listener(envelope)); }
+    catch (error) { console.error("Failed to handle host event", event.data, error); }
+  });
+}
 
-export function send(op: string, data: Record<string, unknown> = {}) { window.chrome?.webview?.postMessage({ v: 1, op, data }); }
+export function send(op: string, data: Record<string, unknown> = {}) {
+  if (typeof window !== "undefined") window.chrome?.webview?.postMessage({ v: 1, op, data });
+}
 export function subscribe(listener: Listener) { listeners.add(listener); return () => listeners.delete(listener); }

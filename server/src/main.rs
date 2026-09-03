@@ -170,6 +170,25 @@ fn spawn_attachment_cleanup(state: AppState) {
                     Err(error) => tracing::warn!(%id, %error, "failed to delete orphaned attachment row"),
                 }
             }
+
+            // SPEC-014: prune client diagnostics reports older than 7 days.
+            let logs_dir = std::path::Path::new(&state.config.attachment_storage_path).join("_client_logs");
+            if let Ok(mut entries) = tokio::fs::read_dir(&logs_dir).await {
+                let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(7 * 24 * 60 * 60);
+                while let Ok(Some(entry)) = entries.next_entry().await {
+                    let too_old = entry
+                        .metadata()
+                        .await
+                        .ok()
+                        .and_then(|m| m.modified().ok())
+                        .is_some_and(|modified| modified < cutoff);
+                    if too_old {
+                        if let Err(error) = tokio::fs::remove_file(entry.path()).await {
+                            tracing::warn!(%error, path = ?entry.path(), "failed to remove old client log");
+                        }
+                    }
+                }
+            }
         }
     });
 }
@@ -184,13 +203,39 @@ fn spawn_voice_reconcile(state: AppState) {
         return;
     }
     tokio::spawn(async move {
+        use std::time::{Duration, Instant};
         // Let the process settle and accept a few reconnects first.
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
-        let mut ticker = tokio::time::interval(std::time::Duration::from_secs(15));
+        tokio::time::sleep(Duration::from_secs(3)).await;
+        let mut ticker = tokio::time::interval(Duration::from_secs(1));
+        let mut last_full = Instant::now();
         loop {
             ticker.tick().await;
-            if state.should_reconcile_voice(std::time::Duration::ZERO).await {
+
+            // 1. Directed reconciles that came due (leave, kick, move, room_finished).
+            for channel_id in state.take_due_reconciles().await {
+                tupi_server::ws::handler::reconcile_one_room(&state, channel_id).await;
+            }
+
+            // 2. Full sweep every 15 s, as before.
+            if last_full.elapsed() >= Duration::from_secs(15)
+                && state.should_reconcile_voice(Duration::ZERO).await
+            {
+                last_full = Instant::now();
                 tupi_server::ws::handler::reconcile_voice_rooms(&state).await;
+            }
+
+            // 3. Expire provisionals (INV-A2).
+            let expired = state.hub.voice.write().await.expire_provisionals();
+            for change in expired {
+                tupi_server::ws::voice_metrics::VoiceMetrics::bump(
+                    &state.voice_metrics.provisional_expired,
+                );
+                tracing::warn!(
+                    event = "voice.registry.participant_expired",
+                    channel_id = %change.channel_id,
+                    source = "expiry"
+                );
+                tupi_server::ws::handler::publish_room_change(&state, change).await;
             }
         }
     });

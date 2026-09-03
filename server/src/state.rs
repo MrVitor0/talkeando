@@ -24,7 +24,33 @@ pub struct AppState {
     /// the on-connect reconcile so a server restart (every client reconnects
     /// within a second) doesn't fan out into one LiveKit sweep per client.
     pub last_voice_reconcile: Arc<Mutex<Option<Instant>>>,
+    /// In-memory counters for the voice path (SPEC-002). Exposed by
+    /// `GET /api/debug/voice`.
+    pub voice_metrics: Arc<crate::ws::voice_metrics::VoiceMetrics>,
+    /// Boot instant, for the debug endpoint's `uptime_seconds`.
+    pub started_at: Instant,
+    /// Last time `GET /api/debug/voice?live=1` hit LiveKit, so the live diff
+    /// can be throttled to one sweep per 10 s (same pattern as
+    /// `should_reconcile_voice`).
+    pub last_debug_live: Arc<Mutex<Option<Instant>>>,
+    /// Channels that need confirming against LiveKit, with the instant they
+    /// become due. Drained by the 1 s tick in `main.rs` (SPEC-004).
+    pub pending_reconcile: Arc<Mutex<HashMap<Uuid, Instant>>>,
+    /// Last time each user uploaded a client diagnostics report (SPEC-014).
+    /// One per 60 s.
+    pub last_client_log: Arc<Mutex<HashMap<Uuid, Instant>>>,
+    /// `channel_id -> (community_id, fetched_at)`. Channels almost never move
+    /// communities; a 5 min TTL removes a Postgres query per roster event.
+    pub channel_community_cache: Arc<Mutex<HashMap<Uuid, (Uuid, Instant)>>>,
+    /// `community_id -> (member_ids, fetched_at)`. 60 s TTL plus explicit
+    /// invalidation on join.
+    pub community_members_cache: Arc<Mutex<HashMap<Uuid, (Vec<Uuid>, Instant)>>>,
+    /// Sliding-window limiter for `voice.room.request`, keyed by user.
+    pub room_request_limiter: Arc<Mutex<HashMap<Uuid, VecDeque<Instant>>>>,
 }
+
+const CHANNEL_COMMUNITY_TTL: Duration = Duration::from_secs(300);
+const COMMUNITY_MEMBERS_TTL: Duration = Duration::from_secs(60);
 
 impl AppState {
     pub fn new(pool: PgPool, config: Config) -> Self {
@@ -36,6 +62,122 @@ impl AppState {
             presence_epochs: Arc::new(Mutex::new(HashMap::new())),
             pending_offline: Arc::new(Mutex::new(HashSet::new())),
             last_voice_reconcile: Arc::new(Mutex::new(None)),
+            voice_metrics: Arc::new(crate::ws::voice_metrics::VoiceMetrics::default()),
+            started_at: Instant::now(),
+            last_debug_live: Arc::new(Mutex::new(None)),
+            pending_reconcile: Arc::new(Mutex::new(HashMap::new())),
+            last_client_log: Arc::new(Mutex::new(HashMap::new())),
+            channel_community_cache: Arc::new(Mutex::new(HashMap::new())),
+            community_members_cache: Arc::new(Mutex::new(HashMap::new())),
+            room_request_limiter: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// `community_id` that owns `channel_id`, cached for `CHANNEL_COMMUNITY_TTL`
+    /// (SPEC-005 §4.6). `None` when the channel does not exist.
+    pub async fn community_of_channel(&self, channel_id: Uuid) -> Option<Uuid> {
+        {
+            let cache = self.channel_community_cache.lock().await;
+            if let Some((community_id, at)) = cache.get(&channel_id) {
+                if at.elapsed() < CHANNEL_COMMUNITY_TTL {
+                    return Some(*community_id);
+                }
+            }
+        }
+        let community_id = crate::db::channel_community(&self.pool, channel_id)
+            .await
+            .ok()
+            .flatten()?;
+        self.channel_community_cache
+            .lock()
+            .await
+            .insert(channel_id, (community_id, Instant::now()));
+        Some(community_id)
+    }
+
+    /// Member ids of `community_id`, cached for `COMMUNITY_MEMBERS_TTL`.
+    pub async fn community_members(&self, community_id: Uuid) -> Result<Vec<Uuid>, sqlx::Error> {
+        {
+            let cache = self.community_members_cache.lock().await;
+            if let Some((members, at)) = cache.get(&community_id) {
+                if at.elapsed() < COMMUNITY_MEMBERS_TTL {
+                    return Ok(members.clone());
+                }
+            }
+        }
+        let members = crate::db::community_member_ids(&self.pool, community_id).await?;
+        self.community_members_cache
+            .lock()
+            .await
+            .insert(community_id, (members.clone(), Instant::now()));
+        Ok(members)
+    }
+
+    pub async fn invalidate_channel_cache(&self, channel_id: Uuid) {
+        self.channel_community_cache.lock().await.remove(&channel_id);
+    }
+
+    pub async fn invalidate_members_cache(&self, community_id: Uuid) {
+        self.community_members_cache.lock().await.remove(&community_id);
+    }
+
+    /// `voice.room.request` limiter: at most 5 per user per rolling 10 s.
+    pub async fn allow_room_request(&self, user_id: Uuid) -> bool {
+        const WINDOW: Duration = Duration::from_secs(10);
+        const MAX: usize = 5;
+        let mut guard = self.room_request_limiter.lock().await;
+        let now = Instant::now();
+        let entry = guard.entry(user_id).or_default();
+        while entry.front().is_some_and(|front| now.duration_since(*front) > WINDOW) {
+            entry.pop_front();
+        }
+        if entry.len() >= MAX {
+            return false;
+        }
+        entry.push_back(now);
+        true
+    }
+
+    /// Schedules confirmation of ONE channel against LiveKit. If a sooner run
+    /// is already queued for it, the sooner one wins.
+    pub async fn schedule_reconcile(&self, channel_id: Uuid, delay: Duration) {
+        let due = Instant::now() + delay;
+        let mut pending = self.pending_reconcile.lock().await;
+        pending
+            .entry(channel_id)
+            .and_modify(|existing| {
+                if due < *existing {
+                    *existing = due;
+                }
+            })
+            .or_insert(due);
+    }
+
+    /// Channels whose scheduled time has passed, removing them from the queue.
+    pub async fn take_due_reconciles(&self) -> Vec<Uuid> {
+        let now = Instant::now();
+        let mut pending = self.pending_reconcile.lock().await;
+        let due: Vec<Uuid> = pending
+            .iter()
+            .filter(|(_, at)| **at <= now)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in &due {
+            pending.remove(id);
+        }
+        due
+    }
+
+    /// Returns true (and stamps "now") when `GET /api/debug/voice?live=1` has
+    /// not hit LiveKit within `min_gap`. Mirrors `should_reconcile_voice`.
+    pub async fn should_run_debug_live(&self, min_gap: Duration) -> bool {
+        let mut guard = self.last_debug_live.lock().await;
+        let now = Instant::now();
+        if guard.map_or(true, |last| now.duration_since(last) >= min_gap) {
+            *guard = Some(now);
+            true
+        } else {
+            false
         }
     }
 
@@ -52,6 +194,19 @@ impl AppState {
         } else {
             false
         }
+    }
+
+    /// Returns true (and stamps "now") when this user has not uploaded a
+    /// diagnostics report in the last 60 s (SPEC-014).
+    pub async fn allow_client_log(&self, user_id: Uuid) -> bool {
+        const MIN_INTERVAL: Duration = Duration::from_secs(60);
+        let mut guard = self.last_client_log.lock().await;
+        let now = Instant::now();
+        if guard.get(&user_id).is_some_and(|last| now.duration_since(*last) < MIN_INTERVAL) {
+            return false;
+        }
+        guard.insert(user_id, now);
+        true
     }
 
     /// Fixed-window brute-force guard on login attempts, keyed by

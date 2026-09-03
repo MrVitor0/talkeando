@@ -15,3 +15,11 @@ turn:
 room:
   empty_timeout: 300
   max_participants: 12
+  # Without this a room with one muted, idle participant can stay alive
+  # indefinitely holding memory (SPEC-016 §4.4).
+  departure_timeout: 20
+logging:
+  # json matches tupi-server's format (telemetry.rs) so the two correlate
+  # under jq.
+  level: info
+  json: true

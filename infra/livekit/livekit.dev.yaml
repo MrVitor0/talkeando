@@ -15,3 +15,9 @@ turn:
 room:
   empty_timeout: 300
   max_participants: 12
+  # Mirrors production (SPEC-016 §4.4) so `departure_timeout` and `logging`
+  # get exercised against v1.9.12 locally before a deploy.
+  departure_timeout: 20
+logging:
+  level: info
+  json: true
